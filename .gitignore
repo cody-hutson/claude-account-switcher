@@ -1,0 +1,23 @@
+# Operator-config (operator-customized config instances; never tracked)
+*.local
+config.toml.local
+
+# Operator-state (runtime logs/markers — should live at ~/.claude/account-switcher/ not here)
+*.log
+.*-marker
+
+# Operator-cache (snapshot backups; identity-specific paths leak operator workflow)
+.*-bak.*
+*-bak.*
+
+# Operator-bridge (cross-repo handoff files; contains routing metadata)
+*-handoff.md
+
+# OS artifacts (macOS Finder metadata)
+.DS_Store
+**/.DS_Store
+
+# Operator-audit (depersonalization audit trails; documents transformed PII tokens
+# and must never ship in this depersonalized public-bound repo — audits live at
+# the operator-instance path, never here)
+_validation/

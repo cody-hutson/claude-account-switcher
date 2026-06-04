@@ -1,0 +1,49 @@
+name: Feature Request
+description: Suggest a new capability or improvement to the account switcher.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suggestions are welcome. This is a single-maintainer project; for security
+        issues, report privately per [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part would this touch?
+      options:
+        - Swap / launch / quit behavior
+        - Install / update
+        - Slash command
+        - Config / handoff
+        - Docs
+        - New capability
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the gap?
+      description: The limitation or friction today — what you can't do, not how to build it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What should the tool do differently? Describe the result, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional — examples or context that helps.
+    validations:
+      required: false

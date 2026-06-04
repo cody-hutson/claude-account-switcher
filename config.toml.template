@@ -1,0 +1,44 @@
+# ~/.claude/account-switcher/config.toml — TEMPLATE
+#
+# This file is the source-of-truth template in the claude-account-switcher repo
+# (config.toml.template). It is deployed to ~/.claude/account-switcher/config.toml
+# ONLY when the runtime instance does not exist (initial install via install.sh).
+# Your customizations to the runtime instance are preserved across re-installs
+# (see README.md § Configuration and § Updating).
+#
+# Hand-edits supported (validation runs on read). Replace the placeholder entry with real
+# account metadata after onboarding.
+
+# Schema version. Increment when structure changes incompatibly.
+version = 1
+
+[accounts]
+# Map of tag -> profile metadata. Keys must match [a-z0-9-]{1,32}.
+# Each tag maps to a ~/Library/Application Support/Claude-<tag> user-data-dir.
+# Replace the placeholder line below with real account metadata, or use
+# `account-switcher add-account <tag> <email> [label]` after first launch + login.
+# primary = { label = "Primary", profile_email = "you@example.com" }
+
+[notifications]
+# Channels for swap-success awareness signals.
+channels = ["statusline", "log", "stderr"]
+
+[swap_handoff]
+# The `swap` command writes a privacy-safe work-state handoff (SWAP_HANDOFF.md)
+# at the swap boundary so the next session can resume coherently. All three
+# keys below are OPTIONAL and have safe defaults.
+#
+# workspace_dir — where SWAP_HANDOFF.md is written, and where an optional
+#   PORTFOLIO.md is read for an "active project" line. Tilde is expanded.
+#   Default: this tool's own store, ~/.claude/account-switcher/.
+# workspace_dir = "~/.claude/account-switcher"
+#
+# git_root — the git repo whose recent commits + uncommitted files are
+#   summarized in the handoff. Tilde is expanded. Default: the current
+#   directory if it is a git work-tree, otherwise git activity is skipped.
+# git_root = "~/my-active-repo"
+#
+# gh_repo — optional GitHub repo to enrich the handoff with recent issue + PR
+#   activity. When unset, the gh queries are skipped (commits/files still
+#   captured). Format: "owner/repo".
+# gh_repo = "your-org/your-repo"

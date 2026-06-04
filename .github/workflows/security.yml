@@ -1,0 +1,70 @@
+# Security CI — static analysis + secret scanning for a Bash-only repo:
+#   - shellcheck: Bash static analyzer (SAST)
+#   - actionlint: GitHub Actions workflow YAML linter (catches Action misconfig)
+#   - gitleaks: secret scanning across full history
+# Branch protection requires each job's `name:` as a status check — keep the
+# `name:` fields below in sync with the required-checks configuration.
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Bash SAST (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run shellcheck
+        run: |
+          # Discover all shell scripts in the repo, excluding .git/
+          # Treat shellcheck errors as failures (severity=error matches bandit's
+          # --severity-level high posture: high-severity / high-confidence
+          # findings only — warnings are surfaced via stderr but do not fail
+          # the build, same as bandit's `high` level skips `medium`/`low`).
+          mapfile -t SCRIPTS < <(find . -type f \( -name '*.sh' -o -name '*.bash' \) -not -path './.git/*')
+          if [ "${#SCRIPTS[@]}" -eq 0 ]; then
+            echo "No shell scripts found; skipping shellcheck"
+            exit 0
+          fi
+          echo "Scanning ${#SCRIPTS[@]} script(s):"
+          printf '  %s\n' "${SCRIPTS[@]}"
+          shellcheck --severity=error "${SCRIPTS[@]}"
+
+  actionlint:
+    name: Workflow SAST (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install actionlint
+        run: |
+          curl -sSL https://github.com/rhysd/actionlint/releases/download/v1.7.4/actionlint_1.7.4_linux_amd64.tar.gz \
+            | tar -xz actionlint
+          sudo mv actionlint /usr/local/bin/
+          actionlint -version
+      - name: Run actionlint
+        run: actionlint -color
+
+  gitleaks:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          gitleaks version
+      - name: Run gitleaks (full history)
+        run: gitleaks detect --source . --no-banner --redact --verbose

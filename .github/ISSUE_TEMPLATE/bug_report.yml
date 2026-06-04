@@ -1,0 +1,61 @@
+name: Bug Report
+description: Report a bug or broken behavior in the account switcher.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For **security issues**, do not open an issue —
+        report privately per [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part is affected?
+      options:
+        - Swap / launch / quit behavior (account-switcher.sh)
+        - Install / update (install.sh)
+        - Slash command (commands/)
+        - Docs (README / SECURITY)
+        - Repo config (.github/)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the broken behavior. Include exact output or error if relevant (redact emails/tokens).
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The exact command(s) you ran and what you observed.
+      placeholder: |
+        1. Ran `account-switcher swap backup`
+        2. Observed ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, bash version (`bash --version`), jq version (`jq --version`).
+      placeholder: "macOS 14.1, bash 5.2, jq 1.7"
+    validations:
+      required: true

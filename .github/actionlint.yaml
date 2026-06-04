@@ -1,0 +1,13 @@
+# actionlint configuration — SC2016 suppression for pr-body-parser-clean.yml.
+#
+# pr-body-parser-clean.yml contains shell patterns like ${PR_BODY:-} and
+# ${ANCHOR_LINE:-} inside double-quoted strings that are CORRECT bash parameter
+# expansion. actionlint's shellcheck integration flags some of these as SC2016
+# false-positives. Suppression scope: SC2016 only, at the file level.
+self-hosted-runner:
+  labels: []
+config-variables: []
+paths:
+  .github/workflows/pr-body-parser-clean.yml:
+    ignore:
+      - 'shellcheck reported issue in this script: SC2016:.*'

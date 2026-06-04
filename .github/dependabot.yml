@@ -1,0 +1,23 @@
+# Dependabot configuration — schedules version updates for GitHub Actions.
+# 
+# This repo ships only bash scripts and GitHub Actions workflows — no language-
+# ecosystem manifests (no pip/npm/cargo/go.mod). The only automatically-managed
+# dependency surface is the GitHub Actions in .github/workflows/. The Bash tools
+# pinned by download URL in security.yml (gitleaks, actionlint, shellcheck) are
+# updated by editing that workflow.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - "dependabot"
+      - "cluster: security"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
