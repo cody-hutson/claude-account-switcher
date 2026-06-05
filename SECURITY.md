@@ -6,13 +6,11 @@ Only the latest commit on `main` is supported. Tagged releases are historical re
 
 ## Reporting a Vulnerability
 
-If you believe you have found a security vulnerability in this repository, please report it privately:
+If you believe you have found a security vulnerability in this repository, please report it privately. **Do not open a public issue, PR, or discussion for security reports.**
 
-- **Email:** chutson.git@gmail.com
-- **Subject:** `[claude-account-switcher security] <short description>`
-- **Include:** affected file(s) or commit, steps to reproduce, expected vs. actual behavior, and any proof-of-concept
-
-Please do **not** open a public issue, PR, or discussion for security reports.
+- **Preferred:** [open a private security advisory](https://github.com/cody-hutson/claude-account-switcher/security/advisories/new) (GitHub Private Vulnerability Reporting).
+- **Email (alternate):** chutson.git@gmail.com — subject `[claude-account-switcher security] <short description>`.
+- **Include:** affected file(s) or commit, steps to reproduce, expected vs. actual behavior, and any proof-of-concept.
 
 ## Response Expectations
 
@@ -50,7 +48,8 @@ You will receive an acknowledgement, an initial assessment, and a remediation pl
 | Workflow YAML SAST (actionlint) | See `.github/workflows/security.yml` |
 | Secret scanning (gitleaks, full history) | See `.github/workflows/security.yml` |
 | Native GitHub Secret Scanning + Push Protection | Enabled |
-| Branch protection on `main` | Enabled — 3 required status checks (Bash SAST + Workflow SAST + Secret scanning); force-push and deletions blocked; stale-review dismissal; required conversation resolution |
+| Private Vulnerability Reporting (PVR) | Enabled — the preferred reporting channel above |
+| Branch protection on `main` | Enabled — 4 required status checks (Bash SAST + Workflow SAST + Secret scanning + Personal-data gate); force-push and deletions blocked; stale-review dismissal; required conversation resolution |
 | Commit signing | Maintainer practice; not enforced via branch protection (single-maintainer model) |
 
 ## Automated Security PRs
