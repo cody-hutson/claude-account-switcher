@@ -3,6 +3,13 @@
 Thanks for your interest in `claude-account-switcher`. It's a single bash script
 plus an installer and a slash-command definition — there's no build step.
 
+## Contribution model
+
+This is a personal, single-maintainer project. Write access is limited to invited
+collaborators, and unsolicited external pull requests generally won't be merged. If
+you'd like to contribute, open an issue to ask about collaborator access — it's granted
+by invitation only.
+
 ## Ground rules
 
 - **Commit with a GitHub no-reply email, not a personal one.** Turn on
@@ -25,9 +32,6 @@ plus an installer and a slash-command definition — there's no build step.
 3. Open a PR and fill in the template. Put any `Closes #N` **only** in the
    *Issue References* block at the bottom of the PR body (the auto-close parser is lexical).
 4. CI must be green: shellcheck, actionlint, secret scan, and the depersonalization gate.
-
-This is a single-maintainer project — you can propose changes via a fork PR, but
-the maintainer is the only merger (there are no other write collaborators).
 
 ## Reporting security issues
 
