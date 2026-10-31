@@ -270,6 +270,25 @@ are NOT removed by the uninstall — they hold per-account OAuth state and
 Mac-app preferences. Remove them manually only if you intend to fully
 deauthorize the tagged identity.
 
+## Testing
+
+`bash tests/run.sh` runs the simulated test suite from the repository root.
+Every case runs against fakes in a scratch directory with its own `HOME`, so
+no case can signal a real Claude process, read your keychain, or write a
+real profile. Three things keep it there: the script runs every external
+command and data root through an `AS_*` variable (the seam), which it
+ignores outside test mode; in test mode it refuses to start (exit 78) unless
+every one of those variables points into the scratch directory; and the
+fakes themselves refuse a stray PID, a real keychain service name, or a
+path outside the scratch directory. `tests/README.md` describes the layout
+and how to add a case.
+
+CI runs the suite on a macOS runner under the system `/bin/bash` 3.2 (the
+`T1 simulated suite (macOS)` job in `.github/workflows/tests.yml`). The
+`/account-switcher` slash command runs the installed script with whichever
+`bash` comes first on your `PATH`, so if that is a newer bash, a green CI run
+speaks for `/bin/bash` rather than for the bash your slash command uses.
+
 ## Contributing / Bug reports
 
 Bug reports and feature ideas are welcome — open an issue using the templates.

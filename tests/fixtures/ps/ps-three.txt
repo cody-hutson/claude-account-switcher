@@ -1,0 +1,8 @@
+  PID ARGS
+  501 /Applications/Claude.app/Contents/MacOS/Claude
+  502 /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=__HOME__/Library/Application Support/Claude-tag-a
+  503 /Applications/Claude.app/Contents/MacOS/Claude --user-data-dir=__HOME__/Library/Application Support/Claude-tag-b
+  511 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=utility
+  512 /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer
+  601 /usr/sbin/cfprefsd agent
+  602 -zsh

@@ -14,6 +14,153 @@
 
 set -euo pipefail
 
+# ---- Command paths and roots (test seam) ---------------------------------
+#
+# Every external command runs through an AS_BIN_<NAME> variable and every data
+# root through an AS_<ROOT> variable, so the test suite under tests/ can point
+# them at fakes in a scratch directory. Outside test mode the environment is
+# ignored: each seam name is unset, given the absolute path the script has
+# always used, and made readonly, so a value planted in the caller's
+# environment never reaches a command. Test mode (AS_TEST_MODE=1, which only
+# tests/lib.sh sets) honours the environment, but first runs
+# _as_test_mode_interlock, which exits 78 unless every seam points into the
+# scratch test root. A new command or root joins AS_SEAM_BINS or AS_SEAM_ROOTS,
+# with its default line, in the change that first calls it; the coverage lint
+# in tests/run.sh fails otherwise.
+
+# Prints one refusal line and exits 78 (EX_CONFIG).
+_as_test_refuse() {
+  printf 'ERROR: AS_TEST_MODE=1 but %s. Test mode never runs against real state; refusing.\n' "$1" >&2
+  exit 78
+}
+
+# Returns 0 when path $1 lies strictly under directory $2. The test is
+# lexical, so a path with a ".." component is refused outright.
+_as_test_under() {
+  local path="${1:-}" dir="${2:-}"
+  [[ -n "$path" && -n "$dir" ]] || return 1
+  case "$path" in
+    */../*|*/..|../*|..) return 1 ;;
+  esac
+  [[ "$path" == "$dir"/?* ]]
+}
+
+# Runs only when AS_TEST_MODE=1. Uses builtins only, and every reference is
+# written ${name:-}, so a planted AS_TEST_MODE=1 with nothing else set refuses
+# with 78 instead of tripping set -u.
+_as_test_mode_interlock() {
+  local root="${AS_TEST_ROOT:-}" fakes="${AS_FAKES_DIR:-}"
+  local danger=" KILL SECURITY OSASCRIPT OPEN PS PGREP "
+  local write=" RM MV CP RSYNC CHMOD INSTALL MKTEMP "
+  local name var value line1 line2 class need
+
+  # 1. The scratch root: absolute, normalised, not /, a directory, and marked
+  #    by the sentinel only tests/lib.sh writes.
+  [[ "$root" == /* ]] || _as_test_refuse "AS_TEST_ROOT is not an absolute path (got '${root}')"
+  [[ "$root" != "/" ]] || _as_test_refuse "AS_TEST_ROOT is /"
+  case "$root" in
+    */|*/./*|*/.|*/../*|*/..) _as_test_refuse "AS_TEST_ROOT is not a normalised path (got '${root}')" ;;
+  esac
+  [[ -d "$root" ]] || _as_test_refuse "AS_TEST_ROOT is not an existing directory (got '${root}')"
+  [[ -f "${root}/.as-test-root" ]] || _as_test_refuse "AS_TEST_ROOT has no .as-test-root sentinel (got '${root}')"
+
+  # 2. HOME, and 3. the fakes directory, both under the scratch root.
+  _as_test_under "${HOME:-}" "$root" || _as_test_refuse "HOME is not under AS_TEST_ROOT (got '${HOME:-}')"
+  _as_test_under "$fakes" "$root" || _as_test_refuse "AS_FAKES_DIR is not under AS_TEST_ROOT (got '${fakes}')"
+
+  # 4. Every command is an executable file in the fakes directory. A name the
+  #    harness forgot to export arrives holding its real default (the := lines
+  #    run first), so the location test is what catches it.
+  # 5. Each fake declares its class on line 2; the danger set must record
+  #    without running anything, the write set must guard its paths.
+  for name in ${AS_SEAM_BINS:-}; do
+    var="AS_BIN_${name}"
+    value="${!var:-}"
+    [[ -n "$value" ]] || _as_test_refuse "${var} is unset"
+    [[ -f "$value" && -x "$value" ]] || _as_test_refuse "${var} is not an executable file (got '${value}')"
+    _as_test_under "$value" "$fakes" || _as_test_refuse "${var} is not under AS_FAKES_DIR (got '${value}')"
+    [[ -r "$value" ]] || _as_test_refuse "${var} is not readable (got '${value}')"
+    line1="" line2=""
+    { IFS= read -r line1 || :; IFS= read -r line2 || :; } < "$value"
+    case "${line1}|${line2}" in
+      '#!'*'|# as-fake: recording') class="recording" ;;
+      '#!'*'|# as-fake: guarded-passthrough') class="guarded-passthrough" ;;
+      '#!'*'|# as-fake: passthrough') class="passthrough" ;;
+      *) _as_test_refuse "${var} has no shebang and as-fake class marker on lines 1 and 2 (got '${value}')" ;;
+    esac
+    need=""
+    case "$danger" in *" ${name} "*) need="recording" ;; esac
+    case "$write" in *" ${name} "*) need="guarded-passthrough" ;; esac
+    [[ -z "$need" || "$class" == "$need" ]] || _as_test_refuse "${var} is a ${class} fake but must be ${need}"
+  done
+
+  # 6. Every data root under the scratch root.
+  for name in ${AS_SEAM_ROOTS:-}; do
+    var="AS_${name}"
+    _as_test_under "${!var:-}" "$root" || _as_test_refuse "${var} is not under AS_TEST_ROOT (got '${!var:-}')"
+  done
+
+  # 7. A keychain service name that no real item uses.
+  [[ "${AS_KEYCHAIN_SVC:-}" == as-test-* ]] || _as_test_refuse "AS_KEYCHAIN_SVC does not begin with as-test- (got '${AS_KEYCHAIN_SVC:-}')"
+}
+
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL MKTEMP MV OPEN OSASCRIPT PGREP PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
+AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
+if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
+  # Production: the environment is ignored.
+  for _n in $AS_SEAM_BINS; do unset "AS_BIN_${_n}"; done
+  for _n in $AS_SEAM_ROOTS; do unset "AS_${_n}"; done
+  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC
+fi
+: "${AS_BIN_AWK:=/usr/bin/awk}"
+: "${AS_BIN_BASENAME:=/usr/bin/basename}"
+: "${AS_BIN_CAT:=/bin/cat}"
+: "${AS_BIN_CHMOD:=/bin/chmod}"
+: "${AS_BIN_COMMAND:=/usr/bin/command}"
+: "${AS_BIN_CP:=/bin/cp}"
+: "${AS_BIN_CUT:=/usr/bin/cut}"
+: "${AS_BIN_DATE:=/bin/date}"
+: "${AS_BIN_DU:=/usr/bin/du}"
+: "${AS_BIN_GIT:=/usr/bin/git}"
+: "${AS_BIN_GREP:=/usr/bin/grep}"
+: "${AS_BIN_HEAD:=/usr/bin/head}"
+: "${AS_BIN_INSTALL:=/usr/bin/install}"
+: "${AS_BIN_JQ:=/usr/bin/jq}"
+: "${AS_BIN_KILL:=/bin/kill}"
+: "${AS_BIN_MKTEMP:=/usr/bin/mktemp}"
+: "${AS_BIN_MV:=/bin/mv}"
+: "${AS_BIN_OPEN:=/usr/bin/open}"
+: "${AS_BIN_OSASCRIPT:=/usr/bin/osascript}"
+: "${AS_BIN_PGREP:=/usr/bin/pgrep}"
+: "${AS_BIN_PS:=/bin/ps}"
+: "${AS_BIN_PYTHON3:=/usr/bin/python3}"
+: "${AS_BIN_RM:=/bin/rm}"
+: "${AS_BIN_RSYNC:=/usr/bin/rsync}"
+: "${AS_BIN_SECURITY:=/usr/bin/security}"
+: "${AS_BIN_SED:=/usr/bin/sed}"
+: "${AS_BIN_SLEEP:=/bin/sleep}"
+: "${AS_BIN_TAIL:=/usr/bin/tail}"
+: "${AS_BIN_TR:=/usr/bin/tr}"
+: "${AS_BIN_WC:=/usr/bin/wc}"
+: "${AS_STORE:=${HOME}/.claude/account-switcher}"
+: "${AS_CLAUDE_JSON:=${HOME}/.claude.json}"
+: "${AS_PROFILE_ROOT:=${HOME}/Library/Application Support}"
+: "${AS_APP_BUNDLE:=/Applications/Claude.app}"
+: "${AS_UPDATER_CACHE:=${HOME}/Library/Caches/com.anthropic.claudefordesktop.ShipIt}"
+: "${AS_APP_LOG_DIR:=${HOME}/Library/Logs/Claude}"
+: "${AS_KEYCHAIN_SVC:=Claude Code-credentials}"
+if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
+readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
+  AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
+  AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_MKTEMP AS_BIN_MV \
+  AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PGREP AS_BIN_PS AS_BIN_PYTHON3 \
+  AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SLEEP AS_BIN_TAIL \
+  AS_BIN_TR AS_BIN_WC
+readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
+  AS_APP_LOG_DIR AS_KEYCHAIN_SVC
+
+# ---- End of test seam -----------------------------------------------------
+
 # ---- Constants & paths ---------------------------------------------------
 
 # Bump on every change to this script. `install.sh --check` reads this line
@@ -21,9 +168,9 @@ set -euo pipefail
 # keep it a single `readonly VERSION="..."` assignment.
 readonly VERSION="11.0.0-dev"
 
-readonly STORE="${HOME}/.claude/account-switcher"
-readonly CLAUDE_JSON="${HOME}/.claude.json"
-readonly KEYCHAIN_SVC="Claude Code-credentials"
+readonly STORE="${AS_STORE}"
+readonly CLAUDE_JSON="${AS_CLAUDE_JSON}"
+readonly KEYCHAIN_SVC="${AS_KEYCHAIN_SVC}"
 readonly CONFIG_FILE="${STORE}/config.toml"
 readonly STATUSLINE_MARKER="${STORE}/.statusline-marker"
 readonly SWAP_LOG="${STORE}/swap-history.log"
@@ -91,15 +238,15 @@ validate_note_safe() {
 rotate_swap_log_if_needed() {
   [[ -f "$SWAP_LOG" ]] || return 0
   local total
-  total=$(/usr/bin/wc -l < "$SWAP_LOG" 2>/dev/null | /usr/bin/tr -d ' ')
+  total=$("$AS_BIN_WC" -l < "$SWAP_LOG" 2>/dev/null | "$AS_BIN_TR" -d ' ')
   [[ -n "$total" ]] || return 0
   if [[ "$total" -gt 1100 ]]; then
     local tmp
-    tmp="$(/usr/bin/mktemp)"
-    /usr/bin/tail -n 1000 "$SWAP_LOG" > "$tmp"
-    /bin/mv -f "$SWAP_LOG" "${SWAP_LOG}.1"
-    /bin/mv -f "$tmp" "$SWAP_LOG"
-    /bin/chmod 600 "$SWAP_LOG"
+    tmp="$("$AS_BIN_MKTEMP")"
+    "$AS_BIN_TAIL" -n 1000 "$SWAP_LOG" > "$tmp"
+    "$AS_BIN_MV" -f "$SWAP_LOG" "${SWAP_LOG}.1"
+    "$AS_BIN_MV" -f "$tmp" "$SWAP_LOG"
+    "$AS_BIN_CHMOD" 600 "$SWAP_LOG"
   fi
 }
 
@@ -113,7 +260,7 @@ toml_get() {
   if [[ "$key" == *.* ]]; then
     local table="${key%%.*}"
     local subkey="${key#*.}"
-    /usr/bin/awk -v table="[${table}]" -v sk="${subkey}" '
+    "$AS_BIN_AWK" -v table="[${table}]" -v sk="${subkey}" '
       BEGIN { in_t = 0 }
       /^\[/  { in_t = ($0 == table); next }
       in_t && $0 ~ "^"sk"[[:space:]]*=" {
@@ -122,7 +269,7 @@ toml_get() {
       }
     ' "$file"
   else
-    /usr/bin/awk -v sk="${key}" '
+    "$AS_BIN_AWK" -v sk="${key}" '
       /^\[/ { exit }
       $0 ~ "^"sk"[[:space:]]*=" {
         sub("^"sk"[[:space:]]*=[[:space:]]*", ""); sub("[[:space:]]*$", "")
@@ -140,7 +287,7 @@ toml_get() {
 resolve_tag_from_email() {
   local email="$1"
   [[ -f "$CONFIG_FILE" ]] || { printf '(unmatched)\n'; return; }
-  /usr/bin/awk -v email="$email" '
+  "$AS_BIN_AWK" -v email="$email" '
     /^\[accounts\]/ { in_a = 1; next }
     /^\[/           { in_a = 0 }
     in_a && /profile_email/ {
@@ -161,11 +308,11 @@ resolve_tag_from_email() {
 tag_is_in_accounts() {
   local tag="$1"
   [[ -f "$CONFIG_FILE" ]] || return 1
-  /usr/bin/awk -v tag="$tag" '
+  "$AS_BIN_AWK" -v tag="$tag" '
     /^\[accounts\]/ { in_a = 1; next }
     /^\[/           { in_a = 0 }
     in_a && $0 ~ "^"tag"[[:space:]]*=" { print "FOUND"; exit }
-  ' "$CONFIG_FILE" | /usr/bin/grep -qx "FOUND"
+  ' "$CONFIG_FILE" | "$AS_BIN_GREP" -qx "FOUND"
 }
 
 # ---- Process helpers (M-12) ----------------------------------------------
@@ -174,11 +321,11 @@ tag_is_in_accounts() {
 # (excluding helpers/grep self-matches). Used in place of `pkill -f` to
 # eliminate argv-substring overmatch.
 get_claude_pids() {
-  /bin/ps -axo pid,args 2>/dev/null \
-    | /usr/bin/grep "Claude.app/Contents/MacOS/Claude" \
-    | /usr/bin/grep -v "Claude Helper" \
-    | /usr/bin/grep -v grep \
-    | /usr/bin/awk '{print $1}'
+  "$AS_BIN_PS" -axo pid,args 2>/dev/null \
+    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
+    | "$AS_BIN_GREP" -v "Claude Helper" \
+    | "$AS_BIN_GREP" -v grep \
+    | "$AS_BIN_AWK" '{print $1}'
   # F2-bis: force return 0. When no Claude
   # process matches, the first grep exits 1; pipefail propagates it. With
   # set -euo pipefail, var=$(get_claude_pids) then triggers script exit
@@ -197,7 +344,7 @@ kill_claude_processes() {
   [[ -z "$pids" ]] && return 0
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    /bin/kill "-${sig}" "$pid" 2>/dev/null || true
+    "$AS_BIN_KILL" "-${sig}" "$pid" 2>/dev/null || true
   done <<< "$pids"
 }
 
@@ -205,11 +352,11 @@ kill_claude_processes() {
 # user-data-dir argv. Used by clone-prefs and as race-detection.
 is_instance_running_for_udd() {
   local udd="$1"
-  /bin/ps -axo args 2>/dev/null \
-    | /usr/bin/grep "Claude.app/Contents/MacOS/Claude" \
-    | /usr/bin/grep -v "Claude Helper" \
-    | /usr/bin/grep -v grep \
-    | /usr/bin/grep -F -q -- "--user-data-dir=${udd}"
+  "$AS_BIN_PS" -axo args 2>/dev/null \
+    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
+    | "$AS_BIN_GREP" -v "Claude Helper" \
+    | "$AS_BIN_GREP" -v grep \
+    | "$AS_BIN_GREP" -F -q -- "--user-data-dir=${udd}"
 }
 
 # ---- Mac app surface -----------------------------------------------------
@@ -222,9 +369,9 @@ is_instance_running_for_udd() {
 udd_for_tag() {
   local tag="$1"
   if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
-    printf '%s' "${HOME}/Library/Application Support/Claude"
+    printf '%s' "${AS_PROFILE_ROOT}/Claude"
   else
-    printf '%s' "${HOME}/Library/Application Support/Claude-${tag}"
+    printf '%s' "${AS_PROFILE_ROOT}/Claude-${tag}"
   fi
 }
 
@@ -246,18 +393,18 @@ udd_for_tag() {
 #     fallback (typically: skip session-index mirror).
 detect_running_tag() {
   local udd_arg
-  udd_arg=$(/bin/ps -axo args 2>/dev/null \
-    | /usr/bin/grep "Claude.app/Contents/MacOS/Claude" \
-    | /usr/bin/grep -v "Claude Helper" \
-    | /usr/bin/grep -v grep \
-    | /usr/bin/grep -oE '\-\-user-data-dir=[^[:space:]]+' \
-    | /usr/bin/sed -E 's|^--user-data-dir=||' \
-    | /usr/bin/head -1 || true)
+  udd_arg=$("$AS_BIN_PS" -axo args 2>/dev/null \
+    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
+    | "$AS_BIN_GREP" -v "Claude Helper" \
+    | "$AS_BIN_GREP" -v grep \
+    | "$AS_BIN_GREP" -oE '\-\-user-data-dir=[^[:space:]]+' \
+    | "$AS_BIN_SED" -E 's|^--user-data-dir=||' \
+    | "$AS_BIN_HEAD" -1 || true)
 
   if [[ -n "$udd_arg" ]]; then
     # Preferred: parse from argv (most accurate at moment of capture).
     local bn
-    bn=$(/usr/bin/basename "$udd_arg")
+    bn=$("$AS_BIN_BASENAME" "$udd_arg")
     case "$bn" in
       Claude)        printf '%s' "primary"; return 0 ;;
       Claude-*)      printf '%s' "${bn#Claude-}"; return 0 ;;
@@ -281,10 +428,10 @@ detect_running_tag() {
   #   (b) If Claude.app is running but no marker, default to primary
   #       (covers cold-start / first-ever-launch scenarios).
   #   (c) If no Claude.app running at all, return empty (caller decides).
-  if /usr/bin/pgrep -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
+  if "$AS_BIN_PGREP" -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
     if [[ -f "$STATUSLINE_MARKER" ]]; then
       local marker_tag
-      marker_tag=$(/bin/cat "$STATUSLINE_MARKER" 2>/dev/null | /usr/bin/head -1 | /usr/bin/tr -d '[:space:]')
+      marker_tag=$("$AS_BIN_CAT" "$STATUSLINE_MARKER" 2>/dev/null | "$AS_BIN_HEAD" -1 | "$AS_BIN_TR" -d '[:space:]')
       if [[ -n "$marker_tag" ]]; then
         printf '%s' "$marker_tag"
         return 0
@@ -355,8 +502,8 @@ capture_handoff() {
   local git_root
   git_root=$(toml_get "swap_handoff.git_root" 2>/dev/null || echo "")
   git_root="${git_root/#\~/$HOME}"
-  if [[ -z "$git_root" ]] && /usr/bin/git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git_root="$(/usr/bin/git rev-parse --show-toplevel 2>/dev/null)"
+  if [[ -z "$git_root" ]] && "$AS_BIN_GIT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git_root="$("$AS_BIN_GIT" rev-parse --show-toplevel 2>/dev/null)"
   fi
 
   local handoff_file="${ws_dir}/SWAP_HANDOFF.md"
@@ -369,14 +516,14 @@ capture_handoff() {
 
   # ---- Compute time cutoff -----------------------------------------------
   local now_ts cutoff_ts last_swap_ts twenty_four_hours_ago
-  now_ts=$(/bin/date +%s)
+  now_ts=$("$AS_BIN_DATE" +%s)
   twenty_four_hours_ago=$((now_ts - 86400))
 
-  last_swap_ts=$(/usr/bin/grep '^\[' "$SWAP_LOG" 2>/dev/null \
-    | /usr/bin/grep ' APP_SWAP ' \
-    | /usr/bin/tail -1 \
-    | /usr/bin/awk -F'[][]' '{print $2}' \
-    | /usr/bin/python3 -c '
+  last_swap_ts=$("$AS_BIN_GREP" '^\[' "$SWAP_LOG" 2>/dev/null \
+    | "$AS_BIN_GREP" ' APP_SWAP ' \
+    | "$AS_BIN_TAIL" -1 \
+    | "$AS_BIN_AWK" -F'[][]' '{print $2}' \
+    | "$AS_BIN_PYTHON3" -c '
 import sys, datetime
 line = sys.stdin.read().strip()
 if line:
@@ -392,8 +539,8 @@ else:
   fi
 
   local cutoff_iso now_iso
-  cutoff_iso=$(/usr/bin/python3 -c "import datetime; print(datetime.datetime.utcfromtimestamp($cutoff_ts).isoformat() + 'Z')")
-  now_iso=$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)
+  cutoff_iso=$("$AS_BIN_PYTHON3" -c "import datetime; print(datetime.datetime.utcfromtimestamp($cutoff_ts).isoformat() + 'Z')")
+  now_iso=$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)
 
   info "Capturing swap handoff to ${handoff_file}..."
   info "  Window: since ${cutoff_iso}"
@@ -408,11 +555,11 @@ else:
   local active_branch="(no git workspace configured)"
   local active_worktree="(none)"
   if [[ -n "$git_root" ]] && [[ -d "${git_root}/.git" ]]; then
-    active_branch=$(/usr/bin/git -C "${git_root}" branch --show-current 2>/dev/null || echo "")
+    active_branch=$("$AS_BIN_GIT" -C "${git_root}" branch --show-current 2>/dev/null || echo "")
     if [[ -z "$active_branch" ]]; then
       # Detached HEAD — report the SHA short form for traceability.
       local detached_sha
-      detached_sha=$(/usr/bin/git -C "${git_root}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+      detached_sha=$("$AS_BIN_GIT" -C "${git_root}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
       active_branch="(detached @ ${detached_sha})"
     fi
     active_worktree="${git_root}"
@@ -426,13 +573,13 @@ else:
   # Commits since cutoff (max 50, redacted, truncated)
   local commits_block="(no git workspace configured)"
   if [[ -n "$git_root" ]] && [[ -d "${git_root}/.git" ]]; then
-    commits_block=$(/usr/bin/git -C "${git_root}" log \
+    commits_block=$("$AS_BIN_GIT" -C "${git_root}" log \
       --since="${cutoff_iso}" \
       --pretty=format:'- `%h` %s' \
       --max-count=50 \
       2>/dev/null \
-      | /usr/bin/sed -E "$redact" \
-      | /usr/bin/awk "$truncate" \
+      | "$AS_BIN_SED" -E "$redact" \
+      | "$AS_BIN_AWK" "$truncate" \
       || true)
     [[ -z "$commits_block" ]] && commits_block="(no commits since cutoff)"
   fi
@@ -445,7 +592,7 @@ else:
 
   # Issues touched (max 20, search by updated-at)
   local issues_block="(gh repo not configured — see config.toml [swap_handoff].gh_repo)"
-  if [[ -n "$gh_repo" ]] && /usr/bin/command -v gh >/dev/null 2>&1; then
+  if [[ -n "$gh_repo" ]] && "$AS_BIN_COMMAND" -v gh >/dev/null 2>&1; then
     issues_block=$(gh issue list \
       --repo "$gh_repo" \
       --state all \
@@ -454,17 +601,17 @@ else:
       --json number,state,title,updatedAt \
       --jq '.[] | "- #\(.number) [\(.state)] \(.title)"' \
       2>/dev/null \
-      | /usr/bin/sed -E "$redact" \
-      | /usr/bin/awk "$truncate" \
+      | "$AS_BIN_SED" -E "$redact" \
+      | "$AS_BIN_AWK" "$truncate" \
       || true)
     [[ -z "$issues_block" ]] && issues_block="(no issues touched since cutoff)"
-  elif ! /usr/bin/command -v gh >/dev/null 2>&1; then
+  elif ! "$AS_BIN_COMMAND" -v gh >/dev/null 2>&1; then
     issues_block="(gh CLI unavailable)"
   fi
 
   # Open PRs (current state, not historical)
   local prs_block="(gh repo not configured — see config.toml [swap_handoff].gh_repo)"
-  if [[ -n "$gh_repo" ]] && /usr/bin/command -v gh >/dev/null 2>&1; then
+  if [[ -n "$gh_repo" ]] && "$AS_BIN_COMMAND" -v gh >/dev/null 2>&1; then
     prs_block=$(gh pr list \
       --repo "$gh_repo" \
       --state open \
@@ -472,11 +619,11 @@ else:
       --json number,isDraft,title,headRefName \
       --jq '.[] | "- #\(.number) [\(if .isDraft then "DRAFT" else "OPEN" end)] \(.title) (\(.headRefName))"' \
       2>/dev/null \
-      | /usr/bin/sed -E "$redact" \
-      | /usr/bin/awk "$truncate" \
+      | "$AS_BIN_SED" -E "$redact" \
+      | "$AS_BIN_AWK" "$truncate" \
       || true)
     [[ -z "$prs_block" ]] && prs_block="(no open PRs)"
-  elif ! /usr/bin/command -v gh >/dev/null 2>&1; then
+  elif ! "$AS_BIN_COMMAND" -v gh >/dev/null 2>&1; then
     prs_block="(gh CLI unavailable)"
   fi
 
@@ -485,8 +632,8 @@ else:
   if [[ -n "$git_root" ]] && [[ -d "${git_root}/.git" ]]; then
     files_block="(no uncommitted changes)"
     local porcelain
-    porcelain=$(/usr/bin/git -C "${git_root}" status --porcelain 2>/dev/null \
-      | /usr/bin/awk 'NR<=50 {print "- " $0}' \
+    porcelain=$("$AS_BIN_GIT" -C "${git_root}" status --porcelain 2>/dev/null \
+      | "$AS_BIN_AWK" 'NR<=50 {print "- " $0}' \
       || true)
     [[ -n "$porcelain" ]] && files_block="$porcelain"
   fi
@@ -494,9 +641,9 @@ else:
   # Active project — peek at PORTFOLIO.md under the workspace dir if present
   local active_project="(none configured)"
   if [[ -f "${ws_dir}/PORTFOLIO.md" ]]; then
-    active_project=$(/usr/bin/grep -m 1 -E '^### [A-Z]' "${ws_dir}/PORTFOLIO.md" 2>/dev/null \
-      | /usr/bin/sed 's/^### //;s/[[:space:]]*$//' \
-      | /usr/bin/awk "$truncate" \
+    active_project=$("$AS_BIN_GREP" -m 1 -E '^### [A-Z]' "${ws_dir}/PORTFOLIO.md" 2>/dev/null \
+      | "$AS_BIN_SED" 's/^### //;s/[[:space:]]*$//' \
+      | "$AS_BIN_AWK" "$truncate" \
       || echo "(none)")
   fi
 
@@ -507,11 +654,11 @@ else:
     # auto-redact (operator may want to reference specific identifiers). Just
     # truncate to a reasonable length.
     local note_truncated
-    note_truncated=$(printf '%s' "$operator_note" | /usr/bin/awk '{ if (length > 240) print substr($0, 1, 240) "…"; else print $0 }')
+    note_truncated=$(printf '%s' "$operator_note" | "$AS_BIN_AWK" '{ if (length > 240) print substr($0, 1, 240) "…"; else print $0 }')
     note_line="- **Operator note:** ${note_truncated}"
   fi
 
-  /bin/cat > "$handoff_file" <<HANDOFF_EOF
+  "$AS_BIN_CAT" > "$handoff_file" <<HANDOFF_EOF
 # Swap Handoff State
 
 > Auto-generated by account-switcher at the swap boundary. Captures
@@ -561,7 +708,7 @@ ${files_block}
 *handoff snapshot, copy this file to a timestamped backup before swapping.*
 HANDOFF_EOF
 
-  /bin/chmod 644 "$handoff_file"
+  "$AS_BIN_CHMOD" 644 "$handoff_file"
 
   ok "Handoff captured: ${handoff_file}"
 
@@ -590,7 +737,7 @@ _alive_pids() {
   local any_alive="false"
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    if /bin/kill -0 "$pid" 2>/dev/null; then
+    if "$AS_BIN_KILL" -0 "$pid" 2>/dev/null; then
       any_alive="true"
       printf '%s\n' "$pid"
     fi
@@ -614,7 +761,7 @@ quit_all_claude() {
   fi
 
   info "Sending graceful quit to running Claude instances..."
-  /usr/bin/osascript -e 'tell application "Claude" to quit' 2>/dev/null || true
+  "$AS_BIN_OSASCRIPT" -e 'tell application "Claude" to quit' 2>/dev/null || true
 
   # M-4: 15-second graceful-quit timeout (was 5s). Electron typically
   # finishes pending writes within seconds, but leveldb compaction can run
@@ -628,7 +775,7 @@ quit_all_claude() {
     if ! _alive_pids "$initial_pids" >/dev/null 2>&1; then
       break
     fi
-    /bin/sleep 1
+    "$AS_BIN_SLEEP" 1
     n=$((n + 1))
   done
 
@@ -644,13 +791,13 @@ quit_all_claude() {
     local p
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      /bin/kill -TERM "$p" 2>/dev/null || true
+      "$AS_BIN_KILL" -TERM "$p" 2>/dev/null || true
     done <<< "$alive_initial"
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      /bin/kill -TERM "$p" 2>/dev/null || true
+      "$AS_BIN_KILL" -TERM "$p" 2>/dev/null || true
     done <<< "$fresh_pids"
-    /bin/sleep 2
+    "$AS_BIN_SLEEP" 2
   fi
 
   # M-12 + F2: SIGKILL via PID list. Re-scan with kill -0 + fresh
@@ -663,13 +810,13 @@ quit_all_claude() {
     local p
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      /bin/kill -KILL "$p" 2>/dev/null || true
+      "$AS_BIN_KILL" -KILL "$p" 2>/dev/null || true
     done <<< "$alive_initial"
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      /bin/kill -KILL "$p" 2>/dev/null || true
+      "$AS_BIN_KILL" -KILL "$p" 2>/dev/null || true
     done <<< "$fresh_pids"
-    /bin/sleep 1
+    "$AS_BIN_SLEEP" 1
   fi
 
   # M-5 + F2: Final verification using BOTH kill -0 (initial PID set) AND
@@ -686,7 +833,7 @@ quit_all_claude() {
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     # Only count fresh PIDs that were not in the initial set (already counted above).
-    if ! /usr/bin/grep -qx "$p" <<< "$initial_pids"; then
+    if ! "$AS_BIN_GREP" -qx "$p" <<< "$initial_pids"; then
       stragglers+=("${p} (launched during quit window)")
     fi
   done <<< "$fresh_pids"
@@ -719,9 +866,9 @@ cmd_launch() {
   fi
 
   if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
-    /usr/bin/open -n -a "Claude"
+    "$AS_BIN_OPEN" -n -a "Claude"
   else
-    /usr/bin/open -n -a "Claude" --args --user-data-dir="$udd"
+    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="$udd"
   fi
 
   ok "Launched. Look for the new Claude window."
@@ -729,7 +876,7 @@ cmd_launch() {
   printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
 
   printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
-    "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
     >> "$SWAP_LOG"
 
   if [[ "$first_launch" == "true" ]]; then
@@ -750,16 +897,16 @@ cmd_list_instances() {
     [[ -z "$line" ]] && continue
     found=1
     local pid
-    pid=$(printf '%s' "$line" | /usr/bin/awk '{print $1}')
+    pid=$(printf '%s' "$line" | "$AS_BIN_AWK" '{print $1}')
     local args
-    args=$(printf '%s' "$line" | /usr/bin/cut -d' ' -f2-)
+    args=$(printf '%s' "$line" | "$AS_BIN_CUT" -d' ' -f2-)
 
     local udd tag
-    if printf '%s' "$args" | /usr/bin/grep -q -- '--user-data-dir='; then
-      udd=$(printf '%s' "$args" | /usr/bin/sed -E 's/.*--user-data-dir=//')
-      udd=$(printf '%s' "$udd" | /usr/bin/sed -E 's/ -[-]?[a-z][a-z-]*([= ].*)?$//')
+    if printf '%s' "$args" | "$AS_BIN_GREP" -q -- '--user-data-dir='; then
+      udd=$(printf '%s' "$args" | "$AS_BIN_SED" -E 's/.*--user-data-dir=//')
+      udd=$(printf '%s' "$udd" | "$AS_BIN_SED" -E 's/ -[-]?[a-z][a-z-]*([= ].*)?$//')
       local base
-      base=$(/usr/bin/basename "$udd")
+      base=$("$AS_BIN_BASENAME" "$udd")
       if [[ "$base" == "Claude" ]]; then
         tag="primary"
       elif [[ "$base" == Claude-* ]]; then
@@ -768,28 +915,28 @@ cmd_list_instances() {
         tag="(unknown)"
       fi
     else
-      udd="${HOME}/Library/Application Support/Claude"
+      udd="${AS_PROFILE_ROOT}/Claude"
       tag="primary"
     fi
 
     printf '  PID %-7s tag=%-12s data-dir=%s\n' "$pid" "$tag" "$udd"
-  done < <(/bin/ps -axo pid,args 2>/dev/null \
-            | /usr/bin/grep "Claude.app/Contents/MacOS/Claude" \
-            | /usr/bin/grep -v "Claude Helper" \
-            | /usr/bin/grep -v grep)
+  done < <("$AS_BIN_PS" -axo pid,args 2>/dev/null \
+            | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
+            | "$AS_BIN_GREP" -v "Claude Helper" \
+            | "$AS_BIN_GREP" -v grep)
 
   if [[ $found -eq 0 ]]; then
     printf '  (no Claude desktop app instances running)\n'
   fi
   printf '\n'
 
-  printf 'Configured profiles (under "%s"):\n' "${HOME}/Library/Application Support/"
-  for d in "${HOME}/Library/Application Support/Claude" "${HOME}/Library/Application Support/Claude-"*; do
+  printf 'Configured profiles (under "%s"):\n' "${AS_PROFILE_ROOT}/"
+  for d in "${AS_PROFILE_ROOT}/Claude" "${AS_PROFILE_ROOT}/Claude-"*; do
     [[ -d "$d" ]] || continue
     local tag
-    tag=$(/usr/bin/basename "$d" | /usr/bin/sed 's/^Claude-//; s/^Claude$/primary/')
+    tag=$("$AS_BIN_BASENAME" "$d" | "$AS_BIN_SED" 's/^Claude-//; s/^Claude$/primary/')
     local size
-    size=$(/usr/bin/du -sh "$d" 2>/dev/null | /usr/bin/awk '{print $1}')
+    size=$("$AS_BIN_DU" -sh "$d" 2>/dev/null | "$AS_BIN_AWK" '{print $1}')
     printf '  %-12s %s  (%s)\n' "$tag" "$d" "${size:-?}"
   done
   printf '\n'
@@ -848,7 +995,7 @@ cmd_swap_app() {
   done
 
   if [[ -z "$target_tag" ]]; then
-    /bin/cat <<EOF >&2
+    "$AS_BIN_CAT" <<EOF >&2
 Usage: account-switcher swap <tag> [flags]
   flags:
     --no-mirror              skip auto-clone-prefs (default: auto-mirror primary→target)
@@ -900,7 +1047,7 @@ EOF
       # the swap event. Operator can override via --note if needed.
       running_tag_for_handoff="primary"
     fi
-    capture_handoff "$running_tag_for_handoff" "$target_tag" "$operator_note" 2>&1 | /usr/bin/sed 's/^/    /'
+    capture_handoff "$running_tag_for_handoff" "$target_tag" "$operator_note" 2>&1 | "$AS_BIN_SED" 's/^/    /'
     printf '\n'
   fi
 
@@ -913,7 +1060,7 @@ EOF
     primary_udd=$(udd_for_tag "primary")
     if [[ -d "$primary_udd" ]] && [[ -d "$target_udd" ]]; then
       info "Auto-mirroring primary's user-facing prefs → ${target_tag}..."
-      cmd_clone_prefs "primary" "$target_tag" 2>&1 | /usr/bin/sed 's/^/    /'
+      cmd_clone_prefs "primary" "$target_tag" 2>&1 | "$AS_BIN_SED" 's/^/    /'
       printf '\n'
     elif [[ ! -d "$target_udd" ]]; then
       info "Skipping auto-mirror (target dir doesn't exist yet; first launch will create it)"
@@ -928,16 +1075,16 @@ EOF
   info "  user-data-dir: ${target_udd}"
 
   if [[ "$is_primary" == "true" ]]; then
-    /usr/bin/open -n -a "Claude"
+    "$AS_BIN_OPEN" -n -a "Claude"
   else
-    /usr/bin/open -n -a "Claude" --args --user-data-dir="${target_udd}"
+    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="${target_udd}"
   fi
 
   ok "Swapped to '${target_tag}'. Bridged Code billing will follow ${target_tag}'s account auth."
 
   printf '%s\n' "$target_tag" > "$STATUSLINE_MARKER"
   printf '[%s] APP_SWAP target=%s udd=%s first_launch=%s mirror=%s\n' \
-    "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
     "$([ "$skip_mirror" == "false" ] && echo "yes" || echo "no")" \
     >> "$SWAP_LOG"
 
@@ -980,13 +1127,13 @@ _clone_prefs_restore_on_failure() {
     local item
     for item in "${__CLONE_PREFS_SNAPSHOTTED[@]}"; do
       if [[ -e "${__CLONE_PREFS_SNAPSHOT_DIR}/${item}" ]]; then
-        /bin/rm -rf "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
-        /bin/mv "${__CLONE_PREFS_SNAPSHOT_DIR}/${item}" "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
+        "$AS_BIN_RM" -rf "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
+        "$AS_BIN_MV" "${__CLONE_PREFS_SNAPSHOT_DIR}/${item}" "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
       fi
     done
   fi
   if [[ -d "$__CLONE_PREFS_SNAPSHOT_DIR" ]]; then
-    /bin/rm -rf "$__CLONE_PREFS_SNAPSHOT_DIR" 2>/dev/null || true
+    "$AS_BIN_RM" -rf "$__CLONE_PREFS_SNAPSHOT_DIR" 2>/dev/null || true
   fi
 }
 
@@ -1002,7 +1149,7 @@ cleanup_orphan_clone_prefs_snapshots() {
   shopt -s nullglob
   for d in "${target_udd}"/.clone-prefs-bak.*; do
     [[ -d "$d" ]] || continue
-    /bin/rm -rf "$d" 2>/dev/null || true
+    "$AS_BIN_RM" -rf "$d" 2>/dev/null || true
     count=$((count + 1))
   done
   shopt -u nullglob
@@ -1045,7 +1192,7 @@ cmd_clone_prefs() {
   # If Anthropic ever stores OAuth/device/secret material in this file in a
   # future Mac-app version, refuse to mirror it across accounts.
   if [[ -f "${source_udd}/claude_desktop_config.json" ]]; then
-    if /usr/bin/grep -qiE '"(oauth|tokenCache|accessToken|refreshToken|clientSecret|authToken|sessionToken|deviceId|deviceToken|bearerToken)"' "${source_udd}/claude_desktop_config.json" 2>/dev/null; then
+    if "$AS_BIN_GREP" -qiE '"(oauth|tokenCache|accessToken|refreshToken|clientSecret|authToken|sessionToken|deviceId|deviceToken|bearerToken)"' "${source_udd}/claude_desktop_config.json" 2>/dev/null; then
       die "Source claude_desktop_config.json contains sensitive-looking keys (oauth/tokenCache/accessToken/etc.). Refusing to mirror credentials across accounts (M-10). Manual review required."
     fi
   fi
@@ -1058,8 +1205,8 @@ cmd_clone_prefs() {
   # inside target_udd to guarantee same-filesystem (atomic rename via
   # rename(2)). On failure or interrupt, the trap restores from snapshot.
   local snapshot_dir
-  snapshot_dir="$(/usr/bin/mktemp -d "${target_udd}/.clone-prefs-bak.XXXXXX")"
-  /bin/chmod 700 "$snapshot_dir"
+  snapshot_dir="$("$AS_BIN_MKTEMP" -d "${target_udd}/.clone-prefs-bak.XXXXXX")"
+  "$AS_BIN_CHMOD" 700 "$snapshot_dir"
 
   __CLONE_PREFS_SUCCEEDED="false"
   __CLONE_PREFS_SNAPSHOT_DIR="$snapshot_dir"
@@ -1075,7 +1222,7 @@ cmd_clone_prefs() {
   local item
   for item in "${items_to_clone[@]}"; do
     if [[ -e "${target_udd}/${item}" ]]; then
-      /bin/mv "${target_udd}/${item}" "${snapshot_dir}/${item}"
+      "$AS_BIN_MV" "${target_udd}/${item}" "${snapshot_dir}/${item}"
       __CLONE_PREFS_SNAPSHOTTED+=("$item")
     fi
   done
@@ -1093,7 +1240,7 @@ cmd_clone_prefs() {
 
   # 1. claude_desktop_config.json
   if [[ -f "${source_udd}/claude_desktop_config.json" ]]; then
-    /bin/cp "${source_udd}/claude_desktop_config.json" "${target_udd}/claude_desktop_config.json"
+    "$AS_BIN_CP" "${source_udd}/claude_desktop_config.json" "${target_udd}/claude_desktop_config.json"
     mirrored+=("claude_desktop_config.json")
   else
     skipped+=("claude_desktop_config.json (source missing)")
@@ -1102,7 +1249,7 @@ cmd_clone_prefs() {
   # 2. Claude Extensions/ (rsync without --delete; target was moved to snapshot,
   #    so no stale entries to delete).
   if [[ -d "${source_udd}/Claude Extensions" ]]; then
-    /usr/bin/rsync -a "${source_udd}/Claude Extensions/" "${target_udd}/Claude Extensions/"
+    "$AS_BIN_RSYNC" -a "${source_udd}/Claude Extensions/" "${target_udd}/Claude Extensions/"
     mirrored+=("Claude Extensions/")
   else
     skipped+=("Claude Extensions/ (source missing)")
@@ -1110,7 +1257,7 @@ cmd_clone_prefs() {
 
   # 3. Claude Extensions Settings/
   if [[ -d "${source_udd}/Claude Extensions Settings" ]]; then
-    /usr/bin/rsync -a "${source_udd}/Claude Extensions Settings/" "${target_udd}/Claude Extensions Settings/"
+    "$AS_BIN_RSYNC" -a "${source_udd}/Claude Extensions Settings/" "${target_udd}/Claude Extensions Settings/"
     mirrored+=("Claude Extensions Settings/")
   else
     skipped+=("Claude Extensions Settings/ (source missing)")
@@ -1121,7 +1268,7 @@ cmd_clone_prefs() {
   if [[ -f "${source_udd}/git-worktrees.json" ]]; then
     if [[ -f "${snapshot_dir}/git-worktrees.json" ]]; then
       local merged_json
-      merged_json=$(/usr/bin/jq -s \
+      merged_json=$("$AS_BIN_JQ" -s \
         '(.[1].worktrees // {}) as $tgt | (.[0].worktrees // {}) as $src
          | {worktrees: ($tgt + $src),
             schemaVersion: ([.[0].schemaVersion // 1, .[1].schemaVersion // 1] | max)}' \
@@ -1129,11 +1276,11 @@ cmd_clone_prefs() {
         "${snapshot_dir}/git-worktrees.json")
       printf '%s\n' "$merged_json" > "${target_udd}/git-worktrees.json"
       local source_count target_count
-      source_count=$(/usr/bin/jq -r '.worktrees | length' "${source_udd}/git-worktrees.json" 2>/dev/null || echo 0)
-      target_count=$(printf '%s' "$merged_json" | /usr/bin/jq -r '.worktrees | length')
+      source_count=$("$AS_BIN_JQ" -r '.worktrees | length' "${source_udd}/git-worktrees.json" 2>/dev/null || echo 0)
+      target_count=$(printf '%s' "$merged_json" | "$AS_BIN_JQ" -r '.worktrees | length')
       mirrored+=("git-worktrees.json (merged: source=${source_count} → target=${target_count})")
     else
-      /bin/cp "${source_udd}/git-worktrees.json" "${target_udd}/git-worktrees.json"
+      "$AS_BIN_CP" "${source_udd}/git-worktrees.json" "${target_udd}/git-worktrees.json"
       mirrored+=("git-worktrees.json (copied; target had none)")
     fi
   else
@@ -1142,7 +1289,7 @@ cmd_clone_prefs() {
 
   # All apply steps succeeded — mark complete, clean up snapshot, clear trap.
   __CLONE_PREFS_SUCCEEDED="true"
-  /bin/rm -rf "$snapshot_dir"
+  "$AS_BIN_RM" -rf "$snapshot_dir"
   __CLONE_PREFS_SNAPSHOT_DIR=""
   trap - INT TERM EXIT
 
@@ -1152,7 +1299,7 @@ cmd_clone_prefs() {
   done
 
   printf '[%s] CLONE_PREFS source=%s target=%s mirrored=%s\n' \
-    "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$source_tag" "$target_tag" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$source_tag" "$target_tag" \
     "$(IFS=,; echo "${mirrored[*]}")" \
     >> "$SWAP_LOG"
 
@@ -1181,7 +1328,7 @@ cmd_quit() {
   case "$target" in
     --all|all|"")
       quit_all_claude
-      printf '[%s] QUIT_ALL\n' "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG"
+      printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG"
       ;;
     *)
       # H-1: Reject malformed tags even though per-tag quit is not yet
@@ -1199,8 +1346,8 @@ cmd_status() {
 
   # CLI identity (what bridged Code reads from when displaying the account name).
   local active_email active_uuid
-  active_email=$(/usr/bin/jq -r '.oauthAccount.emailAddress // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
-  active_uuid=$(/usr/bin/jq -r '.oauthAccount.accountUuid // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
+  active_email=$("$AS_BIN_JQ" -r '.oauthAccount.emailAddress // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
+  active_uuid=$("$AS_BIN_JQ" -r '.oauthAccount.accountUuid // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
 
   printf 'CLI identity (from ~/.claude.json):\n'
   printf '  email:        %s\n' "$active_email"
@@ -1210,10 +1357,10 @@ cmd_status() {
   # shared across all CLI invocations regardless of which Mac app instance
   # spawned them).
   local kc_blob
-  if kc_blob=$(/usr/bin/security find-generic-password -s "${KEYCHAIN_SVC}" -w 2>/dev/null); then
+  if kc_blob=$("$AS_BIN_SECURITY" find-generic-password -s "${KEYCHAIN_SVC}" -w 2>/dev/null); then
     local sub rate
-    sub=$(printf '%s' "$kc_blob" | /usr/bin/jq -r '.claudeAiOauth.subscriptionType // "(unknown)"')
-    rate=$(printf '%s' "$kc_blob" | /usr/bin/jq -r '.claudeAiOauth.rateLimitTier // "(unknown)"')
+    sub=$(printf '%s' "$kc_blob" | "$AS_BIN_JQ" -r '.claudeAiOauth.subscriptionType // "(unknown)"')
+    rate=$(printf '%s' "$kc_blob" | "$AS_BIN_JQ" -r '.claudeAiOauth.rateLimitTier // "(unknown)"')
     printf '  subscription: %s (rate=%s)\n' "$sub" "$rate"
     unset kc_blob
   else
@@ -1222,7 +1369,7 @@ cmd_status() {
 
   local resolved_tag last_swap
   resolved_tag=$(resolve_tag_from_email "$active_email")
-  last_swap=$(/bin/cat "$STATUSLINE_MARKER" 2>/dev/null || echo "(unset)")
+  last_swap=$("$AS_BIN_CAT" "$STATUSLINE_MARKER" 2>/dev/null || echo "(unset)")
   printf '  switcher tag: %s\n' "$resolved_tag"
   printf '  last swap target: %s\n\n' "$last_swap"
 
@@ -1239,7 +1386,7 @@ cmd_config() {
   case "$sub" in
     show)
       if [[ -f "$CONFIG_FILE" ]]; then
-        /bin/cat "$CONFIG_FILE"
+        "$AS_BIN_CAT" "$CONFIG_FILE"
       else
         warn "No config.toml exists yet at ${CONFIG_FILE}."
       fi
@@ -1269,7 +1416,7 @@ cmd_add_account() {
   local label="${3:-}"
 
   if [[ -z "$tag" ]] || [[ -z "$email" ]]; then
-    /bin/cat <<EOF >&2
+    "$AS_BIN_CAT" <<EOF >&2
 Usage: account-switcher add-account <tag> <email> [label]
 
 Registers a tag → email mapping in [accounts] of:
@@ -1300,7 +1447,7 @@ EOF
 
   # Default label = tag with first letter capitalized.
   if [[ -z "$label" ]]; then
-    label="$(printf '%s' "${tag:0:1}" | /usr/bin/tr '[:lower:]' '[:upper:]')${tag:1}"
+    label="$(printf '%s' "${tag:0:1}" | "$AS_BIN_TR" '[:lower:]' '[:upper:]')${tag:1}"
   fi
 
   # Reject shell metacharacters in label (slash command surface guard, M-1 layered defence).
@@ -1310,7 +1457,7 @@ EOF
 
   # Ensure config file exists with [accounts] section.
   if [[ ! -f "$CONFIG_FILE" ]]; then
-    /usr/bin/install -m 600 /dev/null "$CONFIG_FILE"
+    "$AS_BIN_INSTALL" -m 600 /dev/null "$CONFIG_FILE"
     printf '# ~/.claude/account-switcher/config.toml\n# Auto-generated on first add-account.\n\nversion = 1\n\n[accounts]\n' >> "$CONFIG_FILE"
   fi
 
@@ -1331,8 +1478,8 @@ EOF
   # [accounts] is the last section). If [accounts] section is missing,
   # add it at the end of the file.
   local tmp
-  tmp="$(/usr/bin/mktemp)"
-  /usr/bin/awk -v new_entry="$new_entry" '
+  tmp="$("$AS_BIN_MKTEMP")"
+  "$AS_BIN_AWK" -v new_entry="$new_entry" '
     BEGIN { in_a = 0; inserted = 0; has_accounts = 0 }
     /^\[accounts\]/ { in_a = 1; has_accounts = 1; print; next }
     /^\[/ && in_a {
@@ -1351,20 +1498,20 @@ EOF
     }
   ' "$CONFIG_FILE" > "$tmp"
 
-  /bin/mv -f "$tmp" "$CONFIG_FILE"
-  /bin/chmod 600 "$CONFIG_FILE"
+  "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
+  "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
 
   ok "Registered account: tag=${tag} email=${email} label='${label}'"
 
   printf '[%s] ADD_ACCOUNT tag=%s email=%s label=%s\n' \
-    "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$email" "$label" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$email" "$label" \
     >> "$SWAP_LOG"
 }
 
 # ---- Help ----------------------------------------------------------------
 
 cmd_help() {
-  /bin/cat <<EOF
+  "$AS_BIN_CAT" <<EOF
 Claude desktop app account switcher (v${VERSION})
 
 The bridged Code subprocess proxies API calls through the Mac app's parent

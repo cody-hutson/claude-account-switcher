@@ -1,0 +1,159 @@
+# Tests
+
+The T1 suite is simulated: every case runs `account-switcher.sh` or
+`install.sh` against fakes in a scratch directory, never against a running
+Claude app, the keychain, or a real profile. It is plain bash and runs under
+the system `/bin/bash` 3.2.
+
+## Running it
+
+From the repository root:
+
+```bash
+bash tests/run.sh                      # every check and every tests/t-*.sh file
+bash tests/run.sh t-05-install-check   # the checks, then just that file
+bash tests/run.sh --check-defaults     # only: every seam default is an executable file
+```
+
+Exit status: `0` all passed, `1` a case failed, `2` a harness error. A failing
+case prints its last exit code and the first lines of its output. Set
+`TEST_KEEP=1` to keep the scratch directories for inspection.
+
+Before the test files, `run.sh` parses every script with `/bin/bash -n`,
+runs the seam-coverage lint (no command named by absolute path outside the
+seam block, and one default line per `AS_SEAM_BINS` name; each lint has a
+control case that proves it can fail), and checks that every default
+command path exists on this machine.
+
+## Why a case cannot reach real state
+
+Three layers, all of which have tests in `t-00-seam.sh`:
+
+1. **The seam.** `account-switcher.sh` runs every external command through an
+   `AS_BIN_<NAME>` variable and reads every data root through an `AS_<ROOT>`
+   variable (`AS_STORE`, `AS_CLAUDE_JSON`, `AS_PROFILE_ROOT`, `AS_APP_BUNDLE`,
+   `AS_UPDATER_CACHE`, `AS_APP_LOG_DIR`), plus `AS_KEYCHAIN_SVC`. Outside test
+   mode the script unsets every one of them and uses the absolute paths it
+   always used, so a value planted in the environment changes nothing.
+2. **The interlock.** With `AS_TEST_MODE=1` the script first checks, using
+   builtins only, that `AS_TEST_ROOT` is an absolute directory carrying the
+   `.as-test-root` sentinel; that `HOME`, `AS_FAKES_DIR` and every root sit
+   under it; that every `AS_BIN_*` is an executable fake in `AS_FAKES_DIR`
+   of the right class; and that `AS_KEYCHAIN_SVC` begins with `as-test-`. The
+   first failed check prints one `ERROR: AS_TEST_MODE=1 but ...` line and
+   exits 78, before any command runs. A child process that lost part of its
+   environment (the installer runs `status` as a child) refuses the same way.
+3. **The fakes.** The recording fakes run nothing real: `kill` exits 99 for a
+   PID the scenario did not list, and `security` exits 99 for any service
+   name not beginning `as-test-`. The write-tool fakes refuse any absolute
+   path outside `AS_TEST_ROOT`, and any `..` path component, before running
+   the real tool.
+
+`tests/lib.sh` also refuses to start a case whose `HOME` would be, or sit
+under, the invoking user's home. Each case runs from inside its scratch
+root, and the `git` fake refuses a path outside it, so no case runs git
+against this checkout.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `run.sh` | entry point (above) |
+| `lib.sh` | sourced by every test file: `new_case`, `run_switcher`, `run_install`, fixtures, assertions, `result`, `finish` |
+| `fakes/*.sh` | one template per fake class or command; `new_case` copies each to `$AS_FAKES_DIR/<name>` |
+| `fixtures/` | masked inputs, rendered per case (see the masking rule below) |
+| `t-00-seam.sh` | production neutrality, the interlock, and the guards in the fakes |
+| `t-01-detect.sh` | `list` and the running-tag detection, as they behave today |
+| `t-05-install-check.sh` | `install.sh --check`, version reporting, install mode through the fakes |
+
+## The scratch root
+
+`new_case` creates one directory per case under `${TMPDIR:-/tmp}`:
+
+| Inside `$AS_TEST_ROOT` | Use |
+|---|---|
+| `.as-test-root` | the sentinel the interlock looks for |
+| `home` | the case's `HOME`; `AS_STORE`, `AS_PROFILE_ROOT` and the other roots sit beneath it, except `AS_APP_BUNDLE` (`$AS_TEST_ROOT/Applications/Claude.app`) |
+| `fakes` | the fakes (`AS_FAKES_DIR`) |
+| `calls.log` | one line per fake call: the fake's name, then each argument, tab-separated |
+| `ps.txt` | the process table the `ps` and `pgrep` fakes print (`AS_FIXTURE_PS`) |
+| `alive.txt` | the PIDs the `kill` fake treats as alive |
+| `git-fixture` | a scratch git repository with one commit (`TEST_GIT_ROOT`); point `[swap_handoff].git_root` at it when a case needs git content |
+| `tmp` | `TMPDIR` for the code under test |
+
+`run_switcher <args>` runs the script under `/bin/bash` from inside the
+root, with the fakes first on a system `PATH`, and sets `out`, `err` and
+`rc`. `run_install <args>` does the same for `install.sh` (stdout and
+stderr merged in `out`); set `INSTALL_SRC` to run a copy of the repository.
+The harness's own commands never go through the fakes.
+
+## Fakes
+
+Line 1 of every fake is its shebang and line 2 its class, which the
+interlock reads:
+
+| Class | Commands | Behaviour |
+|---|---|---|
+| `recording` | `kill` `security` `osascript` `open` `ps` `pgrep` (required) | record the call, run nothing real, act on the scenario files |
+| `guarded-passthrough` | `rm` `mv` `cp` `rsync` `chmod` `install` `mktemp` (required), `git` | record, refuse a path outside the root, then run the real tool |
+| `passthrough` | every other command | record, then run the real tool |
+
+Scenario controls, all exported and reset by `new_case`:
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `AS_FIXTURE_PS` | `ps`, `pgrep` | path of the process table (set it with `set_ps_fixture <file> [after-quit-file]`) |
+| `AS_FIXTURE_PS_AFTER_QUIT` | `osascript` | the table that replaces it on a graceful quit |
+| `AS_FAKE_QUIT=graceful` | `osascript` | every app quits: `alive.txt` empties, the after-quit table is installed |
+| `AS_FAKE_KILL_EFFECTIVE=0` | `kill` | a signalled PID stays alive |
+| `AS_FAKE_OPEN_SPAWNS_PID=<n>` | `open` | a new main process with that PID joins the table (with its `--user-data-dir` unless `AS_FAKE_OPEN_UDD=0`) |
+| `AS_FAKE_PGREP_RC` | `pgrep` | forces the exit code |
+| `AS_FIXTURE_KEYCHAIN_JSON` | `security` | the item it prints (fake values only) |
+| `AS_FAKE_KEYCHAIN=absent` | `security` | the item is missing (exit 44) |
+
+## Writing a case
+
+One file per area: `t-<NN>-<slug>.sh`, where `00` is the seam, `01` to `04`
+existing behaviour, and a two-digit issue number for that issue's
+behaviour. Inside it, one `case_<slug>` function per case, ending in
+`result "<name>" $?`, and `finish` at the end of the file:
+
+```bash
+case_list_empty() {
+  new_case
+  set_ps_fixture ps-no-claude.txt
+  run_switcher list
+  assert_rc 0 && assert_contains "$out" "(no Claude desktop app instances running)"
+  result "list with no instance running" $?
+}
+```
+
+Assertions: `assert_rc`, `assert_eq`, `assert_contains`,
+`assert_not_contains`, `assert_called <fake> <substring>`,
+`assert_never_called <fake>`, `assert_call_order <fake> <fake>`,
+`assert_unchanged <path> <shasum-before>`, `assert_tree_unchanged <dir>
+<tree_digest-before>`; `calls_of <fake>` prints one fake's lines from
+`calls.log`. Bash 3.2 only: no `mapfile`, `readarray`, `declare -A`,
+`[[ -v`, `${x^^}` or `|&`.
+
+A case that needs a new command adds, in the same change: the name to
+`AS_SEAM_BINS`, its default line in the seam block, and its fake (a
+`fakes/<name>.sh` template for a recording fake, or the name in
+`FAKE_GUARDED` in `lib.sh` for a guarded one). A new data root adds an
+`AS_SEAM_ROOTS` entry and its default line. The lint fails the suite
+otherwise.
+
+## Fixture masking rule
+
+Every committed fixture is masked:
+
+- no real account, organisation or session id; where an id-shaped value is
+  needed, use an all-zero value of the same shape;
+- no email address;
+- no home folder path: write `__HOME__`, which `render_fixture` replaces with
+  the case's scratch `HOME`;
+- no real tag name: fixtures use `primary`, `tag-a` and `tag-b`;
+- token-shaped keys hold the literal value `fake`.
+
+Name a fixture so `.gitignore` cannot swallow it: a log excerpt is stored as
+`*.txt` (never `*.log`), a marker or backup-shaped file as `*.tmpl`.
