@@ -1,6 +1,6 @@
 ---
 description: Seamlessly swap Claude desktop app accounts via --user-data-dir
-argument-hint: <subcommand> [args...] e.g. swap <tag> | launch <tag> | list | quit
+argument-hint: <subcommand> [args...] e.g. swap <tag> | launch <tag> | identity | list | quit
 ---
 
 Run the account switcher with the user-supplied subcommand and arguments.
@@ -17,8 +17,10 @@ persist on disk. OAuth state lives in:
 
 **Subcommands (Mac desktop app management):**
 
-- `swap <tag>` — SEAMLESS swap. 3-step flow: clone-prefs primary→tgt → quit current → launch tgt.
-- `launch <tag>` — ADDITIVE launch. Spawns target without quitting others. Use for side-by-side.
+- `swap <tag>` — SEAMLESS swap. 3-step flow: clone-prefs primary→tgt → quit current → launch tgt. Runs the account check first and refuses on a `MISMATCH` before quitting anything; `--force` swaps anyway.
+- `launch <tag> [--force]` — ADDITIVE launch. Spawns target without quitting others. Use for side-by-side. Refuses on an account-check `MISMATCH`, opening nothing; `--force` launches anyway, with the warning.
+- `identity [<tag> | --all] [--show-ids]` — Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile is recorded as signed into, and `match`, `MISMATCH` or `unknown`. Exit 0 = no MISMATCH, 1 = a MISMATCH, 2 = can't run. Labels only; `--show-ids` adds ids on stdout. Reads only each profile's `config.json` (no cookies, Local Storage, keychain items or tokens).
+- `identity pin <tag> [--yes] [--force]` — Pin the account the tag's profile holds now as its expected account (`[identity]` in config.toml). Check the tag's window first. Refuses an account already pinned to another tag unless `--force`.
 - `clone-prefs [src tgt]` — Mirror Mac-app user-facing prefs from src to tgt (snapshot-rollback semantics; ≤1 backup retained).
 - `quit [--all]` — Quit all running Claude instances (graceful → SIGTERM → SIGKILL via PID list).
 - `list` (or `instances`) — Show running instances + configured profile dirs. Each instance shows its tag and how it was found (`via=argv`, `via=flagless` for primary, `via=lsof`), or `tag=unknown via=none` when it can't be determined.

@@ -138,6 +138,11 @@ account-switcher swap backup
 # ADDITIVE launch: spawn target without quitting others (side-by-side mode)
 account-switcher launch backup
 
+# Account check: which account each tag's profile is recorded as signed into
+account-switcher identity
+# Pin backup's current account as its expected one (check its window first)
+account-switcher identity pin backup
+
 # Quit all running Claude instances (graceful → SIGTERM → SIGKILL via PID list)
 account-switcher quit --all
 ```
@@ -146,7 +151,9 @@ account-switcher quit --all
 
 **Step 0 — Pre-flight validation.** Validates the target tag against
 `^[a-z0-9-]{1,32}$`; refuses to proceed when the target user-data-dir is
-the same as the current. Captures the active PID list at function entry.
+the same as the current. Runs the account check (see § Checking each tag's
+account) before anything else, so a refused swap has quit, captured and
+written nothing. Captures the active PID list at function entry.
 
 **Step 1 — clone-prefs (idempotent prefs mirror).** Mirrors Mac-app
 user-facing prefs from `~/Library/Application Support/Claude` (current) to
@@ -169,6 +176,80 @@ All of this is optional — skip it per-swap with `--no-handoff`.
 `open -n -a Claude.app --args --user-data-dir "~/Library/Application
 Support/Claude-<tag>"`. The Electron parent process loads from the tagged
 user-data-dir; its OAuth state is isolated from every other tagged dir.
+
+## Checking each tag's account (`identity`)
+
+Each tag is meant to stay on one account, but a profile can end up signed
+into another tag's account (for example, when a sign-in that finishes in the
+browser lands in the wrong instance). The app keeps the sessions sidebar
+per account, so the previous account's work looks gone, and anything you do
+in that window runs on the wrong account.
+
+The switcher reads the account a profile is recorded as signed into, the
+`lastKnownAccountUuid` value in `<user-data-dir>/config.json`, and compares
+it with the account you pinned for that tag in `[identity]` of `config.toml`:
+
+```bash
+account-switcher identity            # one row per tag in [accounts]
+account-switcher identity backup     # just one tag
+```
+
+```
+TAG              EXPECTED                 CURRENT                                      STATUS
+primary          "Primary"                "Primary"                                    match
+backup           "Backup"                 primary's account                            MISMATCH
+  fix: account-switcher signin backup; or in the 'backup' window, sign out and sign back in as "Backup"
+```
+
+- `match`: the profile is recorded as signed into the pinned account.
+- `MISMATCH`: it is recorded as signed into another tag's account, or into
+  an account no tag is pinned to (shown as `an unrecognized account (…1a2b)`,
+  the last 4 hex digits of its id). The command exits `1`.
+- `unknown`: the tag has no pin yet, or the profile's account can't be read
+  (no profile folder, no `config.json`, a file that doesn't parse, or no id
+  in it). `unknown` is never treated as `match`. The command exits `0`
+  when no row is `MISMATCH`, and `2` when it can't run (no `config.toml`, or
+  no tag in `[accounts]`).
+
+**Pinning.** Open the tag's window, check its account menu shows the account
+the tag's label names, then run `account-switcher identity pin <tag>`. It
+asks before writing (`--yes` skips the question) and refuses when the tag
+isn't in `[accounts]`, when the profile's account can't be read, or when the
+same account is already pinned to another tag (`--force` overrides that
+last one, for two tags that really share an account). A tag with no pin
+reads `unknown` until you pin it.
+
+**On launch and swap.** `launch <tag>` and `swap <tag>` run the check before
+they open, quit or capture anything:
+
+- `match` prints the tag's label and carries on.
+- `unknown` carries on and prints a one-line hint naming `identity pin`.
+- `MISMATCH` refuses: nothing is opened, quit or written, and every running
+  instance is left alone. `--force` launches or swaps anyway and still
+  prints the warning.
+
+**Recovering from a mismatch.**
+
+1. Run `account-switcher identity` to see which tags are affected.
+2. Open the affected tag (`account-switcher launch <tag> --force`, or switch
+   to its window if it is already running), sign out in the app, and sign
+   back in with the account the tag's label names.
+3. Run `account-switcher identity <tag>` again; it should read `match`. If
+   you meant to move the tag to a different account, check the window's
+   account menu and pin it again with `identity pin <tag>`.
+
+**What the check reads.** Only the profile's `config.json`, read in place
+with `jq` for that one value. It never opens cookies, Local Storage,
+IndexedDB, keychain items or tokens, never copies `config.json`, and never
+writes to it. Output names labels, never ids; `identity --show-ids` adds the
+full ids to its rows, on stdout only. History rows read
+`IDENTITY tag=<tag> status=<word>` and `IDENTITY_PIN tag=<tag>`, never an id
+or a label.
+
+**Limits.** The value is the app's *last known* account: it persists after
+you sign out, so a signed-out profile still reads as its last account.
+`config.json` is an undocumented app file; if a future app version changes
+it, rows read `unknown` rather than `match`.
 
 ## What's shared automatically across accounts
 
@@ -202,6 +283,11 @@ Key sections:
 - `[accounts]` — map of tag → `{ label, profile_email }`. Populate via
   `account-switcher add-account <tag> <email> [label]` after first-launch
   login under the tagged user-data-dir.
+- `[identity]` — map of tag → the account id the tag's profile must be
+  signed into, written by `account-switcher identity pin <tag>` (don't type
+  ids by hand). A tag with no line here reads `unknown`. The header must be
+  exactly `[identity]`. An install from before this check has no such table;
+  the first `identity pin` adds it.
 - `[notifications]` — channels for swap-success awareness signals
   (statusline / log / stderr).
 - `[swap_handoff]` — optional handoff tuning (all default-safe):
@@ -225,8 +311,10 @@ non-ASCII characters are rejected (prevents shell injection in the
 
 | Subcommand | Action |
 |---|---|
-| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars) |
-| `launch <tag>` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. |
+| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`) |
+| `launch <tag> [--force]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`. |
+| `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. See § Checking each tag's account. |
+| `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
 | `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
 | `quit [--all]` | Quit running Claude instances. `--all` quits every instance; bare `quit` quits only the current foreground instance. Graceful → SIGTERM → SIGKILL escalation. |
 | `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. |
@@ -243,6 +331,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - `quit` uses PID-based tracking (`/bin/kill -0` per PID) rather than `pgrep -f` argv-pattern matching. The pattern-match approach is brittle when Anthropic ships new Electron flags; PID tracking is kernel-truth.
 - Every running-instance check (`list`, `quit`, `clone-prefs`, and the swap handoff's source) uses one matcher: a process is a Claude instance only when its first argument (argv[0]) is exactly `/Applications/Claude.app/Contents/MacOS/Claude`, so helper processes and other processes that merely mention that path are never counted or signalled. A profile folder is compared whole, so primary's `Claude` folder never matches a `Claude-<tag>` folder and `alt` never matches `alt-2`. `clone-prefs` refuses when it cannot tell whether its target is running.
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
+- The account check reads one non-secret value, `lastKnownAccountUuid`, from each profile's `config.json`. That file also holds the app's token caches, so `jq` reads it in place and only that one value (at most 36 characters, and only when it is shaped like an account id) reaches the script; no shell variable ever holds the file's contents, the file is never copied, and core dumps are turned off for the run. Nothing else in a profile is opened.
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
 
 ## Safety

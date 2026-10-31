@@ -65,6 +65,7 @@ against this checkout.
 | `t-00-seam.sh` | production neutrality, the interlock, and the guards in the fakes |
 | `t-01-detect.sh` | `list` and the running-tag detection; its former CHARACTERIZATION #9 cases now pin the corrected behaviour |
 | `t-09-detect.sh` | #9: the exact instance matcher and every caller (`list`, `clone-prefs`, the swap handoff, `quit`), the `lsof` path, the `pgrep` lint, a large table |
+| `t-06-identity.sh` | #6: the per-tag account check (`identity`, `identity pin`, the check before `launch` and `swap`), `identity_status`'s always-0 contract, and a leak scan with its own control arm |
 | `t-05-install-check.sh` | `install.sh --check`, version reporting, install mode through the fakes |
 
 ## The scratch root
@@ -149,8 +150,10 @@ otherwise.
 
 Every committed fixture is masked:
 
-- no real account, organisation or session id; where an id-shaped value is
-  needed, use an all-zero value of the same shape;
+- no real account, organisation or session id, and no committed id-shaped
+  value at all, not even an all-zero one (a personal-data scan matches the
+  shape); where a case needs an id, generate it at test time and write it
+  under the scratch root, as `t-06-identity.sh` does with `fid`;
 - no email address;
 - no home folder path: write `__HOME__`, which `render_fixture` replaces with
   the case's scratch `HOME`;
@@ -158,7 +161,9 @@ Every committed fixture is masked:
   replaces with the case's `AS_APP_BUNDLE` (the matcher only accepts a main
   process whose argv[0] is `$AS_APP_BUNDLE/Contents/MacOS/Claude`);
 - no real tag name: fixtures use `primary`, `tag-a` and `tag-b`;
-- token-shaped keys hold the literal value `fake`.
+- token-shaped keys hold the literal value `fake`, or, in a case that must
+  prove a value never leaks, a placeholder such as `FIXTURE-NOT-A-TOKEN-1`
+  that the case then asserts is absent from every output.
 
 Name a fixture so `.gitignore` cannot swallow it: a log excerpt is stored as
 `*.txt` (never `*.log`), a marker or backup-shaped file as `*.tmpl`.

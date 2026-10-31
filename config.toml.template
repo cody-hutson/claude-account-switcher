@@ -19,6 +19,12 @@ version = 1
 # `account-switcher add-account <tag> <email> [label]` after first launch + login.
 # primary = { label = "Primary", profile_email = "you@example.com" }
 
+[identity]
+# tag = account id recorded by `account-switcher identity pin <tag>`; a tag
+# with no line here reads `unknown`. Don't type ids by hand: check the tag's
+# window shows the right account, then run `identity pin <tag>`. The header
+# above must stay exactly [identity], with nothing after it on the line.
+
 [notifications]
 # Channels for swap-success awareness signals.
 channels = ["statusline", "log", "stderr"]

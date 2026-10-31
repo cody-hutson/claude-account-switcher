@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | clone-prefs | quit | list | status | config | add-account | version | help
+# Subcommands: swap | launch | identity | clone-prefs | quit | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -13,6 +13,11 @@
 # user-data-dir (Mac app surface).
 
 set -euo pipefail
+
+# No core dumps (#6): the identity read below has jq parse a profile's
+# config.json, which also holds the app's token caches, so a crashing child
+# must never write its memory to disk. macOS defaults to this; set it anyway.
+ulimit -c 0 2>/dev/null || :
 
 # ---- Command paths and roots (test seam) ---------------------------------
 #
@@ -521,6 +526,271 @@ udd_for_tag() {
   fi
 }
 
+# ---- Account identity per tag (#6) ---------------------------------------
+#
+# Each profile's config.json records the account the profile last signed
+# into (lastKnownAccountUuid). The operator pins the account each tag must
+# hold in the [identity] table of config.toml (`identity pin <tag>`), and
+# launch, swap and the read-only `identity` command compare the two.
+# Output names labels, plus at most the last 4 hex digits of an id, never a
+# whole id (`identity --show-ids` prints whole ids on stdout, for a
+# terminal). History rows carry a tag and a status word, never an id or a
+# label.
+
+readonly AS_UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+# Prints the error and exits 2: the identity commands' "cannot run" status,
+# kept apart from die's 1, which `identity` uses for a MISMATCH.
+_die2() { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 2; }
+
+# profile_account_uuid <user-data-dir>
+# Prints the account id the profile records, as a 36-character lowercase
+# uuid, and returns 0. Otherwise prints nothing and returns:
+#   1  config.json is absent or unreadable
+#   2  it did not parse on two reads, or its top level is not one object
+#   3  it records no id (the key is absent, or not a string)
+#   4  the recorded value is not uuid-shaped
+#
+# Security (#6): the same file holds the app's token caches. jq opens it
+# read-only, in place, and only the one selected value crosses the pipe, so
+# no shell variable ever holds the file's contents, and the filter lets
+# nothing longer than 36 characters through. Never read the file with cat or
+# $(<...), never copy it, never pass it through a second filter, and never
+# trace this function with set -x. Nothing else in the profile (Cookies,
+# Local Storage, IndexedDB) and no keychain item is opened. jq's errors go to
+# /dev/null; they name a position in the file, never a value.
+profile_account_uuid() {
+  local f="${1:-}/config.json" v="" try=1 parsed=0
+  [[ -f "$f" && -r "$f" ]] || return 1
+  while [[ $try -le 2 ]]; do
+    if [[ -s "$f" ]] && v="$("$AS_BIN_JQ" -r '
+        if type != "object" then "N"
+        elif (.lastKnownAccountUuid | type) != "string" then empty
+        elif (.lastKnownAccountUuid | length) != 36 then "X"
+        else .lastKnownAccountUuid | ascii_downcase end' "$f" 2>/dev/null)"; then
+      parsed=1
+      break
+    fi
+    v=""
+    # The app rewrites config.json while it runs (a journal, then a rename),
+    # so a read can land on a torn or empty file: one retry, a second later.
+    if [[ $try -eq 1 ]]; then "$AS_BIN_SLEEP" 1; fi
+    try=$((try + 1))
+  done
+  [[ $parsed -eq 1 ]] || return 2
+  case "$v" in
+    "")      return 3 ;;
+    N|*$'\n'*) return 2 ;;
+  esac
+  [[ "$v" =~ $AS_UUID_RE ]] || return 4
+  printf '%s' "$v"
+}
+
+# Prints $1 with A-F lowercased when the result is uuid-shaped; returns 1
+# otherwise. The value travels on stdin, never on a command line.
+_uuid_shaped() {
+  local v=""
+  v="$(printf '%s' "${1:-}" | "$AS_BIN_TR" 'A-F' 'a-f')" || return 1
+  [[ "$v" =~ $AS_UUID_RE ]] || return 1
+  printf '%s' "$v"
+}
+
+# The [accounts] and [identity] key for a tag: "default" is primary, as in
+# udd_for_tag and is_tag_running.
+identity_key() {
+  if [[ "${1:-}" == "default" ]]; then printf 'primary'; else printf '%s' "${1:-}"; fi
+}
+
+# expected_account_uuid <tag>: prints the id pinned to <tag> in [identity]
+# (read with toml_get), or returns 1 when there is no uuid-shaped pin.
+expected_account_uuid() {
+  local v=""
+  v="$(toml_get "identity.$(identity_key "${1:-}")" 2>/dev/null)" || return 1
+  _uuid_shaped "$v"
+}
+
+# Prints the key of each line of [identity], one per line. The header must be
+# exactly "[identity]", which is how toml_get finds the table.
+identity_pinned_tags() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  "$AS_BIN_AWK" '
+    /^\[/ { in_t = ($0 == "[identity]"); next }
+    in_t && /^[a-z0-9][a-z0-9-]*[[:space:]]*=/ { k = $0; sub(/[[:space:]]*=.*$/, "", k); print k }
+  ' "$CONFIG_FILE"
+}
+
+# pinned_tag_for_id <id> <tag>: prints the first tag other than <tag> whose
+# pin equals <id>, or nothing.
+pinned_tag_for_id() {
+  local id="${1:-}" self keys k pin
+  self="$(identity_key "${2:-}")"
+  keys="$(identity_pinned_tags)" || keys=""
+  # Keys are [a-z0-9-] only (the awk pattern above), so splitting is exact.
+  for k in $keys; do
+    if [[ "$k" == "$self" ]]; then continue; fi
+    pin="$(expected_account_uuid "$k")" || continue
+    if [[ "$pin" == "$id" ]]; then
+      printf '%s' "$k"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Prints the tag of each entry in [accounts], one per line. Comment lines,
+# such as the template's placeholder, are skipped.
+accounts_tags() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  "$AS_BIN_AWK" '
+    /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
+    in_a && /^[a-z0-9][a-z0-9-]*[[:space:]]*=/ { k = $0; sub(/[[:space:]]*=.*$/, "", k); print k }
+  ' "$CONFIG_FILE"
+}
+
+# account_label <tag>: prints the label of the tag's [accounts] entry, or the
+# tag itself when there is none.
+account_label() {
+  local key l=""
+  key="$(identity_key "${1:-}")"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    l="$("$AS_BIN_AWK" -v tag="$key" '
+      /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
+      in_a && $0 ~ "^"tag"[[:space:]]*=" {
+        if (match($0, /label[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+          v = substr($0, RSTART, RLENGTH)
+          sub(/^label[[:space:]]*=[[:space:]]*"/, "", v); sub(/"$/, "", v)
+          print v
+        }
+        exit
+      }' "$CONFIG_FILE")" || l=""
+  fi
+  printf '%s' "${l:-$key}"
+}
+
+# identity_status <tag>
+# Compares the account <tag>'s profile records (profile_account_uuid) with
+# the account pinned to <tag> (expected_account_uuid) and prints one line
+# on stdout: a status word, a detail word and, for two details, a value:
+#   match pinned                  the profile records the pinned account
+#   MISMATCH other-tag <tag>      it records the account pinned to <tag>
+#   MISMATCH unrecognized <hhhh>  it records an account no tag is pinned to;
+#                                 <hhhh> is the last 4 hex digits of its id
+#   unknown <reason>              no-folder | no-file | unreadable | no-id |
+#                                 bad-id | no-pin | bad-tag
+# match needs both ids uuid-shaped and equal; whatever cannot be read or
+# compared is unknown, never match. It never prints a whole id.
+#
+# Return contract: identity_status ALWAYS returns 0, whatever the result,
+# and the result is on stdout, so a caller under set -euo pipefail can write
+#   st="$(identity_status "$tag")"
+# with no guard. The work runs in _identity_status_eval as the left side of
+# an || list, so no failing command inside it can end the script, and that
+# function never calls exit or die; this one ends with `return 0`.
+identity_status() {
+  _IDS_RESULT="unknown unreadable"
+  _identity_status_eval "${1:-}" || :
+  printf '%s\n' "$_IDS_RESULT"
+  return 0
+}
+
+# Sets _IDS_RESULT for identity_status. Reads the tag's own profile only.
+_identity_status_eval() {
+  local tag="${1:-}" key udd cur="" prc=0 pin="" other=""
+  if [[ ! "$tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then _IDS_RESULT="unknown bad-tag"; return 0; fi
+  key="$(identity_key "$tag")"
+  udd="$(udd_for_tag "$tag")"
+  if [[ ! -d "$udd" ]]; then _IDS_RESULT="unknown no-folder"; return 0; fi
+  if [[ ! -e "${udd}/config.json" ]]; then _IDS_RESULT="unknown no-file"; return 0; fi
+  cur="$(profile_account_uuid "$udd")" || prc=$?
+  case "$prc" in
+    0) ;;
+    3) _IDS_RESULT="unknown no-id"; return 0 ;;
+    4) _IDS_RESULT="unknown bad-id"; return 0 ;;
+    *) _IDS_RESULT="unknown unreadable"; return 0 ;;
+  esac
+  pin="$(expected_account_uuid "$key")" || pin=""
+  if [[ -z "$pin" ]]; then _IDS_RESULT="unknown no-pin"; return 0; fi
+  if [[ "$cur" == "$pin" ]]; then _IDS_RESULT="match pinned"; return 0; fi
+  other="$(pinned_tag_for_id "$cur" "$key")" || other=""
+  if [[ -n "$other" ]]; then
+    _IDS_RESULT="MISMATCH other-tag ${other}"
+  else
+    _IDS_RESULT="MISMATCH unrecognized ${cur:32:4}"
+  fi
+  return 0
+}
+
+# Splits an identity_status line into _IDS_STATUS, _IDS_DETAIL, _IDS_VALUE.
+_ids_parse() {
+  local rest
+  _IDS_STATUS="${1%% *}"
+  rest="${1#* }"
+  _IDS_DETAIL="${rest%% *}"
+  _IDS_VALUE=""
+  if [[ "$rest" == *" "* ]]; then _IDS_VALUE="${rest#* }"; fi
+}
+
+# identity_current_text <status line> <label>: how the current account reads
+# in output: the label, another tag's account, an unrecognized account with
+# the last 4 hex digits of its id, or why it is unknown. Never a whole id.
+identity_current_text() {
+  _ids_parse "${1:-}"
+  case "${_IDS_STATUS}/${_IDS_DETAIL}" in
+    match/*)               printf '"%s"' "${2:-}" ;;
+    MISMATCH/other-tag)    printf "%s's account" "$_IDS_VALUE" ;;
+    MISMATCH/unrecognized) printf 'an unrecognized account (…%s)' "$_IDS_VALUE" ;;
+    unknown/no-folder)     printf 'no profile folder yet' ;;
+    unknown/no-file)       printf 'no config.json in the profile' ;;
+    unknown/unreadable)    printf "config.json can't be read" ;;
+    unknown/no-id)         printf 'no account recorded' ;;
+    unknown/bad-id)        printf 'the recorded value is not an account id' ;;
+    unknown/no-pin)        printf 'no pin' ;;
+    *)                     printf 'unknown' ;;
+  esac
+}
+
+# identity_gate <tag> <force: true|false> <launch|swap>
+# The #6 check launch and swap run before they open, quit or capture
+# anything. It only reads. On MISMATCH without --force it refuses (exit 1)
+# with the recovery steps, and nothing has been opened, quit or written.
+# Otherwise it prints one status line and appends one IDENTITY row (tag and
+# status word only) to the history log. It never quits an instance.
+identity_gate() {
+  local tag="$1" force="$2" verb="$3" doing Doing st label current
+  case "$verb" in
+    swap) doing="swapping"; Doing="Swapping" ;;
+    *)    doing="launching"; Doing="Launching" ;;
+  esac
+  st="$(identity_status "$tag")"
+  label="$(account_label "$tag")"
+  current="$(identity_current_text "$st" "$label")"
+  _ids_parse "$st"
+  case "$_IDS_STATUS" in
+    match)
+      ok "Account check: '${tag}' is recorded as \"${label}\" (match)."
+      ;;
+    MISMATCH)
+      if [[ "$force" != "true" ]]; then
+        die "Profile '${tag}' is recorded as signed into ${current}, not \"${label}\" (MISMATCH). Not ${doing}.
+  Fix: account-switcher signin ${tag}; or ${verb} anyway with --force, then in that window sign out and sign back in as \"${label}\"."
+      fi
+      warn "Profile '${tag}' is recorded as signed into ${current}, not \"${label}\" (MISMATCH). ${Doing} anyway (--force)."
+      warn "  Fix: in that window, sign out and sign back in as \"${label}\" (or: account-switcher signin ${tag})."
+      ;;
+    *)
+      if tag_is_in_accounts "$(identity_key "$tag")"; then
+        info "Account check: '${tag}' is unknown (${current}). Once its window shows \"${label}\", pin it: account-switcher identity pin ${tag}"
+      else
+        info "Account check: '${tag}' is unknown (${current}). To check it, register it with add-account, then run: account-switcher identity pin ${tag}"
+      fi
+      ;;
+  esac
+  if [[ -d "$STORE" ]]; then
+    printf '[%s] IDENTITY tag=%s status=%s\n' \
+      "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$_IDS_STATUS" >> "$SWAP_LOG"
+  fi
+}
+
 # ---- detect_running_tag --------------------------------------------------
 
 # Prints the profile of the running Claude instance (primary, <tag> or
@@ -972,11 +1242,24 @@ quit_all_claude() {
 # ---- launch (additive; H-1) ----------------------------------------------
 
 cmd_launch() {
-  local tag="${1:-}"
+  local tag="" force="false" arg
+  for arg; do
+    case "$arg" in
+      --force) force="true" ;;
+      -*) die "Unknown flag: ${arg} (launch takes <tag> [--force])" ;;
+      *)
+        if [[ -z "$tag" ]]; then tag="$arg"; else die "Unexpected arg: ${arg}"; fi
+        ;;
+    esac
+  done
   if [[ -z "$tag" ]]; then
-    die "Usage: account-switcher launch <tag>  (e.g. primary, backup)"
+    die "Usage: account-switcher launch <tag> [--force]  (e.g. primary, backup)"
   fi
   validate_tag "$tag"
+
+  # #6: check the account the profile records before opening anything. A
+  # MISMATCH refuses here (--force overrides); unknown proceeds with a hint.
+  identity_gate "$tag" "$force" launch
 
   local udd
   udd=$(udd_for_tag "$tag")
@@ -1079,11 +1362,13 @@ cmd_swap_app() {
   local skip_mirror="false"
   local skip_handoff="false"
   local operator_note=""
+  local force="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-mirror) skip_mirror="true"; shift ;;
       --no-handoff) skip_handoff="true"; shift ;;
+      --force) force="true"; shift ;;
       --note)
         if [[ $# -lt 2 ]]; then
           die "Flag --note requires a value (e.g., --note \"hit primary usage limit\")"
@@ -1115,12 +1400,20 @@ Usage: account-switcher swap <tag> [flags]
     --no-handoff             skip handoff-bridge capture (default: capture)
     --note "<text>"          optional operator-supplied note recorded in SWAP_HANDOFF.md
                               (240 char max; not auto-redacted — operator's responsibility)
+    --force                  swap even when the target's profile is recorded on
+                              another account (MISMATCH; see 'identity')
 EOF
     return 1
   fi
 
   # H-1: Validate tag before any FS access.
   validate_tag "$target_tag"
+
+  # #6: check the account the target's profile records before anything else:
+  # before the handoff capture and before the M-15 trap, so a MISMATCH
+  # refusal (--force overrides) has no side effect at all and leaves the
+  # running instances alone. unknown proceeds with a hint.
+  identity_gate "$target_tag" "$force" swap
 
   # M-15: Register cleanup trap before any side-effects.
   __SWAP_IN_PROGRESS="true"
@@ -1641,6 +1934,180 @@ EOF
     >> "$SWAP_LOG"
 }
 
+# ---- identity (#6) -------------------------------------------------------
+
+_identity_usage() {
+  "$AS_BIN_CAT" <<EOF >&2
+Usage: account-switcher identity [<tag> | --all] [--show-ids]
+       account-switcher identity pin <tag> [--yes] [--force]
+EOF
+}
+
+# identity [<tag> | --all] [--show-ids]
+# One row per tag in [accounts] (or the one tag named): the tag, its expected
+# account (the configured label), the account its profile records, and
+# match, MISMATCH or unknown. Read-only: it opens config.toml and each
+# profile's config.json for reading and writes nothing, not even the
+# history log (main answers it before log rotation). --show-ids adds the
+# pinned and recorded ids, on stdout only.
+# Exit 0 = no MISMATCH (unknown rows do not fail), 1 = at least one MISMATCH,
+# 2 = it cannot run: no config.toml, no tag in [accounts], a tag that is not
+# in [accounts], or bad arguments. Empty arguments are skipped.
+cmd_identity() {
+  local want="" show_ids="false" arg tags t st label current mismatch=0 pinned recorded
+  for arg; do
+    case "$arg" in
+      "") ;;
+      --show-ids) show_ids="true" ;;
+      --all)
+        if [[ -n "$want" && "$want" != "--all" ]]; then _identity_usage; exit 2; fi
+        want="--all"
+        ;;
+      -*) _identity_usage; _die2 "Unknown flag for identity: ${arg}" ;;
+      *)
+        if [[ -n "$want" ]]; then _identity_usage; exit 2; fi
+        want="$arg"
+        ;;
+    esac
+  done
+
+  [[ -f "$CONFIG_FILE" ]] || _die2 "No config.toml at ${CONFIG_FILE}, so there is nothing to check. Register a tag with: account-switcher add-account <tag> <email>"
+  tags="$(accounts_tags)" || tags=""
+  [[ -n "$tags" ]] || _die2 "No tag in [accounts] of ${CONFIG_FILE}, so there is nothing to check."
+  if [[ -n "$want" && "$want" != "--all" ]]; then
+    [[ "$want" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || _die2 "Tag must match [a-z0-9-]{1,32} (got: '${want}')."
+    tag_is_in_accounts "$(identity_key "$want")" || _die2 "Tag '${want}' is not in [accounts] of ${CONFIG_FILE}."
+    tags="$want"
+  fi
+
+  if [[ "$show_ids" == "true" ]]; then
+    printf '%-16s %-24s %-44s %-9s %-37s %s\n' TAG EXPECTED CURRENT STATUS PINNED RECORDED
+  else
+    printf '%-16s %-24s %-44s %s\n' TAG EXPECTED CURRENT STATUS
+  fi
+  # Tags are [a-z0-9-] only (accounts_tags), so splitting is exact.
+  for t in $tags; do
+    st="$(identity_status "$t")"
+    label="$(account_label "$t")"
+    current="$(identity_current_text "$st" "$label")"
+    _ids_parse "$st"
+    if [[ "$show_ids" == "true" ]]; then
+      pinned="$(expected_account_uuid "$t")" || pinned="-"
+      recorded="$(profile_account_uuid "$(udd_for_tag "$t")")" || recorded="-"
+      printf '%-16s %-24s %-44s %-9s %-37s %s\n' "$t" "\"${label}\"" "$current" "$_IDS_STATUS" "$pinned" "$recorded"
+    else
+      printf '%-16s %-24s %-44s %s\n' "$t" "\"${label}\"" "$current" "$_IDS_STATUS"
+    fi
+    case "${_IDS_STATUS}/${_IDS_DETAIL}" in
+      MISMATCH/*)
+        mismatch=1
+        printf "  fix: account-switcher signin %s; or in the '%s' window, sign out and sign back in as \"%s\"\n" "$t" "$t" "$label"
+        ;;
+      unknown/no-pin)
+        printf '  no pin: run account-switcher identity pin %s\n' "$t"
+        ;;
+    esac
+  done
+  if [[ $mismatch -ne 0 ]]; then exit 1; fi
+  return 0
+}
+
+# identity pin <tag> [--yes] [--force]
+# Records the account <tag>'s profile holds now as the account <tag> must
+# hold: one `<tag> = "<id>"` line in [identity] of config.toml, added to the
+# table or replacing the tag's line there (the table is created when
+# missing). Check the window's account menu first: the pin trusts what the
+# profile records. Refuses with exit 2 when the tag is not in [accounts],
+# when its account can't be read (unknown), or when the same account is
+# already pinned to another tag, which is the mix-up #6 exists to catch,
+# unless --force. Confirms with the label and the id's last 4 hex digits
+# (--yes skips; a declined or unanswered prompt writes nothing and exits 1).
+# Writes through a temp file, mv and chmod 600, passing the id to awk in the
+# environment rather than on its command line, and appends
+# IDENTITY_PIN tag=<tag> (no id) to the history log.
+cmd_identity_pin() {
+  local tag="" yes="false" force="false" arg key udd st label cur="" other="" old="" ans="" tmp
+  for arg; do
+    case "$arg" in
+      "") ;;
+      --yes) yes="true" ;;
+      --force) force="true" ;;
+      -*) _identity_usage; _die2 "Unknown flag for identity pin: ${arg}" ;;
+      *)
+        if [[ -n "$tag" ]]; then _identity_usage; _die2 "Unexpected arg: ${arg}"; fi
+        tag="$arg"
+        ;;
+    esac
+  done
+  if [[ -z "$tag" ]]; then _identity_usage; exit 2; fi
+  [[ "$tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || _die2 "Tag must match [a-z0-9-]{1,32} (got: '${tag}')."
+  key="$(identity_key "$tag")"
+  tag_is_in_accounts "$key" || _die2 "Tag '${tag}' is not in [accounts] of ${CONFIG_FILE}. Register it first: account-switcher add-account ${tag} <email>"
+
+  udd="$(udd_for_tag "$tag")"
+  st="$(identity_status "$tag")"
+  _ids_parse "$st"
+  if [[ "$_IDS_STATUS" == "unknown" && "$_IDS_DETAIL" != "no-pin" ]]; then
+    _die2 "Can't pin '${tag}': its account is unknown ($(identity_current_text "$st" "")). Launch it, sign in, then pin it."
+  fi
+  cur="$(profile_account_uuid "$udd")" || _die2 "Can't pin '${tag}': its account can't be read."
+  label="$(account_label "$tag")"
+
+  other="$(pinned_tag_for_id "$cur" "$key")" || other=""
+  if [[ -n "$other" && "$force" != "true" ]]; then
+    _die2 "Can't pin '${tag}': its profile records the account already pinned to '${other}'. Two tags on one account is the mix-up this check exists to catch; sign '${tag}' in to its own account first. If the two tags really share one account, re-run with --force."
+  fi
+  old="$(expected_account_uuid "$key")" || old=""
+  if [[ "$old" == "$cur" ]]; then
+    ok "'${tag}' is already pinned to \"${label}\" (id …${cur:32:4}). Nothing to change."
+    return 0
+  fi
+  if [[ -n "$other" ]]; then warn "The same account is pinned to '${other}' as well (--force)."; fi
+  if [[ -n "$old" ]]; then info "This replaces the current pin (id …${old:32:4})."; fi
+
+  if [[ "$yes" != "true" ]]; then
+    printf 'Pin %s as "%s" (id …%s)? [y/N] ' "$tag" "$label" "${cur:32:4}" >&2
+    IFS= read -r ans || ans=""
+    case "$ans" in
+      y|Y|yes|Yes|YES) ;;
+      *) info "Not pinned."; exit 1 ;;
+    esac
+  fi
+
+  tmp="$("$AS_BIN_MKTEMP")"
+  if ! AS_PIN_KEY="$key" AS_PIN_LINE="${key} = \"${cur}\"" "$AS_BIN_AWK" '
+    function blanks() { while (nb > 0) { print ""; nb-- } }
+    BEGIN { k = ENVIRON["AS_PIN_KEY"]; line = ENVIRON["AS_PIN_LINE"]; in_t = 0; done = 0; seen = 0; nb = 0 }
+    /^\[/ {
+      if (in_t && !done) { print line; done = 1 }
+      blanks()
+      in_t = ($0 == "[identity]")
+      if (in_t) seen = 1
+      print
+      next
+    }
+    in_t && index($0, k) == 1 && substr($0, length(k) + 1) ~ /^[[:space:]]*=/ {
+      blanks()
+      if (!done) { print line; done = 1 }
+      next
+    }
+    in_t && /^[[:space:]]*$/ { nb++; next }
+    { blanks(); print }
+    END {
+      if (in_t && !done) { print line; done = 1 }
+      blanks()
+      if (!seen) { print ""; print "[identity]"; print line }
+    }' "$CONFIG_FILE" > "$tmp"; then
+    "$AS_BIN_RM" -f "$tmp"
+    _die2 "Could not write the pin; ${CONFIG_FILE} is unchanged."
+  fi
+  "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
+  "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
+
+  printf '[%s] IDENTITY_PIN tag=%s\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$key" >> "$SWAP_LOG"
+  ok "Pinned '${tag}' to \"${label}\" (id …${cur:32:4}) in ${CONFIG_FILE}."
+}
+
 # ---- Help ----------------------------------------------------------------
 
 cmd_help() {
@@ -1680,11 +2147,35 @@ SUBCOMMANDS (Mac desktop app management):
                            3. Launch target instance
                          Result: identity display + Mac-app billing align with tgt.
                          Workspace (~/.claude/) stays bidirectional.
+                         Runs the account check (see identity) first: on a
+                         MISMATCH it refuses before quitting or writing
+                         anything.
                          Flags:
                            --no-mirror       skip step 1
+                           --force           swap even on a MISMATCH
 
-  launch <tag>           ADDITIVE launch. Spawns target instance WITHOUT
+  launch <tag> [--force] ADDITIVE launch. Spawns target instance WITHOUT
                          quitting others. Use for running both side-by-side.
+                         Runs the account check (see identity) first: on a
+                         MISMATCH it refuses and opens nothing; --force
+                         launches anyway, with the warning.
+
+  identity [<tag> | --all] [--show-ids]
+                         Read-only account check. One row per tag in
+                         [accounts]: the expected account (its label), the
+                         account its profile records, and match, MISMATCH
+                         or unknown. Exit 0 = no MISMATCH, 1 = a MISMATCH,
+                         2 = cannot run. Prints labels, never ids;
+                         --show-ids prints the ids too, on stdout. Reads
+                         only the profile's config.json (no cookies, Local
+                         Storage, keychain items or tokens).
+
+  identity pin <tag> [--yes] [--force]
+                         Record the account <tag>'s profile holds now as the
+                         account it must hold ([identity] in config.toml).
+                         Check the window's account menu first. Refuses when
+                         that account is already pinned to another tag,
+                         unless --force.
 
   clone-prefs [src tgt]  Mirror Mac-app user-facing prefs from src to tgt.
                          Default: clone-prefs primary backup. Mirrors:
@@ -1752,6 +2243,10 @@ EXAMPLES:
   account-switcher launch backup
   account-switcher list                       # see both running
 
+  # Account check: is each tag's profile on the account it should be?
+  account-switcher identity                   # one row per tag
+  account-switcher identity pin backup        # after checking backup's window
+
   # Cleanup
   account-switcher quit --all                 # quit all instances
 
@@ -1814,9 +2309,19 @@ main() {
   [[ -n "$_note_val" ]] && validate_note_safe "$_note_val"
 
   # Answer `version` before log rotation, so asking for the version touches
-  # no files.
+  # no files. The read-only `identity` check is answered here too, so it
+  # writes nothing; `identity pin` writes, so it is dispatched with the rest.
+  # identity takes at most two arguments and pin at most three; each is
+  # passed on its own, and an empty one is skipped.
   case "${1:-}" in
     version|--version) cmd_version; return 0 ;;
+    identity)
+      if [[ "${2:-}" != "pin" ]]; then
+        if [[ $# -gt 3 ]]; then _identity_usage; exit 2; fi
+        cmd_identity "${2:-}" "${3:-}"
+        return 0
+      fi
+      ;;
   esac
 
   # M-13: Rotate the swap log at script entry (cheap; runs once per invocation).
@@ -1828,6 +2333,11 @@ main() {
   case "$subcmd" in
     swap)            cmd_swap_app "$@" ;;
     launch)          cmd_launch "$@" ;;
+    identity)
+      # Only `identity pin` reaches here; the read-only form returned above.
+      if [[ $# -gt 4 ]]; then _identity_usage; exit 2; fi
+      cmd_identity_pin "${2:-}" "${3:-}" "${4:-}"
+      ;;
     clone-prefs)     cmd_clone_prefs "$@" ;;
     quit)            cmd_quit "$@" ;;
     list|instances)  cmd_list_instances "$@" ;;
