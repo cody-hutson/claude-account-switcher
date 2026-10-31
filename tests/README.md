@@ -66,6 +66,7 @@ against this checkout.
 | `t-01-detect.sh` | `list` and the running-tag detection; its former CHARACTERIZATION #9 cases now pin the corrected behaviour |
 | `t-09-detect.sh` | #9: the exact instance matcher and every caller (`list`, `clone-prefs`, the swap handoff, `quit`), the `lsof` path, the `pgrep` lint, a large table |
 | `t-06-identity.sh` | #6: the per-tag account check (`identity`, `identity pin`, the check before `launch` and `swap`), `identity_status`'s always-0 contract, and a leak scan with its own control arm |
+| `t-07-signin.sh` | #7: `signin` with other instances open and with `--quit-others`; the identity snapshot before and after (another profile changing is exit 4, naming it); the terminal answer with `read -t`; refusals and the exit-code invariant (no exit 1 but a `MISMATCH`); interrupts; a secret scan (placeholder tokens, ids, 64-hex digests) after every case, with its own control arm |
 | `t-08-front.sh` | #8: after `launch` and `swap`, the wait for the new PID, the bring-to-front ladder (`setfront`, AppKit, System Events, none) with each rung checked by `front_pid`, the closing line, and the always-0 contracts of `wait_for_new_instance` and `bring_to_front` |
 | `t-05-install-check.sh` | `install.sh --check`, version reporting, install mode through the fakes |
 
@@ -124,6 +125,15 @@ Scenario controls, all exported and reset by `new_case`:
 | `AS_FAKE_OPEN_SPAWNS_PID=<n>` | `open` | a new main process with that PID joins the table (with its `--user-data-dir` unless `AS_FAKE_OPEN_UDD=0`) |
 | `AS_FIXTURE_KEYCHAIN_JSON` | `security` | the item it prints (fake values only) |
 | `AS_FAKE_KEYCHAIN=absent` | `security` | the item is missing (exit 44) |
+
+Two more names are read by `account-switcher.sh` itself, for `signin`, and
+only in test mode (production unsets them with the seam names):
+`AS_TEST_STDIN_IS_TTY=1` makes stdin count as a terminal, and
+`AS_TEST_POLL_HOOK` names an executable under `AS_TEST_ROOT` (the interlock
+checks) that `signin` runs once per poll, before the poll's reads, with the
+poll number. `t-07-signin.sh` uses the hook to change the scenario between
+polls, so a case whose timer is `read -t` (a terminal) can stage changes
+mid-wait as well as one whose timer is the `sleep` fake.
 
 ## Writing a case
 

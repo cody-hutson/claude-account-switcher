@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | identity | clone-prefs | quit | list | status | config | add-account | version | help
+# Subcommands: swap | launch | signin | identity | clone-prefs | quit | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript + lsappinfo. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -107,15 +107,26 @@ _as_test_mode_interlock() {
 
   # 7. A keychain service name that no real item uses.
   [[ "${AS_KEYCHAIN_SVC:-}" == as-test-* ]] || _as_test_refuse "AS_KEYCHAIN_SVC does not begin with as-test- (got '${AS_KEYCHAIN_SVC:-}')"
+
+  # 8. signin's per-poll test hook (#7), when set, is an executable file
+  #    under the scratch root.
+  if [[ -n "${AS_TEST_POLL_HOOK:-}" ]]; then
+    _as_test_under "${AS_TEST_POLL_HOOK:-}" "$root" || _as_test_refuse "AS_TEST_POLL_HOOK is not under AS_TEST_ROOT (got '${AS_TEST_POLL_HOOK:-}')"
+    [[ -f "${AS_TEST_POLL_HOOK:-}" && -x "${AS_TEST_POLL_HOOK:-}" ]] || _as_test_refuse "AS_TEST_POLL_HOOK is not an executable file (got '${AS_TEST_POLL_HOOK:-}')"
+  fi
 }
 
-AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKTEMP MV OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKTEMP MV OD OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
+# Two test-only names for signin (#7), honoured only in test mode like every
+# seam name: AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal, and
+# AS_TEST_POLL_HOOK names a scratch script signin runs once per poll, so a
+# case can change the scenario between polls in either timer mode.
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
   for _n in $AS_SEAM_BINS; do unset "AS_BIN_${_n}"; done
   for _n in $AS_SEAM_ROOTS; do unset "AS_${_n}"; done
-  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC
+  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC AS_TEST_STDIN_IS_TTY AS_TEST_POLL_HOOK
 fi
 : "${AS_BIN_AWK:=/usr/bin/awk}"
 : "${AS_BIN_BASENAME:=/usr/bin/basename}"
@@ -136,6 +147,7 @@ fi
 : "${AS_BIN_LSOF:=/usr/sbin/lsof}"
 : "${AS_BIN_MKTEMP:=/usr/bin/mktemp}"
 : "${AS_BIN_MV:=/bin/mv}"
+: "${AS_BIN_OD:=/usr/bin/od}"
 : "${AS_BIN_OPEN:=/usr/bin/open}"
 : "${AS_BIN_OSASCRIPT:=/usr/bin/osascript}"
 : "${AS_BIN_PS:=/bin/ps}"
@@ -144,6 +156,7 @@ fi
 : "${AS_BIN_RSYNC:=/usr/bin/rsync}"
 : "${AS_BIN_SECURITY:=/usr/bin/security}"
 : "${AS_BIN_SED:=/usr/bin/sed}"
+: "${AS_BIN_SHASUM:=/usr/bin/shasum}"
 : "${AS_BIN_SLEEP:=/bin/sleep}"
 : "${AS_BIN_TAIL:=/usr/bin/tail}"
 : "${AS_BIN_TR:=/usr/bin/tr}"
@@ -159,12 +172,15 @@ if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
 readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
   AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
   AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSAPPINFO AS_BIN_LSOF \
-  AS_BIN_MKTEMP AS_BIN_MV \
+  AS_BIN_MKTEMP AS_BIN_MV AS_BIN_OD \
   AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PS AS_BIN_PYTHON3 \
-  AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SLEEP AS_BIN_TAIL \
+  AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SHASUM AS_BIN_SLEEP AS_BIN_TAIL \
   AS_BIN_TR AS_BIN_WC
 readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
   AS_APP_LOG_DIR AS_KEYCHAIN_SVC
+AS_TEST_STDIN_IS_TTY="${AS_TEST_STDIN_IS_TTY:-}"
+AS_TEST_POLL_HOOK="${AS_TEST_POLL_HOOK:-}"
+readonly AS_TEST_STDIN_IS_TTY AS_TEST_POLL_HOOK
 
 # ---- End of test seam -----------------------------------------------------
 
@@ -1434,6 +1450,25 @@ _launch_report() {
 
 # ---- launch (additive; H-1) ----------------------------------------------
 
+# open_tag_instance <tag> <user-data-dir> <first_launch: true|false>
+# The open path launch and signin (#7) share: starts a new instance for the
+# tag (primary without the flag), records the tag in the statusline marker
+# and appends the LAUNCH row.
+open_tag_instance() {
+  local tag="$1" udd="$2" first_launch="$3"
+  if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
+    "$AS_BIN_OPEN" -n -a "Claude"
+  else
+    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="$udd"
+  fi
+
+  printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
+
+  printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
+    >> "$SWAP_LOG"
+}
+
 cmd_launch() {
   local tag="" force="false" arg
   for arg; do
@@ -1470,19 +1505,9 @@ cmd_launch() {
   local pre_pids
   pre_pids="$(get_claude_pids)"
 
-  if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
-    "$AS_BIN_OPEN" -n -a "Claude"
-  else
-    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="$udd"
-  fi
+  open_tag_instance "$tag" "$udd" "$first_launch"
 
   ok "Launched. Look for the new Claude window."
-
-  printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
-
-  printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
-    >> "$SWAP_LOG"
 
   if [[ "$first_launch" == "true" ]]; then
     info ""
@@ -2320,6 +2345,1039 @@ cmd_identity_pin() {
   ok "Pinned '${tag}' to \"${label}\" (id …${cur:32:4}) in ${CONFIG_FILE}."
 }
 
+# ---- signin (#7) -----------------------------------------------------------
+#
+# signin <tag> signs one tag in and, by default, leaves every other Claude
+# instance running. Before the sign-in it records each profile's identity
+# state; afterwards it compares them again, so a login callback delivered to
+# another open instance is detected after the fact (it is not prevented).
+# With --quit-others it quits every instance first (listed, then confirmed)
+# and signs in with only the target running.
+#
+# Exit codes, with precedence 4 > 1 > 3 > 0:
+#   0  the target reads match and every other profile is unchanged
+#   1  the target reads MISMATCH (and no other profile changed)
+#   2  refused before anything was opened or quit (also every argument error)
+#   3  the target reads unknown (no pin, not seen in time, exited, stopped)
+#   4  another profile changed, or could not be re-checked, or an instance
+#      ran on a profile signin can't determine
+# No other path exits 1: signin checks its own arguments before the shared
+# check in main (whose die exits 1), and an EXIT trap set at entry turns
+# any exit that did not come through _signin_exit into 2 before anything
+# was opened, or into the final check (result unknown, detail aborted)
+# after.
+#
+# The identity snapshot: a state word (nofolder, nofile, unreadable, absent,
+# present) and, for present, a SHA-256 digest of the identity value prefixed
+# with a random salt made for this run. jq writes the value into a pipe that
+# shasum reads, so the value never reaches a shell variable, an argument
+# list, a file or a log row in snapshot_read; only the digest comes back, and
+# the digest and salt are never printed, logged, written, exported or passed
+# as an argument. History rows carry tags, status words and counts only.
+
+readonly SIGNIN_POLL_S=2
+readonly SIGNIN_TIMEOUT_DEFAULT=300
+readonly SIGNIN_SETTLE_DEFAULT=20
+
+# The marker jq writes for one profile, no trailing newline: "A" when the key
+# is absent or null; "P" + the value for a string (lowercased); "J" + its JSON
+# text for any other value, so the number 1 and the string "1" differ. A top
+# level that is not one object (null included) is an error, so it reads
+# unreadable. -n input makes an empty file an error rather than no output.
+# shellcheck disable=SC2016
+readonly SNAP_JQ='if type != "object" then error("shape")
+  else .lastKnownAccountUuid as $v
+    | if $v == null then "A"
+      elif ($v | type) == "string" then "P" + ($v | ascii_downcase)
+      else "J" + ($v | tojson) end
+  end'
+
+SIGNIN_FINAL=0
+SIGNIN_PHASE="none"
+SIGNIN_POST_STARTED=0
+SIGNIN_QUIT_ROW=0
+SNAP_SALT=""
+SNAP_D_ABSENT=""
+
+_signin_usage() {
+  "$AS_BIN_CAT" <<EOF >&2
+Usage: account-switcher signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]
+       (login is the same command)
+  --quit-others  quit every Claude instance first (listed, then confirmed),
+                 and sign in with only the target running
+  --yes          answer the confirmations: the --quit-others list, and going
+                 on with a profile or an instance signin can't check
+  --timeout <s>  how long to wait for the sign-in: 30-1800 seconds (default ${SIGNIN_TIMEOUT_DEFAULT})
+  --settle <s>   how long to keep watching the other instances once the
+                 sign-in is seen: 0-120 seconds (default ${SIGNIN_SETTLE_DEFAULT})
+  --new          allow a tag that is not in [accounts]
+EOF
+}
+
+# Every intended signin exit goes through here, so the EXIT trap can tell an
+# intended exit from an unexpected one.
+_signin_exit() { SIGNIN_FINAL=1; exit "$1"; }
+
+# A refusal: one error line, exit 2.
+_signin_refuse() {
+  printf '\033[31mERROR:\033[0m %s\n' "$*" >&2
+  _signin_exit 2
+}
+
+# Returns 0 when stdin counts as a terminal. AS_TEST_STDIN_IS_TTY is empty
+# outside test mode (the seam block unsets it), so production reads -t 0.
+_signin_tty() {
+  if [[ "${AS_TEST_MODE:-0}" == "1" && -n "$AS_TEST_STDIN_IS_TTY" ]]; then
+    [[ "$AS_TEST_STDIN_IS_TTY" == "1" ]]
+    return
+  fi
+  [[ -t 0 ]]
+}
+
+# _signin_ask <question>: prints it and reads one line; returns 0 only for a
+# typed y or yes.
+_signin_ask() {
+  local ans=""
+  printf '%s [y/N] ' "$1"
+  IFS= read -r ans || ans=""
+  case "$ans" in
+    y|Y|yes|Yes|YES) return 0 ;;
+  esac
+  return 1
+}
+
+# Reads and discards whatever is waiting on stdin, so a key pressed before a
+# question was asked can never answer it.
+_signin_drain() {
+  local junk=""
+  while IFS= read -r -t 1 junk; do :; done
+  junk=""
+  return 0
+}
+
+# _account_email <tag>: the profile_email of the tag's [accounts] entry, or
+# nothing. It is printed on stdout only, never written to a log row.
+_account_email() {
+  local key e=""
+  key="$(identity_key "${1:-}")"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    e="$("$AS_BIN_AWK" -v tag="$key" '
+      /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
+      in_a && $0 ~ "^"tag"[[:space:]]*=" {
+        if (match($0, /profile_email[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+          v = substr($0, RSTART, RLENGTH)
+          sub(/^profile_email[[:space:]]*=[[:space:]]*"/, "", v); sub(/"$/, "", v)
+          print v
+        }
+        exit
+      }' "$CONFIG_FILE")" || e=""
+  fi
+  printf '%s' "$e"
+}
+
+# Sets SNAP_SALT (16 random bytes as hex) and SNAP_D_ABSENT (the digest an
+# absent or null key reads as). Neither is a secret: the salt only makes this
+# run's digests meaningless outside it. Neither is ever printed or exported.
+_snap_init() {
+  SNAP_SALT="$("$AS_BIN_OD" -An -N16 -tx1 /dev/urandom | "$AS_BIN_TR" -d ' \n')"
+  [[ "$SNAP_SALT" =~ ^[0-9a-f]{32}$ ]] || return 1
+  SNAP_D_ABSENT="$(printf '%s:A' "$SNAP_SALT" | "$AS_BIN_SHASUM" -a 256 | "$AS_BIN_AWK" '{print $1}')"
+  [[ "$SNAP_D_ABSENT" =~ ^[0-9a-f]{64}$ ]] || return 1
+  return 0
+}
+
+# snapshot_read <user-data-dir> <state-var> <digest-var>
+# Sets <state-var> to nofolder, nofile, unreadable, absent or present, and
+# <digest-var> to the salted digest when present ("" otherwise). Both names
+# must be plain scalar names (printf -v cannot write an array element on
+# bash 3.2; the caller copies the results into its arrays), and neither may
+# start with _sr_, the prefix of this function's own locals, which a caller's
+# name would otherwise shadow, leaving the caller's variable unwritten. A
+# refused name returns 2 and writes nothing. A file that does not parse on
+# three reads, a second apart, reads unreadable. The value itself only
+# travels from jq to shasum through a pipe.
+snapshot_read() {
+  local _sr_dir="${1:-}" _sr_f="" _sr_d="" _sr_try=1 _sr_re='^[A-Za-z_][A-Za-z0-9_]*$'
+  if [[ ! "${2:-}" =~ $_sr_re || ! "${3:-}" =~ $_sr_re || "${2:-}" == _sr_* || "${3:-}" == _sr_* ]]; then
+    printf '\033[31mERROR:\033[0m snapshot_read: out-parameters must be scalar names not starting _sr_ (got %s %s)\n' "${2:-}" "${3:-}" >&2
+    return 2
+  fi
+  printf -v "$2" '%s' unreadable
+  printf -v "$3" '%s' ''
+  if [[ ! -d "$_sr_dir" ]]; then printf -v "$2" '%s' nofolder; return 0; fi
+  _sr_f="${_sr_dir}/config.json"
+  if [[ ! -e "$_sr_f" ]]; then printf -v "$2" '%s' nofile; return 0; fi
+  while [[ $_sr_try -le 3 ]]; do
+    if _sr_d="$( { printf '%s:' "$SNAP_SALT"; "$AS_BIN_JQ" -j -n "input | ${SNAP_JQ}" "$_sr_f" 2> /dev/null; } \
+          | "$AS_BIN_SHASUM" -a 256 | "$AS_BIN_AWK" '{print $1}' )" && [[ "$_sr_d" =~ ^[0-9a-f]{64}$ ]]; then
+      if [[ "$_sr_d" == "$SNAP_D_ABSENT" ]]; then
+        printf -v "$2" '%s' absent
+      else
+        printf -v "$2" '%s' present
+        printf -v "$3" '%s' "$_sr_d"
+      fi
+      _sr_d=""
+      return 0
+    fi
+    _sr_d=""
+    # The app rewrites config.json while it runs; a retry covers a torn read.
+    # These retries never advance signin's poll count.
+    if [[ $_sr_try -lt 3 ]]; then "$AS_BIN_SLEEP" 1; fi
+    _sr_try=$((_sr_try + 1))
+  done
+  return 0
+}
+
+# _snap_now <user-data-dir>: snapshot_read into SG_ST and SG_DG, which read
+# unreadable and "" unless the read sets them.
+_snap_now() {
+  SG_ST="unreadable"
+  SG_DG=""
+  snapshot_read "$1" SG_ST SG_DG
+}
+
+# _snap_compare_idx <i>: sets SG_V to unchanged, changed or unverified for
+# the other profile at index <i>, its before-state against the read now in
+# SG_ST and SG_DG. nofolder, nofile and absent all mean "no recorded
+# account"; unreadable on either side can't be compared. The digests are
+# compared in [[ ]] only, never passed as an argument.
+_snap_compare_idx() {
+  local b="${SNAP_STATE0[$1]}"
+  if [[ "$b" == "unreadable" || "$SG_ST" == "unreadable" ]]; then SG_V="unverified"; return 0; fi
+  if [[ "$b" == "present" && "$SG_ST" == "present" ]]; then
+    if [[ "${SNAP_DIGEST0[$1]}" == "$SG_DG" ]]; then SG_V="unchanged"; else SG_V="changed"; fi
+    return 0
+  fi
+  if [[ "$b" == "present" || "$SG_ST" == "present" ]]; then SG_V="changed"; return 0; fi
+  SG_V="unchanged"
+}
+
+# Prints the tag of each profile folder under the profile root, one per line:
+# primary for Claude, <t> for Claude-<t> when <t> is a tag the matcher can
+# name (never primary or default, which no Claude-<t> folder stands for).
+_signin_profile_tags() {
+  local d t
+  if [[ -d "${AS_PROFILE_ROOT}/Claude" ]]; then printf 'primary\n'; fi
+  for d in "${AS_PROFILE_ROOT}/Claude-"*; do
+    [[ -d "$d" ]] || continue
+    t="${d#"${AS_PROFILE_ROOT}/Claude-"}"
+    if [[ "$t" =~ ^[a-z0-9][a-z0-9-]{0,31}$ && "$t" != "primary" && "$t" != "default" ]]; then
+      printf '%s\n' "$t"
+    fi
+  done
+}
+
+# _snap_index <tag>: the index of <tag> in SNAP_TAG, or nothing.
+_snap_index() {
+  local i=0
+  while [[ $i -lt ${#SNAP_TAG[*]} ]]; do
+    if [[ "${SNAP_TAG[$i]}" == "$1" ]]; then printf '%s' "$i"; return 0; fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# _snap_add <tag> [nofolder]: adds <tag> to the snapshot set with the read
+# now in SG_ST and SG_DG as its before-state, or with "no folder before".
+_snap_add() {
+  SNAP_TAG+=("$1")
+  if [[ "${2:-}" == "nofolder" ]]; then
+    SNAP_STATE0+=("nofolder")
+    SNAP_DIGEST0+=("")
+  else
+    SNAP_STATE0+=("$SG_ST")
+    SNAP_DIGEST0+=("$SG_DG")
+  fi
+  SNAP_VERDICT+=("unchanged")
+}
+
+# Adds every profile folder that is not in the snapshot set yet, and every
+# tag in $1 (tags of running instances), as "no folder before": a folder
+# that appears during the run, or an instance whose folder does not exist,
+# is still compared at the end.
+_snap_extend() {
+  local t tags
+  tags="$(_signin_profile_tags) ${1:-}"
+  # Tags are [a-z0-9-] only, so splitting is exact.
+  for t in $tags; do
+    if [[ "$t" == "$SG_TAG" || "$t" == "unknown" ]]; then continue; fi
+    if [[ -n "$(_snap_index "$t")" ]]; then continue; fi
+    _snap_add "$t" nofolder
+  done
+}
+
+# _signin_scan: one process-table read through the exact matcher (#9; argv[0]
+# must be the app binary, so a pager or grep whose arguments mention it is
+# never an instance). SG_ROWS: claude_instances rows (pid, profile, method).
+# SG_RAW_FLAGLESS: the PIDs the matcher's raw class marks FLAGLESS (no
+# --user-data-dir), padded with spaces. Returns 1 when ps can't be read.
+_signin_scan() {
+  local st=0 raw="" pid kind method
+  SG_ROWS=""
+  SG_RAW_FLAGLESS=" "
+  SG_ROWS="$(claude_instances)" || st=$?
+  [[ $st -eq 0 ]] || return 1
+  raw="$(_claude_main_rows)" || return 1
+  while IFS=$'\t' read -r pid kind method; do
+    if [[ -n "$pid" && "$kind" == "FLAGLESS" ]]; then SG_RAW_FLAGLESS="${SG_RAW_FLAGLESS}${pid} "; fi
+  done <<< "$raw"
+  return 0
+}
+
+# Writes the QUIT_ALL row (cmd_quit's format) once.
+_signin_quit_row() {
+  if [[ "$SIGNIN_QUIT_ROW" == "1" ]]; then return 0; fi
+  SIGNIN_QUIT_ROW=1
+  if [[ -d "$STORE" ]]; then
+    printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
+  fi
+}
+
+# After an interrupt or an unexpected stop during --quit-others' quit: what
+# was listed and what is still running. Nothing was opened yet.
+_signin_quit_report() {
+  local now
+  now="$(get_claude_pids)"
+  now="${now//$'\n'/ }"
+  printf 'Interrupted while quitting. Listed before the quit: PIDs%s. Still running: %s. Nothing was signed in.\n' \
+    "${SG_CONFIRMED% }" "${now:-none}"
+}
+
+# The EXIT trap, set at signin's entry. An exit that came through
+# _signin_exit keeps its status. Any other exit (a failed command under set
+# -e, a die in a helper) is never allowed to read as exit 1: before anything
+# was opened or quit it becomes 2; during the quit, 2 with the QUIT_ALL row;
+# after the target was opened or adopted, the final check runs once with
+# result unknown, detail aborted.
+_signin_on_exit() {
+  local rc=$?
+  if [[ "$SIGNIN_FINAL" == "1" ]]; then exit "$rc"; fi
+  SIGNIN_FINAL=1
+  set +e
+  trap '' INT TERM
+  case "$SIGNIN_PHASE" in
+    open|wait|settle)
+      printf '\033[33mWARN:\033[0m signin stopped unexpectedly (status %s); checking every profile before it reports.\n' "$rc" >&2
+      _signin_finish aborted
+      ;;
+    post)
+      printf "\033[31mERROR:\033[0m signin's final check did not finish (status %s), so no profile is confirmed unchanged. Run: account-switcher identity --all\n" "$rc" >&2
+      exit 4
+      ;;
+    quit|quitdone)
+      _signin_quit_row
+      printf '\033[31mERROR:\033[0m signin stopped during --quit-others (status %s); nothing was opened or signed in.\n' "$rc" >&2
+      exit 2
+      ;;
+    *)
+      printf '\033[31mERROR:\033[0m signin stopped before anything was opened or quit (status %s).\n' "$rc" >&2
+      exit 2
+      ;;
+  esac
+  exit 4
+}
+
+# The INT/TERM trap, phase-aware: before any quit or open, exit 2; during
+# --quit-others' quit, the QUIT_ALL row, what was quit, exit 2; after the
+# target was opened or adopted, the final check (result unknown, detail
+# aborted), which still reports exit 4 when another profile changed. During
+# the final check itself INT and TERM are ignored.
+_signin_on_signal() {
+  trap '' INT TERM
+  printf '\n'
+  case "$SIGNIN_PHASE" in
+    post) return 0 ;;
+    open|wait|settle)
+      printf 'Stopping (interrupted); checking every profile before reporting.\n'
+      _signin_finish aborted
+      ;;
+    quit|quitdone)
+      _signin_quit_row
+      _signin_quit_report
+      _signin_exit 2
+      ;;
+    *)
+      printf 'Stopped (interrupted) before anything was opened or quit.\n'
+      _signin_exit 2
+      ;;
+  esac
+}
+
+# The new-instance watch for one scan (SG_ROWS). A PID counts as a new
+# primary when it was in neither the pre-sign-in primary set (raw FLAGLESS,
+# or resolved primary or unknown) nor is the target, and its raw class is
+# FLAGLESS or its resolved profile is primary or unknown. Each new PID is
+# reported once. In wait mode it also tracks the target: its PID present,
+# or another row on its profile (the app restarted itself: follow it), or a
+# miss; two misses in a row stop the wait (target-exited).
+_signin_watch() {
+  local mode="$1" pid profile method seen_target=0 same="" np new tags_now=""
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$profile" != "unknown" ]]; then tags_now="${tags_now} ${profile}"; fi
+    if [[ "$pid" == "$TARGET_PID" ]]; then seen_target=1; continue; fi
+    # Another process on the target's own profile is the target restarting.
+    if [[ "$profile" == "$SG_TAG" ]]; then same="${same} ${pid}"; continue; fi
+    if [[ "$SG_SEEN" == *" ${pid} "* ]]; then continue; fi
+    np=0
+    new=0
+    if [[ "$SG_PRE_PRIMARY" != *" ${pid} "* ]] && \
+       [[ "$SG_RAW_FLAGLESS" == *" ${pid} "* || "$profile" == "primary" || "$profile" == "unknown" ]]; then
+      np=1
+    fi
+    if [[ "$SG_PRE_ALL" != *" ${pid} "* ]]; then new=1; fi
+    if [[ $np -eq 0 && $new -eq 0 ]]; then continue; fi
+    SG_SEEN="${SG_SEEN}${pid} "
+    if [[ "$SG_MODE" == "quit-others" ]]; then
+      printf "\033[33mWARN:\033[0m another Claude instance started during sign-in (%s · PID %s); the one-instance guarantee no longer holds.\n" "$profile" "$pid" >&2
+    fi
+    if [[ "$profile" == "unknown" ]]; then
+      SG_UNKNOWN_PIDS="${SG_UNKNOWN_PIDS}${pid} "
+      printf "\033[33mWARN:\033[0m an instance started during sign-in (PID %s) whose profile signin can't determine; it may be primary, and the result will be UNVERIFIED.\n" "$pid" >&2
+    elif [[ $np -eq 1 && "$SG_MODE" != "quit-others" ]]; then
+      printf '\033[33mWARN:\033[0m a primary instance started during sign-in (PID %s); the login may land in primary. Watching its identity.\n' "$pid" >&2
+    fi
+  done <<< "$SG_ROWS"
+  _snap_extend "$tags_now"
+
+  if [[ "$mode" != "wait" ]]; then return 0; fi
+  if [[ $seen_target -eq 1 ]]; then
+    SG_MISSES=0
+    if [[ "$SG_TAG" == "primary" && -n "$same" && "$SG_TWO_PRIMARY_WARNED" == "0" ]]; then
+      SG_TWO_PRIMARY_WARNED=1
+      printf '\033[33mWARN:\033[0m two primary instances are running (PIDs %s,%s); they share one profile, and the final check decides.\n' "$TARGET_PID" "${same// /, }" >&2
+    fi
+    return 0
+  fi
+  if [[ -n "$same" ]]; then
+    TARGET_PID="${same# }"
+    TARGET_PID="${TARGET_PID%% *}"
+    SG_MISSES=0
+    printf "The '%s' instance restarted; following the restarted instance (PID %s).\n" "$SG_TAG" "$TARGET_PID"
+    return 0
+  fi
+  SG_MISSES=$((SG_MISSES + 1))
+  if [[ $SG_MISSES -ge 2 ]]; then SG_STOP="target-exited"; fi
+  return 0
+}
+
+# Compares every other profile with its before-state. The first changed one
+# stops the wait (or the settle window) at once; an unreadable read does not
+# (it may be a torn write) and is settled by the final check.
+_signin_compare_others() {
+  local i=0
+  while [[ $i -lt ${#SNAP_TAG[*]} ]]; do
+    _snap_now "$(udd_for_tag "${SNAP_TAG[$i]}")"
+    _snap_compare_idx "$i"
+    SG_DG=""
+    if [[ "$SG_V" == "changed" ]]; then
+      SG_STOP="other-changed"
+      printf "Stopping: profile '%s' changed (see below).\n" "${SNAP_TAG[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 0
+}
+
+# One poll (wait or settle). The test hook, when set, runs first, once per
+# poll; time is counted in polls (poll count x 2 s), so snapshot_read's
+# retry sleeps never advance it.
+_signin_poll() {
+  local mode="$1"
+  SG_POLL=$((SG_POLL + 1))
+  if [[ -n "$AS_TEST_POLL_HOOK" ]]; then "$AS_TEST_POLL_HOOK" "$SG_POLL" || :; fi
+  # A process table that can't be read tells nothing this poll (not a miss).
+  if _signin_scan; then _signin_watch "$mode"; fi
+  if [[ -n "$SG_STOP" ]]; then return 0; fi
+  if [[ "$mode" == "wait" ]]; then
+    _snap_now "$SG_UDD"
+    if [[ "$SG_ST" == "present" && ( "$SG_TSTATE0" != "present" || "$SG_DG" != "$SG_TDIGEST0" ) ]]; then
+      SG_COMPLETE="changed"
+    fi
+    SG_DG=""
+  fi
+  _signin_compare_others
+  return 0
+}
+
+# The timer between polls. At a terminal, `read -t 2` is the interval and an
+# answer of y completes the sign-in. What happened is decided by the time
+# the read took, not its status: on bash 3.2 a timeout returns 1, the same as
+# end of input. A read that returns non-zero in under 2 s is end of input,
+# so signin stops reading and sleeps from then on.
+_signin_timer() {
+  local s r el ans=""
+  if [[ "$SG_READING" != "1" ]]; then
+    "$AS_BIN_SLEEP" "$SIGNIN_POLL_S"
+    return 0
+  fi
+  s=$SECONDS
+  if IFS= read -r -t "$SIGNIN_POLL_S" ans; then r=0; else r=$?; fi
+  el=$((SECONDS - s))
+  if [[ $r -eq 0 ]]; then
+    case "$ans" in
+      y|Y|yes|Yes|YES) SG_COMPLETE="${SG_COMPLETE:-unchanged}" ;;
+      *) printf '%s [y/N] ' "$SG_QUESTION" ;;
+    esac
+    return 0
+  fi
+  if [[ $el -ge $SIGNIN_POLL_S ]]; then return 0; fi
+  SG_READING=0
+  printf '\nInput ended, so signin no longer reads an answer; it finishes when the profile records an account, or after the timeout.\n'
+  return 0
+}
+
+# _signin_other_status <tag>: identity_status rendered by D-a4's label rule.
+_signin_other_status() {
+  local st
+  st="$(identity_status "$1")"
+  _ids_parse "$st"
+  case "${_IDS_STATUS}/${_IDS_DETAIL}" in
+    match/*)               printf '"%s" (match)' "$(account_label "$1")" ;;
+    MISMATCH/other-tag)    printf "%s's account (MISMATCH)" "$_IDS_VALUE" ;;
+    MISMATCH/*)            printf 'an unrecognized account (MISMATCH)' ;;
+    *)                     printf 'unknown (%s)' "$(identity_current_text "$st" "")" ;;
+  esac
+}
+
+# The final check: re-reads every profile (an unreadable read gets three
+# more reads, 2 s apart), runs #6's identity_status on the target, prints
+# the target line, the pin offer or the next step, a MISMATCH or UNVERIFIED
+# block for each other profile that changed or could not be re-checked, the
+# history rows, and the summary line last. Then exits 4, 1, 3 or 0. Runs
+# once (from the end of the wait, an interrupt or the EXIT trap).
+_signin_finish() {
+  local why="${1:-}" i v t st label current result detail recorded="none" cur="" other_pin=""
+  local changed=0 unverified=0 code=0 tries ts p n_unknown=0 note=""
+  if [[ "$SIGNIN_POST_STARTED" == "1" ]]; then return 0; fi
+  SIGNIN_POST_STARTED=1
+  SIGNIN_PHASE="post"
+  trap '' INT TERM
+  set +e
+  if [[ "$why" == "aborted" ]]; then SG_STOP="aborted"; fi
+
+  # 1. Final reads of every other profile, new folders included.
+  _snap_extend ""
+  i=0
+  while [[ $i -lt ${#SNAP_TAG[*]} ]]; do
+    _snap_now "$(udd_for_tag "${SNAP_TAG[$i]}")"
+    tries=0
+    while [[ "$SG_ST" == "unreadable" && $tries -lt 3 ]]; do
+      "$AS_BIN_SLEEP" "$SIGNIN_POLL_S"
+      _snap_now "$(udd_for_tag "${SNAP_TAG[$i]}")"
+      tries=$((tries + 1))
+    done
+    _snap_compare_idx "$i"
+    SG_DG=""
+    v="$SG_V"
+    SNAP_VERDICT[$i]="$v"
+    if [[ "$v" == "changed" ]]; then changed=$((changed + 1)); fi
+    if [[ "$v" == "unverified" ]]; then unverified=$((unverified + 1)); fi
+    i=$((i + 1))
+  done
+  for p in $SG_UNKNOWN_PIDS; do n_unknown=$((n_unknown + 1)); done
+  unverified=$((unverified + n_unknown))
+
+  # 2. The target, through #6 (always returns 0; the result is on stdout).
+  st="$(identity_status "$SG_TAG")"
+  _ids_parse "$st"
+  label="$(account_label "$SG_TAG")"
+  current="$(identity_current_text "$st" "$label")"
+  case "${_IDS_STATUS}/${_IDS_DETAIL}" in
+    match/*)               recorded="$SG_TAG" ;;
+    MISMATCH/other-tag)    recorded="$_IDS_VALUE" ;;
+    MISMATCH/*)            recorded="unrecognized" ;;
+    unknown/no-pin)
+      cur="$(profile_account_uuid "$SG_UDD")" || cur=""
+      if [[ -n "$cur" ]]; then other_pin="$(pinned_tag_for_id "$cur" "$SG_TAG")"; fi
+      cur=""
+      if [[ -n "$other_pin" ]]; then recorded="$other_pin"; else recorded="unrecognized"; fi
+      ;;
+    unknown/unreadable|unknown/bad-id) recorded="unrecognized" ;;
+    *)                     recorded="none" ;;
+  esac
+
+  # The result word. A sign-in that was seen (the key appeared or changed, or
+  # the operator answered y) is judged by #6. A stop before that (aborted,
+  # target-exited, other-changed, timeout) is MISMATCH when #6 says so, and
+  # otherwise unknown with the stop as its detail: never match. An abort is
+  # never match either, even after the sign-in was seen.
+  if [[ -n "$SG_COMPLETE" && "$SG_STOP" != "aborted" ]]; then
+    result="$_IDS_STATUS"
+    detail="$SG_COMPLETE"
+    if [[ "$result" == "unknown" ]]; then
+      case "$_IDS_DETAIL" in
+        no-pin) detail="unpinned" ;;
+        unreadable|bad-id) detail="unreadable" ;;
+      esac
+    fi
+  else
+    if [[ "$_IDS_STATUS" == "MISMATCH" ]]; then result="MISMATCH"; else result="unknown"; fi
+    detail="${SG_STOP:-aborted}"
+  fi
+
+  printf '\n'
+  case "$result" in
+    match)
+      if [[ "$detail" == "unchanged" ]]; then
+        printf "✓ '%s' is recorded as \"%s\" (match; the recorded account did not change, so signin could not see the sign-in itself).\n" "$SG_TAG" "$label"
+      else
+        printf "✓ '%s' is signed into \"%s\" (match).\n" "$SG_TAG" "$label"
+      fi
+      ;;
+    MISMATCH)
+      printf "✗ '%s' is recorded as %s, not \"%s\" (MISMATCH). In the '%s' window, sign out, then run: account-switcher signin %s\n" \
+        "$SG_TAG" "$current" "$label" "$SG_TAG" "$SG_TAG"
+      ;;
+    *)
+      case "$detail" in
+        aborted)       note="signin was stopped before the sign-in was confirmed" ;;
+        target-exited) note="the instance exited before sign-in finished" ;;
+        other-changed) note="the wait stopped because another profile changed" ;;
+        timeout)       note="sign-in not seen within ${SG_TIMEOUT}s" ;;
+        unreadable)    note="its identity can't be read" ;;
+        unpinned)      note="no pin" ;;
+        *)             note="no account is recorded, so signin can't confirm the sign-in" ;;
+      esac
+      printf "? '%s': %s (unknown).\n" "$SG_TAG" "$note"
+      if [[ -n "$other_pin" ]]; then printf "  It is recorded as %s's account.\n" "$other_pin"; fi
+      if [[ "$detail" == "unpinned" ]]; then _signin_pin_step "$other_pin" "$changed" "$unverified"; fi
+      ;;
+  esac
+
+  # 3. Every other profile that changed, or could not be re-checked.
+  i=0
+  while [[ $i -lt ${#SNAP_TAG[*]} ]]; do
+    t="${SNAP_TAG[$i]}"
+    case "${SNAP_VERDICT[$i]}" in
+      changed)
+        if [[ "${SNAP_STATE0[$i]}" == "present" ]]; then v="had a recorded account"; else v="had no recorded account"; fi
+        {
+          printf "\033[31mMISMATCH:\033[0m profile '%s' changed during this sign-in. Before: %s. Now: %s.\n" "$t" "$v" "$(_signin_other_status "$t")"
+          printf "  The '%s' sign-in may have been delivered to the '%s' instance.\n" "$SG_TAG" "$t"
+          printf "  Don't use the '%s' window for work until this is resolved.\n" "$t"
+          printf '  Recovery:\n'
+          printf '    1. account-switcher identity %s        (shows whether it still matches its pin)\n' "$t"
+          printf "    2. If it isn't match: sign out in the '%s' window, then\n" "$t"
+          printf '       account-switcher signin %s --quit-others\n' "$t"
+          printf "    3. Sign '%s' in again with nothing else open:\n" "$SG_TAG"
+          printf '       account-switcher signin %s --quit-others\n' "$SG_TAG"
+          printf "  If you signed in '%s' yourself during this run, step 1 confirms it and nothing else is needed.\n" "$t"
+        } >&2
+        ;;
+      unverified)
+        {
+          printf "\033[31mUNVERIFIED:\033[0m profile '%s' could not be re-checked (its identity can't be read). signin can't confirm it is unchanged.\n" "$t"
+          printf "  Recovery: account-switcher identity %s; if it isn't match, sign it in again with --quit-others.\n" "$t"
+        } >&2
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  for p in $SG_UNKNOWN_PIDS; do
+    {
+      printf "\033[31mUNVERIFIED:\033[0m an instance (PID %s) runs on a profile signin can't check, so signin can't confirm the sign-in did not land there.\n" "$p"
+      printf "  Recovery: account-switcher list; account-switcher identity --all; sign any tag that isn't match in again with --quit-others.\n"
+    } >&2
+  done
+
+  # 4. Exit code: 4 > 1 > 3 > 0.
+  if [[ $((changed + unverified)) -gt 0 ]]; then code=4
+  elif [[ "$result" == "MISMATCH" ]]; then code=1
+  elif [[ "$result" == "unknown" ]]; then code=3
+  else code=0
+  fi
+
+  # 5. History rows, in one block: tags, words and counts only.
+  if [[ -d "$STORE" ]]; then
+    ts="$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)"
+    {
+      printf '[%s] SIGNIN tag=%s mode=%s result=%s detail=%s others_changed=%s others_unverified=%s\n' \
+        "$ts" "$SG_TAG" "$SG_MODE" "$result" "$detail" "$changed" "$unverified"
+      printf '[%s] IDENTITY tag=%s status=%s\n' "$ts" "$SG_TAG" "$_IDS_STATUS"
+      i=0
+      while [[ $i -lt ${#SNAP_TAG[*]} ]]; do
+        case "${SNAP_VERDICT[$i]}" in
+          changed|unverified)
+            printf '[%s] SIGNIN_OTHER tag=%s change=%s during=%s\n' "$ts" "${SNAP_TAG[$i]}" "${SNAP_VERDICT[$i]}" "$SG_TAG" ;;
+        esac
+        i=$((i + 1))
+      done
+      for p in $SG_UNKNOWN_PIDS; do
+        printf '[%s] SIGNIN_OTHER tag=unknown change=unverified during=%s\n' "$ts" "$SG_TAG"
+      done
+    } >> "$SWAP_LOG"
+  fi
+
+  # 6. The summary line, always last on stdout.
+  printf 'signin tag=%s mode=%s result=%s detail=%s recorded_as=%s others_checked=%s others_changed=%s others_unverified=%s exit=%s\n' \
+    "$SG_TAG" "$SG_MODE" "$result" "$detail" "$recorded" "${#SNAP_TAG[*]}" "$changed" "$unverified" "$code"
+  _signin_exit "$code"
+}
+
+# _signin_pin_step <pinned-to-other-tag> <changed> <unverified>: after an
+# unpinned sign-in, offers the pin only where `identity pin` can succeed (the
+# tag is in [accounts], and its new account is not pinned to another tag),
+# at a terminal, with nothing else changed; it asks after draining input,
+# and --yes never answers it. Otherwise it prints the next step. The pin
+# runs in a subshell, so its exit status never becomes signin's.
+_signin_pin_step() {
+  local other="$1" key label
+  key="$(identity_key "$SG_TAG")"
+  label="$(account_label "$SG_TAG")"
+  if ! tag_is_in_accounts "$key"; then
+    printf '  Not in [accounts]: add it with account-switcher add-account %s <email>, then account-switcher identity pin %s\n' "$SG_TAG" "$SG_TAG"
+    return 0
+  fi
+  if [[ -n "$other" ]]; then
+    printf "  identity pin refuses an account already pinned to another tag. If '%s' should be on its own account, sign out in that window, then run: account-switcher signin %s\n" "$SG_TAG" "$SG_TAG"
+    return 0
+  fi
+  if [[ "$SG_STATE_END" != "present" || "$2" != "0" || "$3" != "0" ]] || ! _signin_tty; then
+    printf "  Check that the window's account menu shows \"%s\", then run: account-switcher identity pin %s\n" "$label" "$SG_TAG"
+    return 0
+  fi
+  printf "  Check that the window's account menu shows \"%s\".\n" "$label"
+  _signin_drain
+  if _signin_ask "Pin '${SG_TAG}' to this account now?"; then
+    printf '\n'
+    if ( cmd_identity_pin "$SG_TAG" --yes ); then
+      printf "  Pinned. account-switcher identity %s now reads match; this run's result stays unknown (it was checked before the pin).\n" "$SG_TAG"
+    else
+      printf '  Not pinned. Run: account-switcher identity pin %s\n' "$SG_TAG"
+    fi
+  else
+    printf '\n  Not pinned. To pin it later: account-switcher identity pin %s\n' "$SG_TAG"
+  fi
+  return 0
+}
+
+# signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]
+# See the block comment at the top of this section. main passes at most
+# eight arguments, each on its own; an empty one is skipped.
+cmd_signin() {
+  SIGNIN_FINAL=0
+  SIGNIN_PHASE="pre"
+  trap _signin_on_exit EXIT
+  trap _signin_on_signal INT TERM
+
+  local tag="" arg want="" quit_others="false" yes="false" new="false"
+  local timeout="" settle="" timeout_set=0 settle_set=0
+  for arg; do
+    if [[ -n "$want" ]]; then
+      if [[ "$want" == "timeout" ]]; then timeout="$arg"; timeout_set=1; else settle="$arg"; settle_set=1; fi
+      want=""
+      continue
+    fi
+    case "$arg" in
+      "") ;;
+      --quit-others|--yes|--new)
+        case "$arg" in
+          --quit-others) [[ "$quit_others" == "false" ]] || { _signin_usage; _signin_refuse "--quit-others is given twice."; }; quit_others="true" ;;
+          --yes)         [[ "$yes" == "false" ]] || { _signin_usage; _signin_refuse "--yes is given twice."; }; yes="true" ;;
+          --new)         [[ "$new" == "false" ]] || { _signin_usage; _signin_refuse "--new is given twice."; }; new="true" ;;
+        esac
+        ;;
+      --timeout) [[ $timeout_set -eq 0 ]] || { _signin_usage; _signin_refuse "--timeout is given twice."; }; want="timeout" ;;
+      --settle)  [[ $settle_set -eq 0 ]] || { _signin_usage; _signin_refuse "--settle is given twice."; }; want="settle" ;;
+      -*) _signin_usage; _signin_refuse "Unknown flag for signin: ${arg}" ;;
+      *)
+        if [[ -n "$tag" ]]; then _signin_usage; _signin_refuse "Unexpected argument: ${arg}"; fi
+        tag="$arg"
+        ;;
+    esac
+  done
+  if [[ -n "$want" ]]; then _signin_usage; _signin_refuse "--${want} needs a number of seconds."; fi
+  if [[ -z "$tag" ]]; then _signin_usage; _signin_refuse "signin needs a tag (for example: account-switcher signin backup)."; fi
+  # validate_tag's rules, checked here so a bad tag exits 2, not die's 1.
+  if [[ "$tag" == -* || ! "$tag" =~ ^[a-z0-9-]{1,32}$ ]]; then
+    _signin_refuse "Tag must match [a-z0-9-]{1,32} and must not start with '-' (got: '${tag}')."
+  fi
+  if [[ "$tag" == "default" ]]; then tag="primary"; fi
+  if [[ $timeout_set -eq 0 ]]; then
+    timeout="$SIGNIN_TIMEOUT_DEFAULT"
+  elif [[ ! "$timeout" =~ ^[0-9]{1,4}$ ]] || [[ $((10#$timeout)) -lt 30 || $((10#$timeout)) -gt 1800 ]]; then
+    _signin_refuse "--timeout takes a whole number of seconds from 30 to 1800 (got: '${timeout}')."
+  fi
+  if [[ $settle_set -eq 0 ]]; then
+    settle="$SIGNIN_SETTLE_DEFAULT"
+  elif [[ ! "$settle" =~ ^[0-9]{1,3}$ ]] || [[ $((10#$settle)) -gt 120 ]]; then
+    _signin_refuse "--settle takes a whole number of seconds from 0 to 120 (got: '${settle}')."
+  fi
+  timeout=$((10#$timeout))
+  settle=$((10#$settle))
+
+  # signin writes history rows; rotation runs here, inside the trap.
+  rotate_swap_log_if_needed
+
+  [[ -f "$CONFIG_FILE" ]] || _signin_refuse "No config.toml at ${CONFIG_FILE}. Register a tag first: account-switcher add-account <tag> <email>"
+  local in_accounts="false"
+  if tag_is_in_accounts "$(identity_key "$tag")"; then in_accounts="true"; fi
+  if [[ "$in_accounts" == "false" && "$new" == "false" ]]; then
+    _signin_refuse "Tag '${tag}' is not in [accounts] of ${CONFIG_FILE}. Register it first (account-switcher add-account ${tag} <email>), or sign in without a configured account: account-switcher signin ${tag} --new"
+  fi
+
+  # Run state, read by the helpers above.
+  SG_TAG="$tag"
+  SG_UDD="$(udd_for_tag "$tag")"
+  SG_TIMEOUT="$timeout"
+  if [[ "$quit_others" == "true" ]]; then SG_MODE="quit-others"; else SG_MODE="others-open"; fi
+  SG_ROWS="" SG_RAW_FLAGLESS=" " SG_PRE_PRIMARY=" " SG_PRE_ALL=" " SG_SEEN=" " SG_UNKNOWN_PIDS=""
+  SG_CONFIRMED="" SG_POLL=0 SG_COMPLETE="" SG_STOP="" SG_MISSES=0 SG_READING=0 SG_QUESTION=""
+  SG_TWO_PRIMARY_WARNED=0 SG_ST="" SG_DG="" SG_TSTATE0="" SG_TDIGEST0="" SG_STATE_END=""
+  TARGET_PID=""
+  SNAP_TAG=() SNAP_STATE0=() SNAP_DIGEST0=() SNAP_VERDICT=()
+
+  local label email email_txt
+  label="$(account_label "$tag")"
+  email="$(_account_email "$tag")"
+  email_txt="${email:-the account you intend for this tag}"
+  if [[ "$in_accounts" == "true" ]]; then
+    if [[ -n "$email" ]]; then
+      printf "Sign in tag '%s' as \"%s\" (%s).\n" "$tag" "$label" "$email"
+    else
+      printf "Sign in tag '%s' as \"%s\".\n" "$tag" "$label"
+    fi
+    SG_QUESTION="Does the '${tag}' window show you signed in as \"${label}\"?"
+  else
+    printf "Sign in tag '%s' (not in [accounts]; no configured account to check against).\n" "$tag"
+    email_txt="the account you intend for this tag"
+    SG_QUESTION="Does the '${tag}' window show you signed in with the account you intend for it?"
+  fi
+
+  # The identity snapshot of every profile, before anything is opened.
+  _snap_init || _signin_refuse "Could not set up the identity snapshot (no random salt); nothing was opened."
+  local t
+  for t in $(_signin_profile_tags); do
+    if [[ "$t" == "$tag" ]]; then continue; fi
+    _snap_now "$(udd_for_tag "$t")"
+    _snap_add "$t"
+  done
+  SG_DG=""
+  _snap_now "$SG_UDD"
+  SG_TSTATE0="$SG_ST"
+  SG_TDIGEST0="$SG_DG"
+  SG_DG=""
+
+  # The instances, through the exact matcher.
+  _signin_scan || _signin_refuse "The process table could not be read, so signin can't tell which instances are open; nothing was opened."
+  local pid profile method n_target=0 unknown_now="" listing="" idx state tags_now=""
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    SG_PRE_ALL="${SG_PRE_ALL}${pid} "
+    tags_now="${tags_now} ${profile}"
+    if [[ "$profile" == "primary" || "$profile" == "unknown" || "$SG_RAW_FLAGLESS" == *" ${pid} "* ]]; then
+      SG_PRE_PRIMARY="${SG_PRE_PRIMARY}${pid} "
+    fi
+    if [[ "$profile" == "$tag" ]]; then
+      n_target=$((n_target + 1))
+      TARGET_PID="$pid"
+      continue
+    fi
+    if [[ "$profile" == "unknown" ]]; then unknown_now="${unknown_now}${pid} "; fi
+    listing="${listing}, ${profile} · PID ${pid}"
+  done <<< "$SG_ROWS"
+  # A running instance's profile is always in the snapshot set, even when
+  # its folder is missing (then "no folder before").
+  _snap_extend "$tags_now"
+  listing="${listing#, }"
+
+  if [[ $n_target -ge 2 ]]; then
+    _signin_refuse "Two instances report profile '${tag}'; run account-switcher list. Nothing was opened."
+  fi
+
+  local warn_items=0
+  if [[ "$quit_others" == "false" ]]; then
+    if [[ -n "$listing" ]]; then
+      printf 'Open Claude instances, left running: %s\n' "$listing"
+    elif [[ -n "$TARGET_PID" ]]; then
+      printf 'Open Claude instances, left running: none besides the target\n'
+    else
+      printf 'Open Claude instances, left running: none\n'
+    fi
+    if [[ -z "$TARGET_PID" && -n "$unknown_now" ]]; then
+      _signin_refuse "Can't tell whether PID ${unknown_now% } is '${tag}'; run account-switcher list, or use --quit-others. Nothing was opened."
+    fi
+    for pid in $unknown_now; do
+      printf "\033[33mWARN:\033[0m PID %s runs on a profile signin can't determine, so signin can't protect it.\n" "$pid" >&2
+      SG_UNKNOWN_PIDS="${SG_UNKNOWN_PIDS}${pid} "
+      warn_items=$((warn_items + 1))
+    done
+  fi
+  idx=0
+  while [[ $idx -lt ${#SNAP_TAG[*]} ]]; do
+    if [[ "${SNAP_STATE0[$idx]}" == "unreadable" ]]; then
+      printf "\033[33mWARN:\033[0m can't read the identity of '%s'; signin can't protect it.\n" "${SNAP_TAG[$idx]}" >&2
+      warn_items=$((warn_items + 1))
+    fi
+    idx=$((idx + 1))
+  done
+  if [[ $warn_items -gt 0 && "$yes" != "true" ]]; then
+    _signin_tty || _signin_refuse "signin can't check everything it would need to (see the warnings above), and there is no terminal to ask; nothing was opened. Re-run with --yes to go on anyway (the result is then UNVERIFIED, exit 4)."
+    if ! _signin_ask "Continue anyway?"; then
+      printf '\n'
+      printf 'Not continuing; nothing was opened.\n'
+      _signin_exit 2
+    fi
+    printf '\n'
+  fi
+  if [[ "$quit_others" == "false" ]]; then
+    # X3: an open instance with no recorded account is the likeliest place
+    # for a stray login to land.
+    while IFS=$'\t' read -r pid profile method; do
+      [[ -n "$pid" && "$profile" != "$tag" && "$profile" != "unknown" ]] || continue
+      idx="$(_snap_index "$profile")"
+      [[ -n "$idx" ]] || continue
+      state="${SNAP_STATE0[$idx]}"
+      case "$state" in
+        absent|nofile|nofolder)
+          printf "\033[33mWARN:\033[0m '%s' (PID %s) has no recorded account and may be showing a sign-in screen. A stray login is most likely to land in a window like that; close it first, or use --quit-others.\n" "$profile" "$pid" >&2
+          ;;
+      esac
+    done <<< "$SG_ROWS"
+  fi
+
+  # --quit-others: list, confirm, check the quit path would signal exactly
+  # the listed PIDs, quit through quit_all_claude, check nothing is left.
+  if [[ "$quit_others" == "true" ]]; then
+    local mark now p
+    if [[ -z "${SG_PRE_ALL// /}" ]]; then
+      printf 'Nothing to quit.\n'
+    else
+      printf 'Open Claude instances:\n'
+      while IFS=$'\t' read -r pid profile method; do
+        [[ -n "$pid" ]] || continue
+        mark=""
+        if [[ "$profile" == "$tag" ]]; then mark="  (target: will be quit and reopened)"; fi
+        printf '  %s · PID %s%s\n' "$profile" "$pid" "$mark"
+        SG_CONFIRMED="${SG_CONFIRMED} ${pid}"
+      done <<< "$SG_ROWS"
+      printf -- "--quit-others quits every Claude instance listed above (work in progress in them may be lost), then opens '%s' alone.\n" "$tag"
+      if [[ "$yes" != "true" ]]; then
+        _signin_tty || _signin_refuse "--quit-others needs a terminal to confirm the list, or --yes. Nothing was quit."
+        if ! _signin_ask "Quit them?"; then
+          printf '\n'
+          printf 'Not quitting; nothing was quit or signed in.\n'
+          _signin_exit 2
+        fi
+        printf '\n'
+      fi
+      now="$(get_claude_pids)"
+      now=" ${now//$'\n'/ } "
+      for p in $SG_CONFIRMED; do
+        if [[ "$now" != *" ${p} "* ]]; then
+          _signin_refuse "The quit path would signal processes that weren't listed (the open instances changed since the list). Nothing was quit; run it again."
+        fi
+      done
+      for p in $now; do
+        if [[ " ${SG_CONFIRMED} " != *" ${p} "* ]]; then
+          _signin_refuse "The quit path would signal processes that weren't listed (PID ${p}). Nothing was quit; run it again."
+        fi
+      done
+      SIGNIN_PHASE="quit"
+      if ! ( quit_all_claude ); then
+        _signin_quit_row
+        _signin_refuse "Could not quit every instance; nothing was signed in."
+      fi
+      _signin_quit_row
+      SIGNIN_PHASE="quitdone"
+      _signin_scan || _signin_refuse "The process table could not be read after the quit; nothing was signed in."
+      if [[ -n "$SG_ROWS" ]]; then
+        _signin_refuse "A Claude instance is still running after the quit (account-switcher list); nothing was signed in."
+      fi
+    fi
+    TARGET_PID=""
+    SG_PRE_ALL=" "
+    SG_PRE_PRIMARY=" "
+  fi
+
+  # The target: use the running instance (never a second process on a
+  # profile whose lock is held), or open it through launch's open path.
+  local first_launch="false" pre rung
+  [[ -d "$SG_UDD" ]] || first_launch="true"
+  if [[ -n "$TARGET_PID" ]]; then
+    SIGNIN_PHASE="open"
+    printf "Using the running instance for '%s' (PID %s); not opening another.\n" "$tag" "$TARGET_PID"
+    printf "In the '%s' window: if it shows you signed in, sign out from the app's account menu first; then sign in as \"%s\".\n" "$tag" "$label"
+  else
+    pre="$(get_claude_pids)"
+    SIGNIN_PHASE="open"
+    if ! open_tag_instance "$tag" "$SG_UDD" "$first_launch"; then
+      SIGNIN_PHASE="pre"
+      _signin_refuse "Could not open the '${tag}' instance; nothing was signed in."
+    fi
+    TARGET_PID="$(wait_for_new_instance "$tag" "$pre" "$NEW_INSTANCE_WAIT_S")"
+    if [[ -z "$TARGET_PID" ]]; then
+      _signin_refuse "No new '${tag}' instance appeared within ${NEW_INSTANCE_WAIT_S} s of opening it, so signin can't watch it; nothing was signed in by signin. Check with: account-switcher list"
+    fi
+    printf "Opened '%s' (PID %s).\n" "$tag" "$TARGET_PID"
+  fi
+  rung="$(bring_to_front "$TARGET_PID")"
+  if [[ "$rung" == "none" ]]; then
+    printf "Bring the '%s' window (PID %s) to the front first: Cmd-backtick or the Dock.\n" "$tag" "$TARGET_PID"
+  fi
+
+  # The prompt block (criterion 2): the account, and how to sign in.
+  printf "In the '%s' window, choose \"Continue with email\", enter %s, then type the code you're sent.\n" "$tag" "$email_txt"
+  printf 'If you use Google instead, the browser decides the account: make sure the browser is signed into %s first.\n' "$email_txt"
+  printf 'Finish the sign-in in that window only, and leave the other Claude windows alone until this command reports.\n'
+  if [[ "$quit_others" == "false" ]]; then
+    printf 'If any other Claude window shows a sign-in screen, close it before you start.\n'
+    printf 'To sign in with nothing else open instead, stop now (Ctrl-C) and run: account-switcher signin %s --quit-others\n' "$tag"
+  fi
+
+  # The wait.
+  SIGNIN_PHASE="wait"
+  if _signin_tty; then
+    _signin_drain
+    SG_READING=1
+    printf 'Waiting up to %ss. When the window shows you signed in, answer y; Ctrl-C stops.\n' "$timeout"
+    printf '%s [y/N] ' "$SG_QUESTION"
+  else
+    printf 'Waiting up to %ss for the profile to record the sign-in; Ctrl-C stops.\n' "$timeout"
+  fi
+  while :; do
+    _signin_poll wait
+    if [[ -n "$SG_STOP" || -n "$SG_COMPLETE" ]]; then break; fi
+    _signin_timer
+    if [[ -n "$SG_COMPLETE" ]]; then
+      # Answered y: say "changed" if the key changed since the last poll.
+      _snap_now "$SG_UDD"
+      if [[ "$SG_ST" == "present" && ( "$SG_TSTATE0" != "present" || "$SG_DG" != "$SG_TDIGEST0" ) ]]; then
+        SG_COMPLETE="changed"
+      fi
+      SG_DG=""
+      break
+    fi
+    if [[ $((SG_POLL * SIGNIN_POLL_S)) -ge $timeout ]]; then SG_STOP="timeout"; break; fi
+  done
+  if [[ "$SG_READING" == "1" ]]; then printf '\n'; fi
+  if [[ "$SG_STOP" == "target-exited" ]]; then
+    printf "The '%s' instance exited before sign-in finished. If a browser tab or an emailed code is still pending, don't complete it:\n" "$tag"
+    printf 'finishing it now could sign another open instance, or a newly started primary, into this account.\n'
+    printf 'Check again in a minute with: account-switcher identity --all\n'
+  fi
+  _snap_now "$SG_UDD"
+  SG_STATE_END="$SG_ST"
+  SG_DG=""
+
+  # The settle window: the app has been seen to deliver one login callback
+  # several times, so keep watching the other profiles for a while.
+  if [[ -n "$SG_COMPLETE" && -z "$SG_STOP" && $settle -gt 0 ]]; then
+    SIGNIN_PHASE="settle"
+    printf 'Watching the other instances for %s s…\n' "$settle"
+    local k=0 n_settle=$(( (settle + SIGNIN_POLL_S - 1) / SIGNIN_POLL_S ))
+    while [[ $k -lt $n_settle ]]; do
+      "$AS_BIN_SLEEP" "$SIGNIN_POLL_S"
+      _signin_poll settle
+      if [[ -n "$SG_STOP" ]]; then break; fi
+      k=$((k + 1))
+    done
+  fi
+  _signin_finish ""
+}
+
 # ---- Help ----------------------------------------------------------------
 
 cmd_help() {
@@ -2380,6 +3438,32 @@ SUBCOMMANDS (Mac desktop app management):
                          (one line). front=no adds "Switch with Cmd-backtick
                          or the Dock". pid=unknown: no new instance
                          appeared in time; the launch still happened.
+
+  signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]
+                         (or login) Sign one tag in. Other instances stay
+                         open by default. It lists them, prints the tag's
+                         label and email, and opens the tag (or uses its
+                         running instance; never a second one). It then
+                         waits for the profile to record an account (at a
+                         terminal you can also answer y), keeps watching for
+                         ${SIGNIN_SETTLE_DEFAULT} s (--settle), and runs the account check. Before
+                         and after, it compares every profile's recorded
+                         account (a salted hash, never printed or saved): a
+                         change in another profile is a loud MISMATCH naming
+                         that tag, detected after the fact, not prevented.
+                         --quit-others lists every instance, asks (--yes
+                         skips), quits them all, and signs in with only the
+                         target running. --timeout 30-1800 (default ${SIGNIN_TIMEOUT_DEFAULT});
+                         --new allows a tag not in [accounts]. Ends with:
+                           signin tag=<tag> mode=<others-open|quit-others>
+                           result=<match|MISMATCH|unknown> detail=<word>
+                           recorded_as=<tag|none|unrecognized>
+                           others_checked=<n> others_changed=<n>
+                           others_unverified=<n> exit=<code>
+                         Exit 0 match; 1 MISMATCH; 2 refused, nothing
+                         opened; 3 unknown (no pin, not seen in time,
+                         exited, stopped); 4 another profile changed or
+                         could not be checked (wins over 1, 3 and 0).
 
   identity [<tag> | --all] [--show-ids]
                          Read-only account check. One row per tag in
@@ -2450,7 +3534,7 @@ PROFILE TAG CONVENTIONS:
                          (the OS default; preserves your existing chat history,
                          plugins, MCP, settings.)
   <other-tag>          → uses ~/Library/Application Support/Claude-<tag>
-                         (isolated; first launch of each tag prompts for OAuth login.)
+                         (isolated; sign each tag in with: signin <tag>.)
 
   Tag format enforced (H-1): [a-z0-9-]{1,32}, no leading hyphen.
 
@@ -2468,12 +3552,16 @@ EXAMPLES:
   account-switcher identity                   # one row per tag
   account-switcher identity pin backup        # after checking backup's window
 
+  # Sign a tag in (others stay open; any other profile that changes is named)
+  account-switcher signin backup
+  account-switcher signin backup --quit-others   # with nothing else open
+
   # Cleanup
   account-switcher quit --all                 # quit all instances
 
 NOTES:
-  - Each non-primary user-data-dir is created on first launch; first launch of
-    a new tag prompts for OAuth login.
+  - Each non-primary user-data-dir is created on first launch, which shows the
+    app's sign-in screen; use \`signin <tag>\` to sign it in and check the result.
   - "primary" maps to the default ~/Library/Application Support/Claude — preserves
     existing chat history, MCP connections, plugins. Don't rename this dir.
   - Multiple instances can run simultaneously. Each has its own dock icon (same
@@ -2508,6 +3596,22 @@ main() {
     IFS=' ' read -ra args <<< "$input"
     set -- "${args[@]}"
   fi
+
+  # signin (#7) is dispatched before the shared check below, whose die exits
+  # 1, which a caller would read as a MISMATCH: signin runs the same check in
+  # a subshell per argument and refuses with 2, and it takes at most eight
+  # arguments, each passed on its own (cmd_signin skips an empty one).
+  case "${1:-}" in
+    signin|login)
+      local _a
+      if [[ $# -gt 9 ]]; then _signin_usage; printf '\033[31mERROR:\033[0m Too many arguments for signin.\n' >&2; exit 2; fi
+      for _a; do
+        if ! ( validate_argv_safe "$_a" ); then exit 2; fi
+      done
+      cmd_signin "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}"
+      return 0
+      ;;
+  esac
 
   # M-1: Reject any argv token containing shell metacharacters before
   # dispatching. Layered defence with the slash command's "$ARGUMENTS" quoting.

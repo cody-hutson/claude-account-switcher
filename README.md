@@ -125,9 +125,10 @@ leftover, that file came from an older install and is no longer used.
 # Show CLI identity (~/.claude.json + keychain subscription)
 account-switcher status
 
-# Register a tag → email mapping in [accounts] of the runtime config.toml.
-# Run this after first-launch login under the tagged user-data-dir.
+# Register a tag → email mapping in [accounts] of the runtime config.toml,
+# then sign the tag in (see § Signing in a tag).
 account-switcher add-account backup you@example.com
+account-switcher signin backup
 
 # List configured tags + running instances
 account-switcher list
@@ -210,6 +211,76 @@ asking to let your terminal (or Claude) control System Events; allowing it
 is optional, and if you decline, that step just reads as not confirmed. It
 never uses `open -a Claude` or `tell application "Claude" to activate`,
 because with several instances open those can pick any of them.
+
+## Signing in a tag (`signin`)
+
+A new tag's first launch opens the app on its sign-in screen. The app
+signs in one of two ways:
+
+- **Email code** (recommended): choose "Continue with email", enter the
+  address, then type the code you are emailed into that window. The account
+  is the address you typed.
+- **Google**: the app sends you to the system browser, and the browser
+  returns you to the app through a `claude://` callback. The browser decides
+  the account, so it must already be signed into the right one.
+
+`account-switcher signin <tag>` (or `login <tag>`) runs that sign-in for one
+tag and checks the result:
+
+```bash
+account-switcher signin backup                 # other instances stay open
+account-switcher signin backup --quit-others   # sign in with nothing else open
+```
+
+1. It prints the tag's label and email from `[accounts]`, says which account
+   to use, and lists the Claude instances that are open (tag and PID).
+2. It opens the tag, or, when the tag is already running, uses that
+   instance and opens no second process for it.
+3. It waits up to `--timeout` seconds (default 300) for the profile to
+   record an account. At a terminal you can also answer `y` when the window
+   shows you signed in, which is how a sign-in back into the same account
+   finishes (nothing on disk changes then). Then it keeps watching the other
+   instances for `--settle` seconds (default 20).
+4. It runs the account check (§ Checking each tag's account) and reports
+   `match`, `MISMATCH` or `unknown` for the tag, then a summary line:
+   `signin tag=<tag> mode=<others-open|quit-others> result=<...> detail=<...>
+   recorded_as=<...> others_checked=<n> others_changed=<n>
+   others_unverified=<n> exit=<code>`.
+
+**Other instances stay open, and afterwards signin checks that no other
+profile's account changed.** Before the sign-in it records each profile's
+identity state: whether the account key is there, and a hash of its value
+with a random salt made for that run. The hash is never printed, logged or
+written to a file. After the sign-in it compares them again. If any profile
+other than the target changed, can't be re-read, or runs in an instance
+whose profile can't be determined, it prints `MISMATCH` (or `UNVERIFIED`)
+naming that tag or PID, with recovery steps, and exits `4`, even when the
+target reads `match`.
+
+**A callback delivered to another open instance is detected after the fact,
+not prevented.** With several instances open, macOS may hand the
+`claude://` login callback to a different instance than the one you are
+signing in, and that instance's profile can then be signed into this
+account. `signin` sees that only afterwards, when that profile's recorded
+account changes. It can't see a change in an instance that was already on
+the same account, or a login that lands after it has exited. Email-code
+sign-in may avoid the callback altogether. To remove the risk, close the
+other windows first, or use `--quit-others`.
+
+**`signin <tag> --quit-others` signs in with nothing else open.** It lists
+every open instance (the target too, when it is running: it is quit and
+reopened), asks before quitting them (`--yes` skips the question; without a
+terminal and without `--yes` it quits nothing and exits `2`), quits them the
+way `quit` does, and signs the tag in with only its instance running.
+
+Exit codes: `0` match; `1` MISMATCH; `2` refused before anything was opened
+or quit (including every argument error); `3` unknown (no pin yet, not seen
+before the timeout, the instance exited, or stopped); `4` another profile
+changed or could not be checked, which wins over the others. A tag with no
+pin ends `unknown`; at a terminal signin offers to pin it when
+`identity pin` would accept it, and otherwise prints the next step.
+`--new` signs in a tag that is not in `[accounts]` (it then ends `unknown`
+with the `add-account` and `identity pin` steps).
 
 ## Checking each tag's account (`identity`)
 
@@ -315,8 +386,8 @@ runtime path only on first install (your state preserved on re-install — see
 Key sections:
 
 - `[accounts]` — map of tag → `{ label, profile_email }`. Populate via
-  `account-switcher add-account <tag> <email> [label]` after first-launch
-  login under the tagged user-data-dir.
+  `account-switcher add-account <tag> <email> [label]`, then sign the tag in
+  with `account-switcher signin <tag>`.
 - `[identity]` — map of tag → the account id the tag's profile must be
   signed into, written by `account-switcher identity pin <tag>` (don't type
   ids by hand). A tag with no line here reads `unknown`. The header must be
@@ -335,7 +406,7 @@ Key sections:
 ## Profile tag conventions
 
 - `primary` (default) → `~/Library/Application Support/Claude` — preserves the existing chat history of the workspace's primary account
-- `<tag>` → `~/Library/Application Support/Claude-<tag>` — isolated; first launch prompts login
+- `<tag>` → `~/Library/Application Support/Claude-<tag>` — isolated; its first launch shows the app's sign-in screen (see § Signing in a tag)
 
 Tag validation regex: `^[a-z0-9-]{1,32}$`. Whitespace, uppercase, and
 non-ASCII characters are rejected (prevents shell injection in the
@@ -347,6 +418,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 |---|---|
 | `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`). Ends with the same closing line as `launch`. |
 | `launch <tag> [--force]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
+| `signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]` (or `login`) | Sign one tag in. Other instances stay open by default; afterwards it checks that no other profile's account changed (a change is detected after the fact, not prevented), and reports `match`, `MISMATCH` or `unknown` for the tag. `--quit-others` signs in with nothing else open. Exit `0`/`1`/`3` for the tag, `2` refused, `4` another profile changed. See § Signing in a tag. |
 | `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. See § Checking each tag's account. |
 | `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
 | `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
@@ -355,7 +427,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 | `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |
 | `config show` | Display the active config.toml. |
 | `config get <key>` | Read a single config.toml key (supports flat keys and one-level `table.key` form). |
-| `add-account <tag> <email> [label]` | Register a tag → email mapping in `[accounts]` of the runtime config.toml. Run after first-launch login under the tagged user-data-dir. |
+| `add-account <tag> <email> [label]` | Register a tag → email mapping in `[accounts]` of the runtime config.toml. Run it before `signin <tag>`, which prints the label and email from it. |
 | `version` (or `--version`) | Print the installed script's version. To check the install against the repo, run `bash install.sh --check` from the clone (see § Verify). |
 
 ## Security & input validation
@@ -365,6 +437,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - `quit` uses PID-based tracking (`/bin/kill -0` per PID) rather than `pgrep -f` argv-pattern matching. The pattern-match approach is brittle when Anthropic ships new Electron flags; PID tracking is kernel-truth.
 - Every running-instance check (`list`, `quit`, `clone-prefs`, the swap handoff's source, and the wait for the new instance after `launch` and `swap`) uses one matcher: a process is a Claude instance only when its first argument (argv[0]) is exactly `/Applications/Claude.app/Contents/MacOS/Claude`, so helper processes and other processes that merely mention that path are never counted or signalled. A profile folder is compared whole, so primary's `Claude` folder never matches a `Claude-<tag>` folder and `alt` never matches `alt-2`. `clone-prefs` refuses when it cannot tell whether its target is running.
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
+- `signin` compares every profile's identity before and after the sign-in without holding the value: `jq` writes it into a pipe that `shasum` reads, and only a salted SHA-256 digest comes back. The digests and the salt are never printed, logged, written to a file or passed to another program; history rows carry tags, status words and counts only.
 - The account check reads one non-secret value, `lastKnownAccountUuid`, from each profile's `config.json`. That file also holds the app's token caches, so `jq` reads it in place and only that one value (at most 36 characters, and only when it is shaped like an account id) reaches the script; no shell variable ever holds the file's contents, the file is never copied, and core dumps are turned off for the run. Nothing else in a profile is opened.
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
 
