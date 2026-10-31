@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | clone-prefs | quit | list | status | config | add-account | help
+# Subcommands: swap | launch | clone-prefs | quit | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -15,6 +15,11 @@
 set -euo pipefail
 
 # ---- Constants & paths ---------------------------------------------------
+
+# Bump on every change to this script. `install.sh --check` reads this line
+# from both the repo copy and the installed copy (without running either), so
+# keep it a single `readonly VERSION="..."` assignment.
+readonly VERSION="11.0.0-dev"
 
 readonly STORE="${HOME}/.claude/account-switcher"
 readonly CLAUDE_JSON="${HOME}/.claude.json"
@@ -81,7 +86,7 @@ validate_note_safe() {
 # ---- Log rotation (M-13) -------------------------------------------------
 
 # Trim swap-history.log to last 1000 lines if total exceeds 1100. Older
-# content moves to .swap-history.log.1 (single-file rotation). Called once
+# content moves to swap-history.log.1 (single-file rotation). Called once
 # per script invocation (at script entry).
 rotate_swap_log_if_needed() {
   [[ -f "$SWAP_LOG" ]] || return 0
@@ -1190,7 +1195,7 @@ cmd_quit() {
 # ---- status --------------------------------------------------------------
 
 cmd_status() {
-  printf '\n=== Claude Code Account Switcher (v1.0) ===\n\n'
+  printf '\n=== Claude Code Account Switcher (v%s) ===\n\n' "$VERSION"
 
   # CLI identity (what bridged Code reads from when displaying the account name).
   local active_email active_uuid
@@ -1360,7 +1365,7 @@ EOF
 
 cmd_help() {
   /bin/cat <<EOF
-Claude desktop app account switcher (v1.0)
+Claude desktop app account switcher (v${VERSION})
 
 The bridged Code subprocess proxies API calls through the Mac app's parent
 auth (per user-data-dir), NOT the CLI keychain. So the right primitive for
@@ -1437,6 +1442,10 @@ SUBCOMMANDS (Mac desktop app management):
                          'status' can resolve CLI identity → switcher tag.
                          This is the explicit [accounts] registration path.
 
+  version (or --version) Print this script's version. To check whether the
+                         install matches the repository, run
+                         \`bash install.sh --check\` from the repo clone.
+
   help                   Show this message.
 
 PROFILE TAG CONVENTIONS:
@@ -1473,8 +1482,12 @@ NOTES:
 
 STORE:        ${STORE}
 CONFIG:       ${CONFIG_FILE}
-SWAP LOG:     ${SWAP_LOG}  (rotated at 1100 lines, archive .swap-history.log.1)
+SWAP LOG:     ${SWAP_LOG}  (rotated at 1100 lines, archive swap-history.log.1)
 EOF
+}
+
+cmd_version() {
+  printf 'account-switcher %s\n' "$VERSION"
 }
 
 # ---- Dispatch ------------------------------------------------------------
@@ -1514,6 +1527,12 @@ main() {
   done
   validate_argv_safe "${_strict_argv[@]}"
   [[ -n "$_note_val" ]] && validate_note_safe "$_note_val"
+
+  # Answer `version` before log rotation, so asking for the version touches
+  # no files.
+  case "${1:-}" in
+    version|--version) cmd_version; return 0 ;;
+  esac
 
   # M-13: Rotate the swap log at script entry (cheap; runs once per invocation).
   rotate_swap_log_if_needed

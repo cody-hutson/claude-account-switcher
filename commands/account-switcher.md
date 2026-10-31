@@ -25,6 +25,7 @@ persist on disk. OAuth state lives in:
 - `status` — Show CLI identity (~/.claude.json + keychain subscription).
 - `config show | get <key>` — Display or read config.toml.
 - `add-account <tag> <email> [label]` — Register a tag → email mapping in `[accounts]` of the runtime config.toml.
+- `version` (or `--version`) — Print the installed script's version. To check the install against the repo, run `bash install.sh --check` from the clone.
 
 **Profile tag mapping (validated regex `^[a-z0-9-]{1,32}$`):**
 - `primary` (default) → `~/Library/Application Support/Claude` — preserves chat history

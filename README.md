@@ -40,17 +40,50 @@ bash install.sh
 
 1. Creates `~/.claude/account-switcher/` if not exists
 2. Copies `account-switcher.sh` to `~/.claude/account-switcher/account-switcher.sh` (overwrite — source of truth)
-3. Copies `config.toml.template` to `~/.claude/account-switcher/config.toml` ONLY if the runtime instance does not exist (preserves your customization across re-installs)
-4. Copies `commands/account-switcher.md` to `~/.claude/commands/account-switcher.md` (registers the `/account-switcher` slash command)
+3. Copies `commands/account-switcher.md` to `~/.claude/commands/account-switcher.md` (registers the `/account-switcher` slash command)
+4. Copies `config.toml.template` to `~/.claude/account-switcher/config.toml` ONLY if the runtime instance does not exist (preserves your customization across re-installs)
 5. Verifies install by invoking `account-switcher status`
 
 ### Verify
 
+Check that the installed files match the repo you installed from:
+
 ```bash
-~/.claude/account-switcher/account-switcher.sh help
+cd ~/claude-account-switcher
+bash install.sh --check
 ```
 
-Or in a fresh Claude Code terminal session:
+The check compares each installed file byte for byte with its copy in the
+repo and prints both versions:
+
+```
+Installed version: <version>
+Repo version:      <version> (commit <sha>)
+
+  ok        ~/.claude/account-switcher/account-switcher.sh
+  ok        ~/.claude/commands/account-switcher.md
+
+Install matches this repo.
+```
+
+It exits `0` when everything matches. It exits `1` and names the problem
+when an installed file **differs**, is **missing**, or is a **leftover** — a
+file in `~/.claude/account-switcher/` that this version does not install,
+usually from an older install. Remove a leftover with `trash <path>`; the
+installer never deletes files. Exit `2` means the check could not run (run it
+from the repo root).
+
+The check is read-only. It skips your runtime state and never opens it:
+`config.toml`, `swap-history.log`, `swap-history.log.1`, `.statusline-marker`,
+`prefs-sync.json` and `.DS_Store`.
+
+To see which version is installed without the repo:
+
+```bash
+~/.claude/account-switcher/account-switcher.sh version
+```
+
+To confirm the switcher runs, in a fresh Claude Code terminal session:
 
 ```
 /account-switcher help
@@ -58,12 +91,14 @@ Or in a fresh Claude Code terminal session:
 
 ## Updating
 
-Fixes ship to `main`. To update an existing install, pull and re-run the installer:
+Fixes ship to `main`. To update an existing install, pull, re-run the
+installer, then check the result:
 
 ```bash
 cd ~/claude-account-switcher
 git pull
 bash install.sh
+bash install.sh --check
 ```
 
 `install.sh` overwrites `account-switcher.sh` and the `/account-switcher` slash
@@ -71,6 +106,18 @@ command with the new versions, but **preserves your runtime
 `~/.claude/account-switcher/config.toml`** — the template is only copied on a
 first install. Your account mappings, notification channels, and handoff
 settings survive updates untouched.
+
+Because your `config.toml` is never rewritten, settings added in a newer
+version show up only in `config.toml.template`. Until you add them, the
+switcher uses their defaults. After updating, compare the two and copy across
+any section you want:
+
+```bash
+diff ~/claude-account-switcher/config.toml.template ~/.claude/account-switcher/config.toml
+```
+
+`bash install.sh --check` then confirms the update landed. If it lists a
+leftover, that file came from an older install and is no longer used.
 
 ## Quick start
 
@@ -187,6 +234,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 | `config show` | Display the active config.toml. |
 | `config get <key>` | Read a single config.toml key (supports flat keys and one-level `table.key` form). |
 | `add-account <tag> <email> [label]` | Register a tag → email mapping in `[accounts]` of the runtime config.toml. Run after first-launch login under the tagged user-data-dir. |
+| `version` (or `--version`) | Print the installed script's version. To check the install against the repo, run `bash install.sh --check` from the clone (see § Verify). |
 
 ## Security & input validation
 
