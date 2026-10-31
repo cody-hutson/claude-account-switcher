@@ -16,6 +16,9 @@
 #                                its next call (set_ps_next_fixture)
 #   $AS_TEST_ROOT/lsof/<pid>.txt open-file names the lsof fake prints
 #   $AS_TEST_ROOT/alive.txt      PIDs the kill fake treats as alive
+#   $AS_TEST_ROOT/front.txt      PID of the front application (lsappinfo and
+#                                osascript fakes; absent until a rung moves
+#                                it, then $AS_FAKE_FRONT_PID, default 400)
 #   $AS_TEST_ROOT/git-fixture    scratch git repository ($TEST_GIT_ROOT)
 #   $AS_TEST_ROOT/tmp            TMPDIR for the script under test
 # The harness itself never runs a fake: the fakes directory goes on PATH only
@@ -235,7 +238,8 @@ new_case() {
   # shellcheck disable=SC2090
   export AS_FIXTURE_PS AS_FIXTURE_PS_AFTER_QUIT AS_FIXTURE_KEYCHAIN_JSON
   unset AS_FAKE_QUIT AS_FAKE_KILL_EFFECTIVE AS_FAKE_OPEN_SPAWNS_PID AS_FAKE_OPEN_UDD \
-    AS_FAKE_KEYCHAIN
+    AS_FAKE_KEYCHAIN AS_FAKE_FRONT_PID AS_FAKE_FRONT_AFTER_SETFRONT \
+    AS_FAKE_FRONT_AFTER_APPKIT AS_FAKE_FRONT_AFTER_SYSEVENTS AS_FAKE_ACTIVATE_RC
   : > "$AS_FIXTURE_PS"
   : > "$AS_FIXTURE_PS_AFTER_QUIT"
   /bin/mkdir -p "${AS_TEST_ROOT}/lsof" || harness_error "cannot create the lsof fixture directory"

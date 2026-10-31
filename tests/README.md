@@ -66,6 +66,7 @@ against this checkout.
 | `t-01-detect.sh` | `list` and the running-tag detection; its former CHARACTERIZATION #9 cases now pin the corrected behaviour |
 | `t-09-detect.sh` | #9: the exact instance matcher and every caller (`list`, `clone-prefs`, the swap handoff, `quit`), the `lsof` path, the `pgrep` lint, a large table |
 | `t-06-identity.sh` | #6: the per-tag account check (`identity`, `identity pin`, the check before `launch` and `swap`), `identity_status`'s always-0 contract, and a leak scan with its own control arm |
+| `t-08-front.sh` | #8: after `launch` and `swap`, the wait for the new PID, the bring-to-front ladder (`setfront`, AppKit, System Events, none) with each rung checked by `front_pid`, the closing line, and the always-0 contracts of `wait_for_new_instance` and `bring_to_front` |
 | `t-05-install-check.sh` | `install.sh --check`, version reporting, install mode through the fakes |
 
 ## The scratch root
@@ -82,6 +83,7 @@ against this checkout.
 | `ps-next.txt` | optional: the table the `ps` fake installs after its next call (`set_ps_next_fixture`) |
 | `lsof/<pid>.txt` | the open-file names (`lsof -Fn` records) the `lsof` fake prints for that PID (`set_lsof_fixture <pid> <file>`) |
 | `alive.txt` | the PIDs the `kill` fake treats as alive |
+| `front.txt` | the PID of the front application, which the `lsappinfo` and `osascript` fakes share; absent until a rung moves it (then `AS_FAKE_FRONT_PID`, default `400`) |
 | `git-fixture` | a scratch git repository with one commit (`TEST_GIT_ROOT`); point `[swap_handoff].git_root` at it when a case needs git content |
 | `tmp` | `TMPDIR` for the code under test |
 
@@ -98,9 +100,13 @@ interlock reads:
 
 | Class | Commands | Behaviour |
 |---|---|---|
-| `recording` | `kill` `security` `osascript` `open` `ps` `lsof` (required) | record the call, run nothing real, act on the scenario files |
+| `recording` | `kill` `security` `osascript` `open` `ps` `lsof` `lsappinfo` (required), `sleep` | record the call, run nothing real, act on the scenario files |
 | `guarded-passthrough` | `rm` `mv` `cp` `rsync` `chmod` `install` `mktemp` (required), `git` | record, refuse a path outside the root, then run the real tool |
 | `passthrough` | every other command | record, then run the real tool |
+
+The `sleep` fake returns at once: every wait in the script counts polls
+rather than reading the clock, and every fake changes state on a call,
+never with time, so a 15 s wait runs its full count without waiting.
 
 Scenario controls, all exported and reset by `new_case`:
 
@@ -108,7 +114,12 @@ Scenario controls, all exported and reset by `new_case`:
 |---|---|---|
 | `AS_FIXTURE_PS` | `ps` | path of the process table (set it with `set_ps_fixture <file> [after-quit-file]`) |
 | `AS_FIXTURE_PS_AFTER_QUIT` | `osascript` | the table that replaces it on a graceful quit |
-| `AS_FAKE_QUIT=graceful` | `osascript` | every app quits: `alive.txt` empties, the after-quit table is installed |
+| `AS_FAKE_QUIT=graceful` | `osascript` | on the quit script only, every app quits: `alive.txt` empties, the after-quit table is installed |
+| `AS_FAKE_FRONT_PID=<n>` | `lsappinfo` | the front application before any rung moves it (default `400`) |
+| `AS_FAKE_FRONT_AFTER_SETFRONT` | `lsappinfo` | what `setfront` leaves in front: `target` (the PID it named), a PID, or unset/empty for no change |
+| `AS_FAKE_FRONT_AFTER_APPKIT` | `osascript` | the same, for the AppKit activation (`-l JavaScript`, recorded as `osascript ACTIVATE appkit <pid>`) |
+| `AS_FAKE_FRONT_AFTER_SYSEVENTS` | `osascript` | the same, for the System Events activation (recorded as `osascript ACTIVATE system-events <pid>`) |
+| `AS_FAKE_ACTIVATE_RC=<n>` | `lsappinfo`, `osascript` | the exit status of `setfront` and of both activations (default `0`) |
 | `AS_FAKE_KILL_EFFECTIVE=0` | `kill` | a signalled PID stays alive |
 | `AS_FAKE_OPEN_SPAWNS_PID=<n>` | `open` | a new main process with that PID joins the table (with its `--user-data-dir` unless `AS_FAKE_OPEN_UDD=0`) |
 | `AS_FIXTURE_KEYCHAIN_JSON` | `security` | the item it prints (fake values only) |

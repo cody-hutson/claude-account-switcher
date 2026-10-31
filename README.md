@@ -176,6 +176,40 @@ All of this is optional — skip it per-swap with `--no-handoff`.
 `open -n -a Claude.app --args --user-data-dir "~/Library/Application
 Support/Claude-<tag>"`. The Electron parent process loads from the tagged
 user-data-dir; its OAuth state is isolated from every other tagged dir.
+Then it brings the new window to the front and prints the closing line
+described in the next section.
+
+## The window in front after `launch` and `swap`
+
+With several instances open, the window in front after a launch is not
+always the new one, and work done in the wrong window runs on the wrong
+account. So after `open`, `launch <tag>` and `swap <tag>` wait up to 15 s
+for the new instance's process (a process for that tag that was not
+running before), ask macOS to bring that process to the front, check with
+`lsappinfo front` that it is in front, and end with one line:
+
+```
+tag=backup pid=4242 front=yes account="Backup" status=match
+```
+
+- `pid` is the new instance's process; `pid=unknown` means no new process
+  for the tag appeared within 15 s. The launch itself still happened, and
+  the command still exits `0`.
+- `front=yes` means the check saw that process in front. `front=no` adds
+  `Switch with Cmd-backtick or the Dock`.
+- `account` and `status` come from the account check (see § Checking each
+  tag's account): the label, in double quotes, of the account the profile
+  is recorded as signed into (the tag's own label, or another tag's label
+  on a `MISMATCH`); or `unrecognized`, or `unknown`. Labels only, never ids.
+
+To bring the window forward it tries, in order, and stops at the first that
+the check confirms: `lsappinfo setfront` for that process; an AppKit
+activation of that process (through `osascript`); asking System Events to
+make that process frontmost. The last one can show a one-time macOS prompt
+asking to let your terminal (or Claude) control System Events; allowing it
+is optional, and if you decline, that step just reads as not confirmed. It
+never uses `open -a Claude` or `tell application "Claude" to activate`,
+because with several instances open those can pick any of them.
 
 ## Checking each tag's account (`identity`)
 
@@ -311,8 +345,8 @@ non-ASCII characters are rejected (prevents shell injection in the
 
 | Subcommand | Action |
 |---|---|
-| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`) |
-| `launch <tag> [--force]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`. |
+| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`). Ends with the same closing line as `launch`. |
+| `launch <tag> [--force]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
 | `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. See § Checking each tag's account. |
 | `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
 | `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
@@ -329,7 +363,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - Tag regex `^[a-z0-9-]{1,32}$` rejects shell-injection vectors in the `--user-data-dir` path argument.
 - Email validation in `add-account` is intentionally lightweight (not RFC-compliant): refuses whitespace, requires a `@` followed by a `.`.
 - `quit` uses PID-based tracking (`/bin/kill -0` per PID) rather than `pgrep -f` argv-pattern matching. The pattern-match approach is brittle when Anthropic ships new Electron flags; PID tracking is kernel-truth.
-- Every running-instance check (`list`, `quit`, `clone-prefs`, and the swap handoff's source) uses one matcher: a process is a Claude instance only when its first argument (argv[0]) is exactly `/Applications/Claude.app/Contents/MacOS/Claude`, so helper processes and other processes that merely mention that path are never counted or signalled. A profile folder is compared whole, so primary's `Claude` folder never matches a `Claude-<tag>` folder and `alt` never matches `alt-2`. `clone-prefs` refuses when it cannot tell whether its target is running.
+- Every running-instance check (`list`, `quit`, `clone-prefs`, the swap handoff's source, and the wait for the new instance after `launch` and `swap`) uses one matcher: a process is a Claude instance only when its first argument (argv[0]) is exactly `/Applications/Claude.app/Contents/MacOS/Claude`, so helper processes and other processes that merely mention that path are never counted or signalled. A profile folder is compared whole, so primary's `Claude` folder never matches a `Claude-<tag>` folder and `alt` never matches `alt-2`. `clone-prefs` refuses when it cannot tell whether its target is running.
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
 - The account check reads one non-secret value, `lastKnownAccountUuid`, from each profile's `config.json`. That file also holds the app's token caches, so `jq` reads it in place and only that one value (at most 36 characters, and only when it is shaped like an account id) reaches the script; no shell variable ever holds the file's contents, the file is never copied, and core dumps are turned off for the run. Nothing else in a profile is opened.
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
@@ -364,8 +398,8 @@ deauthorize the tagged identity.
 
 `bash tests/run.sh` runs the simulated test suite from the repository root.
 Every case runs against fakes in a scratch directory with its own `HOME`, so
-no case can signal a real Claude process, read your keychain, or write a
-real profile. Three things keep it there: the script runs every external
+no case can signal a real Claude process, bring a real window to the front,
+read your keychain, or write a real profile. Three things keep it there: the script runs every external
 command and data root through an `AS_*` variable (the seam), which it
 ignores outside test mode; in test mode it refuses to start (exit 78) unless
 every one of those variables points into the scratch directory; and the

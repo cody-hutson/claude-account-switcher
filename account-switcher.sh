@@ -7,7 +7,7 @@
 #
 # Subcommands: swap | launch | identity | clone-prefs | quit | list | status | config | add-account | version | help
 #
-# Primitives: bash + jq + open + osascript. No Python, no node.
+# Primitives: bash + jq + open + osascript + lsappinfo. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
 # macOS keychain (CLI surface, when used) or Electron safeStorage per
 # user-data-dir (Mac app surface).
@@ -55,7 +55,7 @@ _as_test_under() {
 # with 78 instead of tripping set -u.
 _as_test_mode_interlock() {
   local root="${AS_TEST_ROOT:-}" fakes="${AS_FAKES_DIR:-}"
-  local danger=" KILL SECURITY OSASCRIPT OPEN PS LSOF "
+  local danger=" KILL SECURITY OSASCRIPT OPEN PS LSOF LSAPPINFO "
   local write=" RM MV CP RSYNC CHMOD INSTALL MKTEMP "
   local name var value line1 line2 class need
 
@@ -109,7 +109,7 @@ _as_test_mode_interlock() {
   [[ "${AS_KEYCHAIN_SVC:-}" == as-test-* ]] || _as_test_refuse "AS_KEYCHAIN_SVC does not begin with as-test- (got '${AS_KEYCHAIN_SVC:-}')"
 }
 
-AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSOF MKTEMP MV OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKTEMP MV OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
@@ -132,6 +132,7 @@ fi
 : "${AS_BIN_INSTALL:=/usr/bin/install}"
 : "${AS_BIN_JQ:=/usr/bin/jq}"
 : "${AS_BIN_KILL:=/bin/kill}"
+: "${AS_BIN_LSAPPINFO:=/usr/bin/lsappinfo}"
 : "${AS_BIN_LSOF:=/usr/sbin/lsof}"
 : "${AS_BIN_MKTEMP:=/usr/bin/mktemp}"
 : "${AS_BIN_MV:=/bin/mv}"
@@ -157,7 +158,8 @@ fi
 if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
 readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
   AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
-  AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSOF AS_BIN_MKTEMP AS_BIN_MV \
+  AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSAPPINFO AS_BIN_LSOF \
+  AS_BIN_MKTEMP AS_BIN_MV \
   AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PS AS_BIN_PYTHON3 \
   AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SLEEP AS_BIN_TAIL \
   AS_BIN_TR AS_BIN_WC
@@ -1239,6 +1241,197 @@ quit_all_claude() {
   ok "Existing instances quit"
 }
 
+# ---- The new instance, brought to the front (#8) --------------------------
+#
+# After `open -n`, launch and swap find the new instance's PID, ask macOS to
+# put that process in front, check that it is, and end with one line on
+# stdout naming the tag, the PID, whether it is in front, and the account
+# from the #6 check (labels only, never ids):
+#
+#   tag=<tag> pid=<pid|unknown> front=yes|no account=<"label"|unrecognized|unknown> status=<match|MISMATCH|unknown>
+#
+# followed, when front=no, by two spaces and "Switch with Cmd-backtick or the
+# Dock". Before this the switcher only said to look for the new window, so
+# the operator could go on working in a window that was already in front.
+# wait_for_new_instance and bring_to_front are also called by signin (#7);
+# their contracts below are stable.
+
+# How long launch and swap wait for the new instance to appear, in seconds.
+readonly NEW_INSTANCE_WAIT_S=15
+
+# front_pid: prints the PID of the front application, or nothing; always
+# returns 0. `lsappinfo front` prints the front application's ASN with a
+# trailing colon (ASN:0x0-0x1d01d:). Only that trailing colon is removed
+# before `lsappinfo info -only pid` reads it: deleting every colon (tr -d ':')
+# also removes the "ASN:" prefix, and info then prints nothing (Stage 5 A-1).
+front_pid() {
+  local asn="" line="" re='"pid"=([0-9]+)'
+  asn="$("$AS_BIN_LSAPPINFO" front 2>/dev/null | "$AS_BIN_SED" 's/:$//')" || asn=""
+  if [[ "$asn" != ASN:* ]]; then return 0; fi
+  line="$("$AS_BIN_LSAPPINFO" info -only pid "$asn" 2>/dev/null)" || line=""
+  if [[ "$line" =~ $re ]]; then printf '%s\n' "${BASH_REMATCH[1]}"; fi
+  return 0
+}
+
+# wait_for_new_instance <tag> <pre-open PID list> [timeout]
+#
+# Contract (stable; signin calls it too):
+#   - Polls the exact matcher (claude_instances, #9) every 0.5 s for up to
+#     <timeout> seconds (default 15; anything but a whole number reads 15).
+#   - Prints the PID of the first main process whose profile resolves to
+#     <tag> ("default" is primary) and whose PID is not in <pre-open PID
+#     list> (PIDs separated by spaces or newlines, normally get_claude_pids
+#     taken just before `open`), then stops.
+#   - Prints nothing when no such process appears in time, or when <tag> is
+#     not a valid tag (then it returns at once). A process table that cannot
+#     be read counts as "not yet".
+#   - ALWAYS returns 0, so  pid="$(wait_for_new_instance "$t" "$pre")"  is
+#     safe under set -euo pipefail. It only reads; it never signals.
+# The number of polls is fixed (two per second of timeout) rather than read
+# from the clock, so a test's sleep fake can drive the wait to its end.
+wait_for_new_instance() {
+  local want="${1:-}" pre=" ${2:-} " limit="${3:-15}" polls n=0 rows pid profile method
+  if [[ "$want" == "default" ]]; then want="primary"; fi
+  if [[ ! "$want" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then return 0; fi
+  pre="${pre//$'\n'/ }"
+  if [[ ! "$limit" =~ ^[0-9]{1,5}$ ]]; then limit=15; fi
+  polls=$(( 10#$limit * 2 ))
+  while :; do
+    rows=""
+    rows="$(claude_instances)" || rows=""
+    while IFS=$'\t' read -r pid profile method; do
+      if [[ -z "$pid" || "$profile" != "$want" ]]; then continue; fi
+      if [[ "$pre" == *" ${pid} "* ]]; then continue; fi
+      printf '%s\n' "$pid"
+      return 0
+    done <<< "$rows"
+    if [[ $n -ge $polls ]]; then break; fi
+    "$AS_BIN_SLEEP" 0.5 2>/dev/null || :
+    n=$((n + 1))
+  done
+  return 0
+}
+
+# The AppKit rung's script (JavaScript for Automation with the ObjC bridge).
+# The PID arrives as argv[0], never as part of the code. 3 is
+# NSApplicationActivateAllWindows (1) | NSApplicationActivateIgnoringOtherApps (2).
+# shellcheck disable=SC2016
+readonly AS_JXA_ACTIVATE='function run(argv) {
+  ObjC.import("AppKit");
+  var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(argv[0]));
+  if (app.isNil()) { return "absent"; }
+  app.activateWithOptions(3);
+  return "asked";
+}'
+
+# The System Events rung's script; the PID arrives as item 1 of argv.
+readonly AS_SE_ACTIVATE='tell application "System Events" to set frontmost of (first application process whose unix id is ((item 1 of argv) as integer)) to true'
+
+# _front_is <pid>: returns 0 when front_pid reads <pid>, checked twice, each
+# after a 0.5 s pause (activation is asynchronous); 1 otherwise.
+_front_is() {
+  local i=0 f=""
+  while [[ $i -lt 2 ]]; do
+    "$AS_BIN_SLEEP" 0.5 2>/dev/null || :
+    f="$(front_pid)"
+    if [[ -n "$f" && "$f" == "$1" ]]; then return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# bring_to_front <pid>
+#
+# Contract (stable; signin calls it too):
+#   - Asks macOS to put main process <pid> in front, one rung at a time, and
+#     after each rung checks with front_pid whether <pid> is now the front
+#     application (_front_is: two checks, 0.5 s apart).
+#   - Stops at the first rung that verifies and prints its name, one word on
+#     stdout: setfront, appkit or system-events; or none when no rung
+#     verified, or when <pid> is not a positive whole number (then no rung
+#     runs). The word names the first rung after which <pid> was seen in
+#     front; a window that comes forward on its own is credited to the rung
+#     just tried.
+#   - ALWAYS returns 0, so  rung="$(bring_to_front "$pid")"  is safe under
+#     set -euo pipefail. A rung whose command fails reads as not verified.
+#
+# The rungs, in order (Stage 5 D-8 as amended by A-1):
+#   setfront       `lsappinfo setfront "#<pid>"`: a Launch Services request
+#                  addressed by PID ("#<pid>" is lsappinfo's PID form of an
+#                  application specifier). Raises no Automation prompt.
+#   appkit         osascript -l JavaScript: NSRunningApplication for <pid>,
+#                  then activateWithOptions. An AppKit call made inside
+#                  osascript, not an Apple event to another app, so it raises
+#                  no Automation prompt either.
+#   system-events  osascript asking System Events to set frontmost of the
+#                  process whose unix id is <pid>. The first time this rung
+#                  runs, macOS may show a one-time Automation prompt ("... wants
+#                  to control System Events"); once that is denied, osascript
+#                  fails silently (-1743) and the rung reads as not verified.
+#   none           nothing else is tried; the caller says how to switch.
+# Never `open -a Claude` or `tell application "Claude" to activate`: both
+# name the app bundle, not a process, so with several instances running
+# Launch Services picks one of them, not necessarily <pid>. From macOS 14 an
+# app that is not frontmost may have its activation request ignored
+# (cooperative activation), which is why each rung is verified, not trusted.
+bring_to_front() {
+  local pid="${1:-}" rung
+  if [[ ! "$pid" =~ ^[1-9][0-9]{0,9}$ ]]; then printf 'none\n'; return 0; fi
+  for rung in setfront appkit system-events; do
+    case "$rung" in
+      setfront)
+        "$AS_BIN_LSAPPINFO" setfront "#${pid}" > /dev/null 2>&1 || :
+        ;;
+      appkit)
+        "$AS_BIN_OSASCRIPT" -l JavaScript -e "$AS_JXA_ACTIVATE" "$pid" > /dev/null 2>&1 || :
+        ;;
+      system-events)
+        "$AS_BIN_OSASCRIPT" -e 'on run argv' -e "$AS_SE_ACTIVATE" -e 'end run' "$pid" > /dev/null 2>&1 || :
+        ;;
+    esac
+    if _front_is "$pid"; then
+      printf '%s\n' "$rung"
+      return 0
+    fi
+  done
+  printf 'none\n'
+  return 0
+}
+
+# _launch_report <tag> <pre-open PID list>: the end of launch and swap.
+# Waits for the new instance, brings it to the front, reads the #6 status
+# again (the same on-disk value the gate read, so a report, not a second
+# gate, and no second history row) and prints the closing line on stdout.
+_launch_report() {
+  local tag="$1" pre="$2" pid="" rung="none" front="no" st account line
+  info "Waiting up to ${NEW_INSTANCE_WAIT_S} s for the new '${tag}' instance..."
+  pid="$(wait_for_new_instance "$tag" "$pre" "$NEW_INSTANCE_WAIT_S")"
+  if [[ -n "$pid" ]]; then
+    rung="$(bring_to_front "$pid")"
+    if [[ "$rung" != "none" ]]; then
+      front="yes"
+      info "  PID ${pid} is in front (${rung})."
+    else
+      info "  PID ${pid} is running but could not be brought to the front."
+    fi
+  else
+    pid="unknown"
+    info "  No new '${tag}' instance appeared within ${NEW_INSTANCE_WAIT_S} s; it may still be starting (account-switcher list)."
+  fi
+  st="$(identity_status "$tag")"
+  _ids_parse "$st"
+  case "${_IDS_STATUS}/${_IDS_DETAIL}" in
+    match/*)            account="\"$(account_label "$tag")\"" ;;
+    MISMATCH/other-tag) account="\"$(account_label "$_IDS_VALUE")\"" ;;
+    MISMATCH/*)         account="unrecognized" ;;
+    *)                  account="unknown" ;;
+  esac
+  line="tag=${tag} pid=${pid} front=${front} account=${account} status=${_IDS_STATUS}"
+  if [[ "$front" != "yes" ]]; then line="${line}  Switch with Cmd-backtick or the Dock"; fi
+  printf '%s\n' "$line"
+  return 0
+}
+
 # ---- launch (additive; H-1) ----------------------------------------------
 
 cmd_launch() {
@@ -1272,6 +1465,11 @@ cmd_launch() {
     info "  (first launch — Claude will prompt for login in the new window)"
   fi
 
+  # #8: every main process running before `open`, so the wait below takes
+  # only a process that is new.
+  local pre_pids
+  pre_pids="$(get_claude_pids)"
+
   if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
     "$AS_BIN_OPEN" -n -a "Claude"
   else
@@ -1292,6 +1490,10 @@ cmd_launch() {
     info "After login, the user-data-dir will hold that account's auth + chat + plugins."
     info "Future 'launch ${tag}' invocations will skip the login prompt."
   fi
+
+  # #8: wait for the new instance, bring it to the front, end with its line.
+  # The launch itself has happened, so this never changes the exit status.
+  _launch_report "$tag" "$pre_pids"
 }
 
 # ---- list (running instances + configured profile dirs) ------------------
@@ -1489,6 +1691,11 @@ EOF
   info "Launching '${target_tag}' Mac app instance..."
   info "  user-data-dir: ${target_udd}"
 
+  # #8: any main process still listed after the quit, so the wait at the end
+  # takes only the instance this swap opens.
+  local pre_pids
+  pre_pids="$(get_claude_pids)"
+
   if [[ "$is_primary" == "true" ]]; then
     "$AS_BIN_OPEN" -n -a "Claude"
   else
@@ -1523,6 +1730,11 @@ EOF
   # M-15: Success path — clear in-progress flag so the EXIT trap is a no-op.
   __SWAP_IN_PROGRESS="false"
   trap - INT TERM EXIT
+
+  # #8: the swap is complete; wait for the new instance, bring it to the
+  # front and end with its line. This runs after the trap is cleared, so an
+  # interrupt during the wait does not report a half-done swap.
+  _launch_report "$target_tag" "$pre_pids"
 }
 
 # ---- clone-prefs (H-1, M-7, M-10, M-11) ----------------------------------
@@ -2144,12 +2356,13 @@ SUBCOMMANDS (Mac desktop app management):
                            1. Auto-clone-prefs primary→tgt (if tgt is non-primary)
                            2. Quit current Claude instance(s)
                               (graceful 15s → SIGTERM → SIGKILL via PID list)
-                           3. Launch target instance
+                           3. Launch target instance and bring its window to
+                              the front
                          Result: identity display + Mac-app billing align with tgt.
                          Workspace (~/.claude/) stays bidirectional.
                          Runs the account check (see identity) first: on a
                          MISMATCH it refuses before quitting or writing
-                         anything.
+                         anything. Ends with the same line as launch.
                          Flags:
                            --no-mirror       skip step 1
                            --force           swap even on a MISMATCH
@@ -2159,6 +2372,14 @@ SUBCOMMANDS (Mac desktop app management):
                          Runs the account check (see identity) first: on a
                          MISMATCH it refuses and opens nothing; --force
                          launches anyway, with the warning.
+                         Then waits up to ${NEW_INSTANCE_WAIT_S} s for the new instance, brings
+                         its window to the front by PID, and ends with:
+                           tag=<tag> pid=<pid> front=yes|no
+                           account=<"label"|unrecognized|unknown>
+                           status=<match|MISMATCH|unknown>
+                         (one line). front=no adds "Switch with Cmd-backtick
+                         or the Dock". pid=unknown: no new instance
+                         appeared in time; the launch still happened.
 
   identity [<tag> | --all] [--show-ids]
                          Read-only account check. One row per tag in
@@ -2257,6 +2478,10 @@ NOTES:
     existing chat history, MCP connections, plugins. Don't rename this dir.
   - Multiple instances can run simultaneously. Each has its own dock icon (same
     Claude.app binary; different in-memory state).
+  - To bring a new window forward, launch and swap try lsappinfo setfront,
+    then an AppKit activation, then System Events, each for that PID. The
+    System Events step may show a one-time macOS prompt asking to control
+    System Events; declining only means that step is skipped.
   - To fully reset a profile: quit the instance, then \`trash\`
     \`~/Library/Application Support/Claude-<tag>\`. Next \`launch <tag>\` is a fresh login.
 
