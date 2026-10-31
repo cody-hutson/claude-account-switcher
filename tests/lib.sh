@@ -11,7 +11,10 @@
 #   $AS_TEST_ROOT/home           HOME for the case
 #   $AS_TEST_ROOT/fakes          one fake per seamed command (tests/fakes/)
 #   $AS_TEST_ROOT/calls.log      one line per fake call
-#   $AS_TEST_ROOT/ps.txt         process table the ps and pgrep fakes print
+#   $AS_TEST_ROOT/ps.txt         process table the ps fake prints
+#   $AS_TEST_ROOT/ps-next.txt    optional table the ps fake installs after
+#                                its next call (set_ps_next_fixture)
+#   $AS_TEST_ROOT/lsof/<pid>.txt open-file names the lsof fake prints
 #   $AS_TEST_ROOT/alive.txt      PIDs the kill fake treats as alive
 #   $AS_TEST_ROOT/git-fixture    scratch git repository ($TEST_GIT_ROOT)
 #   $AS_TEST_ROOT/tmp            TMPDIR for the script under test
@@ -131,13 +134,19 @@ _case_base() {
   printf '%s' "$base"
 }
 
-# Renders a fixture: copies $1 to $2, writing the case's HOME for __HOME__.
+# Renders a fixture: copies $1 to $2, writing the case's HOME for __HOME__
+# and the case's app bundle ($AS_APP_BUNDLE) for __APP__.
 render_fixture() {
   local src="$1" dest="$2" l
   [[ -f "$src" ]] || harness_error "fixture not found: $src"
   : > "$dest" || harness_error "cannot write $dest"
   while IFS= read -r l || [[ -n "$l" ]]; do
-    printf '%s\n' "${l//__HOME__/$HOME}" >> "$dest"
+    l="${l//__HOME__/$HOME}"
+    if [[ "$l" == *__APP__* ]]; then
+      [[ -n "${AS_APP_BUNDLE:-}" ]] || harness_error "fixture $src names __APP__ but AS_APP_BUNDLE is unset"
+      l="${l//__APP__/$AS_APP_BUNDLE}"
+    fi
+    printf '%s\n' "$l" >> "$dest"
   done < "$src"
 }
 
@@ -226,9 +235,10 @@ new_case() {
   # shellcheck disable=SC2090
   export AS_FIXTURE_PS AS_FIXTURE_PS_AFTER_QUIT AS_FIXTURE_KEYCHAIN_JSON
   unset AS_FAKE_QUIT AS_FAKE_KILL_EFFECTIVE AS_FAKE_OPEN_SPAWNS_PID AS_FAKE_OPEN_UDD \
-    AS_FAKE_PGREP_RC AS_FAKE_KEYCHAIN
+    AS_FAKE_KEYCHAIN
   : > "$AS_FIXTURE_PS"
   : > "$AS_FIXTURE_PS_AFTER_QUIT"
+  /bin/mkdir -p "${AS_TEST_ROOT}/lsof" || harness_error "cannot create the lsof fixture directory"
   : > "${AS_TEST_ROOT}/alive.txt"
   : > "${AS_TEST_ROOT}/calls.log"
 
@@ -282,6 +292,18 @@ set_ps_fixture() {
   if [[ -n "${2:-}" ]]; then
     render_fixture "${FIXTURES}/ps/$2" "$AS_FIXTURE_PS_AFTER_QUIT"
   fi
+}
+
+# Renders tests/fixtures/ps/<name> as the table the ps fake installs right
+# after its next call, so the following call sees a changed process list.
+set_ps_next_fixture() {
+  render_fixture "${FIXTURES}/ps/$1" "${AS_TEST_ROOT}/ps-next.txt"
+}
+
+# set_lsof_fixture <pid> <name>: renders tests/fixtures/lsof/<name> as the
+# open-file names (lsof -Fn records) the lsof fake prints for that PID.
+set_lsof_fixture() {
+  render_fixture "${FIXTURES}/lsof/$2" "${AS_TEST_ROOT}/lsof/$1.txt"
 }
 
 # ---- Running the code under test -------------------------------------------

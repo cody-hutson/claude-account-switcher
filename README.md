@@ -229,7 +229,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 | `launch <tag>` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. |
 | `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
 | `quit [--all]` | Quit running Claude instances. `--all` quits every instance; bare `quit` quits only the current foreground instance. Graceful → SIGTERM → SIGKILL escalation. |
-| `list` (or `instances`) | Show running instances + configured profile dirs. |
+| `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. |
 | `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |
 | `config show` | Display the active config.toml. |
 | `config get <key>` | Read a single config.toml key (supports flat keys and one-level `table.key` form). |
@@ -241,6 +241,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - Tag regex `^[a-z0-9-]{1,32}$` rejects shell-injection vectors in the `--user-data-dir` path argument.
 - Email validation in `add-account` is intentionally lightweight (not RFC-compliant): refuses whitespace, requires a `@` followed by a `.`.
 - `quit` uses PID-based tracking (`/bin/kill -0` per PID) rather than `pgrep -f` argv-pattern matching. The pattern-match approach is brittle when Anthropic ships new Electron flags; PID tracking is kernel-truth.
+- Every running-instance check (`list`, `quit`, `clone-prefs`, and the swap handoff's source) uses one matcher: a process is a Claude instance only when its first argument (argv[0]) is exactly `/Applications/Claude.app/Contents/MacOS/Claude`, so helper processes and other processes that merely mention that path are never counted or signalled. A profile folder is compared whole, so primary's `Claude` folder never matches a `Claude-<tag>` folder and `alt` never matches `alt-2`. `clone-prefs` refuses when it cannot tell whether its target is running.
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
 

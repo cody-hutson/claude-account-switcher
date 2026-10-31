@@ -21,7 +21,7 @@ persist on disk. OAuth state lives in:
 - `launch <tag>` — ADDITIVE launch. Spawns target without quitting others. Use for side-by-side.
 - `clone-prefs [src tgt]` — Mirror Mac-app user-facing prefs from src to tgt (snapshot-rollback semantics; ≤1 backup retained).
 - `quit [--all]` — Quit all running Claude instances (graceful → SIGTERM → SIGKILL via PID list).
-- `list` (or `instances`) — Show running instances + configured profile dirs.
+- `list` (or `instances`) — Show running instances + configured profile dirs. Each instance shows its tag and how it was found (`via=argv`, `via=flagless` for primary, `via=lsof`), or `tag=unknown via=none` when it can't be determined.
 - `status` — Show CLI identity (~/.claude.json + keychain subscription).
 - `config show | get <key>` — Display or read config.toml.
 - `add-account <tag> <email> [label]` — Register a tag → email mapping in `[accounts]` of the runtime config.toml.

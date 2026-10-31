@@ -63,7 +63,8 @@ against this checkout.
 | `fakes/*.sh` | one template per fake class or command; `new_case` copies each to `$AS_FAKES_DIR/<name>` |
 | `fixtures/` | masked inputs, rendered per case (see the masking rule below) |
 | `t-00-seam.sh` | production neutrality, the interlock, and the guards in the fakes |
-| `t-01-detect.sh` | `list` and the running-tag detection, as they behave today |
+| `t-01-detect.sh` | `list` and the running-tag detection; its former CHARACTERIZATION #9 cases now pin the corrected behaviour |
+| `t-09-detect.sh` | #9: the exact instance matcher and every caller (`list`, `clone-prefs`, the swap handoff, `quit`), the `lsof` path, the `pgrep` lint, a large table |
 | `t-05-install-check.sh` | `install.sh --check`, version reporting, install mode through the fakes |
 
 ## The scratch root
@@ -76,7 +77,9 @@ against this checkout.
 | `home` | the case's `HOME`; `AS_STORE`, `AS_PROFILE_ROOT` and the other roots sit beneath it, except `AS_APP_BUNDLE` (`$AS_TEST_ROOT/Applications/Claude.app`) |
 | `fakes` | the fakes (`AS_FAKES_DIR`) |
 | `calls.log` | one line per fake call: the fake's name, then each argument, tab-separated |
-| `ps.txt` | the process table the `ps` and `pgrep` fakes print (`AS_FIXTURE_PS`) |
+| `ps.txt` | the process table the `ps` fake prints (`AS_FIXTURE_PS`) |
+| `ps-next.txt` | optional: the table the `ps` fake installs after its next call (`set_ps_next_fixture`) |
+| `lsof/<pid>.txt` | the open-file names (`lsof -Fn` records) the `lsof` fake prints for that PID (`set_lsof_fixture <pid> <file>`) |
 | `alive.txt` | the PIDs the `kill` fake treats as alive |
 | `git-fixture` | a scratch git repository with one commit (`TEST_GIT_ROOT`); point `[swap_handoff].git_root` at it when a case needs git content |
 | `tmp` | `TMPDIR` for the code under test |
@@ -94,7 +97,7 @@ interlock reads:
 
 | Class | Commands | Behaviour |
 |---|---|---|
-| `recording` | `kill` `security` `osascript` `open` `ps` `pgrep` (required) | record the call, run nothing real, act on the scenario files |
+| `recording` | `kill` `security` `osascript` `open` `ps` `lsof` (required) | record the call, run nothing real, act on the scenario files |
 | `guarded-passthrough` | `rm` `mv` `cp` `rsync` `chmod` `install` `mktemp` (required), `git` | record, refuse a path outside the root, then run the real tool |
 | `passthrough` | every other command | record, then run the real tool |
 
@@ -102,12 +105,11 @@ Scenario controls, all exported and reset by `new_case`:
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `AS_FIXTURE_PS` | `ps`, `pgrep` | path of the process table (set it with `set_ps_fixture <file> [after-quit-file]`) |
+| `AS_FIXTURE_PS` | `ps` | path of the process table (set it with `set_ps_fixture <file> [after-quit-file]`) |
 | `AS_FIXTURE_PS_AFTER_QUIT` | `osascript` | the table that replaces it on a graceful quit |
 | `AS_FAKE_QUIT=graceful` | `osascript` | every app quits: `alive.txt` empties, the after-quit table is installed |
 | `AS_FAKE_KILL_EFFECTIVE=0` | `kill` | a signalled PID stays alive |
 | `AS_FAKE_OPEN_SPAWNS_PID=<n>` | `open` | a new main process with that PID joins the table (with its `--user-data-dir` unless `AS_FAKE_OPEN_UDD=0`) |
-| `AS_FAKE_PGREP_RC` | `pgrep` | forces the exit code |
 | `AS_FIXTURE_KEYCHAIN_JSON` | `security` | the item it prints (fake values only) |
 | `AS_FAKE_KEYCHAIN=absent` | `security` | the item is missing (exit 44) |
 
@@ -152,6 +154,9 @@ Every committed fixture is masked:
 - no email address;
 - no home folder path: write `__HOME__`, which `render_fixture` replaces with
   the case's scratch `HOME`;
+- no app path: write `__APP__` for the app bundle, which `render_fixture`
+  replaces with the case's `AS_APP_BUNDLE` (the matcher only accepts a main
+  process whose argv[0] is `$AS_APP_BUNDLE/Contents/MacOS/Claude`);
 - no real tag name: fixtures use `primary`, `tag-a` and `tag-b`;
 - token-shaped keys hold the literal value `fake`.
 

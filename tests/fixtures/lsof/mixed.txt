@@ -1,0 +1,7 @@
+p0
+fcwd
+n/
+f12
+n__HOME__/Library/Application Support/Claude/Local Storage/leveldb/LOCK
+f13
+n__HOME__/Library/Application Support/Claude-tag-b/Local Storage/leveldb/LOCK

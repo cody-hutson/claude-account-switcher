@@ -50,7 +50,7 @@ _as_test_under() {
 # with 78 instead of tripping set -u.
 _as_test_mode_interlock() {
   local root="${AS_TEST_ROOT:-}" fakes="${AS_FAKES_DIR:-}"
-  local danger=" KILL SECURITY OSASCRIPT OPEN PS PGREP "
+  local danger=" KILL SECURITY OSASCRIPT OPEN PS LSOF "
   local write=" RM MV CP RSYNC CHMOD INSTALL MKTEMP "
   local name var value line1 line2 class need
 
@@ -104,7 +104,7 @@ _as_test_mode_interlock() {
   [[ "${AS_KEYCHAIN_SVC:-}" == as-test-* ]] || _as_test_refuse "AS_KEYCHAIN_SVC does not begin with as-test- (got '${AS_KEYCHAIN_SVC:-}')"
 }
 
-AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL MKTEMP MV OPEN OSASCRIPT PGREP PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSOF MKTEMP MV OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
@@ -127,11 +127,11 @@ fi
 : "${AS_BIN_INSTALL:=/usr/bin/install}"
 : "${AS_BIN_JQ:=/usr/bin/jq}"
 : "${AS_BIN_KILL:=/bin/kill}"
+: "${AS_BIN_LSOF:=/usr/sbin/lsof}"
 : "${AS_BIN_MKTEMP:=/usr/bin/mktemp}"
 : "${AS_BIN_MV:=/bin/mv}"
 : "${AS_BIN_OPEN:=/usr/bin/open}"
 : "${AS_BIN_OSASCRIPT:=/usr/bin/osascript}"
-: "${AS_BIN_PGREP:=/usr/bin/pgrep}"
 : "${AS_BIN_PS:=/bin/ps}"
 : "${AS_BIN_PYTHON3:=/usr/bin/python3}"
 : "${AS_BIN_RM:=/bin/rm}"
@@ -152,8 +152,8 @@ fi
 if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
 readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
   AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
-  AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_MKTEMP AS_BIN_MV \
-  AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PGREP AS_BIN_PS AS_BIN_PYTHON3 \
+  AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSOF AS_BIN_MKTEMP AS_BIN_MV \
+  AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PS AS_BIN_PYTHON3 \
   AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SLEEP AS_BIN_TAIL \
   AS_BIN_TR AS_BIN_WC
 readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
@@ -315,24 +315,148 @@ tag_is_in_accounts() {
   ' "$CONFIG_FILE" | "$AS_BIN_GREP" -qx "FOUND"
 }
 
-# ---- Process helpers (M-12) ----------------------------------------------
+# ---- Process helpers (M-12, #9) ------------------------------------------
+#
+# Every running-instance check goes through one matcher, _claude_main_rows:
+# get_claude_pids (and so quit_all_claude), is_tag_running (clone-prefs),
+# detect_running_tag (the swap handoff) and cmd_list_instances.
+#
+# A process is a Claude main process only when its argv[0] equals the app's
+# main binary, "${AS_APP_BUNDLE}/Contents/MacOS/Claude", exactly. A substring
+# of the whole command line is not enough: helper processes, and any other
+# process whose arguments merely mention the path, are not main processes.
+# argv[0] is read from the same `ps -o args` row that carries the
+# --user-data-dir value, so identity and profile come from one read; the
+# row is argv joined by spaces, so "argv[0] is the binary" means the row
+# equals the binary path or begins with it followed by a space.
+#
+# awk reads the whole process table and nothing in the chain exits early,
+# so a large table cannot close the pipe under pipefail.
 
-# Returns newline-separated PIDs of running Claude.app main processes
-# (excluding helpers/grep self-matches). Used in place of `pkill -f` to
-# eliminate argv-substring overmatch.
+# Prints one raw row per Claude main process: pid<TAB>KIND<TAB>method, where
+# KIND is primary or <tag> (method argv) when --user-data-dir names exactly
+# <root>/Claude or <root>/Claude-<tag>; FLAGLESS (method flagless) when the
+# process has no --user-data-dir; UNRESOLVED (method none) otherwise. The
+# value keeps its spaces ("Application Support"). A folder is compared whole:
+# <root>/Claude never matches <root>/Claude-<tag>, and tag-a never matches
+# tag-a-2. Returns the pipeline's status: non-zero when ps failed.
+_claude_main_rows() {
+  "$AS_BIN_PS" -axww -o pid=,args= 2>/dev/null \
+    | AS_MATCH_BIN="${AS_APP_BUNDLE}/Contents/MacOS/Claude" AS_MATCH_ROOT="${AS_PROFILE_ROOT}" \
+      "$AS_BIN_AWK" '
+      {
+        pid = $1
+        if (pid !~ /^[0-9]+$/) next
+        a = $0
+        sub(/^[ \t]*[0-9]+[ \t]/, "", a)
+        bin = ENVIRON["AS_MATCH_BIN"]
+        if (a == bin) rest = ""
+        else if (index(a, bin " ") == 1) rest = substr(a, length(bin) + 1)
+        else next
+        i = index(rest, " --user-data-dir=")
+        if (i == 0) {
+          if (index(rest, " --user-data-dir") > 0) print pid "\tUNRESOLVED\tnone"
+          else print pid "\tFLAGLESS\tflagless"
+          next
+        }
+        v = substr(rest, i + 17)
+        if (index(v, " --user-data-dir") > 0) { print pid "\tUNRESOLVED\tnone"; next }
+        j = index(v, " --")
+        if (j) v = substr(v, 1, j - 1)
+        root = ENVIRON["AS_MATCH_ROOT"]
+        if (v == root "/Claude") { print pid "\tprimary\targv"; next }
+        if (index(v, root "/Claude-") == 1) {
+          t = substr(v, length(root) + 9)
+          if (t ~ /^[a-z0-9][a-z0-9-]*$/ && length(t) <= 32 && t != "primary" && t != "default") {
+            print pid "\t" t "\targv"
+            next
+          }
+        }
+        print pid "\tUNRESOLVED\tnone"
+      }'
+}
+
+# Prints "Claude" or "Claude-<tag>" when process $1 holds files open under
+# exactly one profile folder of AS_PROFILE_ROOT; otherwise nothing. Reads
+# file NAMES from lsof's -Fn records only, never file contents, and prints
+# only the folder name, never a path under it. The first path component is
+# compared whole, so a file under Claude-<tag>/ never counts as Claude.
+lsof_profile_root() {
+  "$AS_BIN_LSOF" -w -Fn -p "$1" 2>/dev/null \
+    | AS_MATCH_ROOT="${AS_PROFILE_ROOT}/" "$AS_BIN_AWK" '
+      substr($0, 1, 1) == "n" {
+        p = substr($0, 2)
+        r = ENVIRON["AS_MATCH_ROOT"]
+        if (index(p, r) == 1) {
+          split(substr(p, length(r) + 1), c, "/")
+          t = substr(c[1], 8)
+          if (c[1] == "Claude" || (c[1] ~ /^Claude-[a-z0-9][a-z0-9-]*$/ && length(t) <= 32 && t != "primary" && t != "default")) seen[c[1]] = 1
+        }
+      }
+      END { n = 0; for (k in seen) { n++; last = k }; if (n == 1) print last }'
+  return 0
+}
+
+# Prints the final row for process $1 from the profile folder it holds open.
+_resolve_by_open_files() {
+  local root
+  root="$(lsof_profile_root "$1")"
+  case "$root" in
+    Claude)    printf '%s\tprimary\tlsof\n' "$1" ;;
+    Claude-?*) printf '%s\t%s\tlsof\n' "$1" "${root#Claude-}" ;;
+    *)         printf '%s\tunknown\tnone\n' "$1" ;;
+  esac
+}
+
+# Prints one row per Claude main process: pid<TAB>profile<TAB>method
+#   profile: primary | <tag> | unknown      method: argv | flagless | lsof | none
+# A process without --user-data-dir is primary (the switcher launches primary
+# without the flag) only when it is the one such process and no other
+# process names primary's folder. Otherwise each flagless process, and each
+# process whose --user-data-dir names no configured profile folder, is
+# resolved by the profile folder it holds open (lsof), or reported unknown.
+# No row ever reads primary without one of those three reasons. An empty
+# table means no instance is running. Returns 2, printing nothing, when the
+# process table could not be read.
+claude_instances() {
+  local raw st=0 pid kind method flagless=0 argv_primary=0
+  raw="$(_claude_main_rows)" || st=$?
+  [[ $st -eq 0 ]] || return 2
+  while IFS=$'\t' read -r pid kind method; do
+    case "$kind" in
+      FLAGLESS) flagless=$((flagless + 1)) ;;
+      primary)  argv_primary=1 ;;
+    esac
+  done <<< "$raw"
+  while IFS=$'\t' read -r pid kind method; do
+    [[ -n "$pid" ]] || continue
+    case "$kind" in
+      FLAGLESS)
+        if [[ $flagless -eq 1 && $argv_primary -eq 0 ]]; then
+          printf '%s\tprimary\tflagless\n' "$pid"
+        else
+          _resolve_by_open_files "$pid"
+        fi
+        ;;
+      UNRESOLVED) _resolve_by_open_files "$pid" ;;
+      *)          printf '%s\t%s\t%s\n' "$pid" "$kind" "$method" ;;
+    esac
+  done <<< "$raw"
+  return 0
+}
+
+# Returns newline-separated PIDs of running Claude main processes, from the
+# matcher above: helpers and processes that only mention the app path are
+# never included, so quit_all_claude never signals them. Used in place of
+# `pkill -f`. Always returns 0: callers detect "no Claude running" via empty
+# stdout, not via exit status (under set -euo pipefail a failing assignment
+# would end the script).
 get_claude_pids() {
-  "$AS_BIN_PS" -axo pid,args 2>/dev/null \
-    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
-    | "$AS_BIN_GREP" -v "Claude Helper" \
-    | "$AS_BIN_GREP" -v grep \
-    | "$AS_BIN_AWK" '{print $1}'
-  # F2-bis: force return 0. When no Claude
-  # process matches, the first grep exits 1; pipefail propagates it. With
-  # set -euo pipefail, var=$(get_claude_pids) then triggers script exit
-  # (bash 3.2.57 quirk: pipefail-amplified pipeline failure escapes the
-  # assignment-exempt set -e rule that protects var=$(false) and
-  # var=$(fn_returning_1)). Callers detect "no Claude running" via empty
-  # stdout, not via exit status — this return preserves that contract.
+  local raw="" pid rest
+  raw="$(_claude_main_rows)" || true
+  while IFS=$'\t' read -r pid rest; do
+    if [[ -n "$pid" ]]; then printf '%s\n' "$pid"; fi
+  done <<< "$raw"
   return 0
 }
 
@@ -348,15 +472,37 @@ kill_claude_processes() {
   done <<< "$pids"
 }
 
-# Returns 0 if a Claude.app instance is currently running with the given
-# user-data-dir argv. Used by clone-prefs and as race-detection.
-is_instance_running_for_udd() {
-  local udd="$1"
-  "$AS_BIN_PS" -axo args 2>/dev/null \
-    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
-    | "$AS_BIN_GREP" -v "Claude Helper" \
-    | "$AS_BIN_GREP" -v grep \
-    | "$AS_BIN_GREP" -F -q -- "--user-data-dir=${udd}"
+# is_tag_running <tag>: whether an instance of <tag> is running, from the
+# matcher above ("default" is primary).
+#   0  a running instance's profile is <tag>
+#   1  none is, and every running instance's profile is known
+#   2  none is, but some instance's profile is unknown, or the process
+#      table could not be read: undetermined
+# clone-prefs treats 2 as "refuse and say why"; swap proceeds, because it
+# quits every instance first. Call it as `is_tag_running "$t" || rs=$?`: a
+# bare call that returns 1 or 2 ends the script under set -e.
+#
+# This replaces is_instance_running_for_udd, whose live defect was a
+# substring match of "--user-data-dir=<folder>" against each command line:
+# primary's folder is a prefix of every Claude-<tag> folder, and primary is
+# launched without the flag, so primary read as running whenever another
+# tag was open and as not running when only primary was; tag alt matched
+# alt-2 the same way. Its last reader was also `grep -q`, which closes the
+# pipe on its first match; under pipefail that can turn a found instance
+# into "not running", but only once the filtered lines outgrow one pipe
+# buffer, which a real process table does not reach.
+is_tag_running() {
+  local want="$1" rows st=0 pid profile method unknown=0
+  [[ "$want" == "default" ]] && want="primary"
+  rows="$(claude_instances)" || st=$?
+  [[ $st -eq 0 ]] || return 2
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$profile" == "$want" ]]; then return 0; fi
+    if [[ "$profile" == "unknown" ]]; then unknown=1; fi
+  done <<< "$rows"
+  if [[ $unknown -eq 1 ]]; then return 2; fi
+  return 1
 }
 
 # ---- Mac app surface -----------------------------------------------------
@@ -377,68 +523,46 @@ udd_for_tag() {
 
 # ---- detect_running_tag --------------------------------------------------
 
-# Returns the tag of the currently-running Claude.app main process by
-# parsing its --user-data-dir argv, or empty string if no instance is
-# running. Used by cmd_swap_app to determine the SOURCE account for the
-# handoff capture (the currently-active account at swap time, regardless
-# of swap direction).
+# Prints the profile of the running Claude instance (primary, <tag> or
+# unknown), or nothing when no instance is running. Used by cmd_swap_app for
+# the SOURCE of the handoff capture (the account active at swap time).
 #
-# Behavior:
-#   - Claude.app main process WITH --user-data-dir=<path> argv → parse the
-#     path and reverse-lookup the tag from its basename (Claude→primary,
-#     Claude-<tag>→<tag>).
-#   - Claude.app main process WITHOUT --user-data-dir argv → primary
-#     (Mac app's OS-default udd is the unflagged primary path).
-#   - No Claude.app main process running → empty string; caller decides
-#     fallback (typically: skip session-index mirror).
+#   - One instance: its profile from claude_instances (which may be unknown).
+#   - Several instances: the first line of $STATUSLINE_MARKER (the target of
+#     the last launch or swap) when it names one of the running profiles;
+#     otherwise unknown. Several instances with no usable marker are never
+#     guessed to be primary.
+#   - No instance: empty; the caller decides.
+#
+# The argument parse this replaces stopped at the first space in the
+# --user-data-dir value, so it could never match a path under "Application
+# Support", and every call fell through to a pgrep fallback, then the
+# marker, then "primary". That explains the earlier report that the app
+# strips --user-data-dir from its arguments; the flag is visible in ps.
 detect_running_tag() {
-  local udd_arg
-  udd_arg=$("$AS_BIN_PS" -axo args 2>/dev/null \
-    | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
-    | "$AS_BIN_GREP" -v "Claude Helper" \
-    | "$AS_BIN_GREP" -v grep \
-    | "$AS_BIN_GREP" -oE '\-\-user-data-dir=[^[:space:]]+' \
-    | "$AS_BIN_SED" -E 's|^--user-data-dir=||' \
-    | "$AS_BIN_HEAD" -1 || true)
+  local rows st=0 pid profile method n=0 only="" marker=""
+  rows="$(claude_instances)" || st=$?
+  if [[ $st -ne 0 ]]; then printf '%s' "unknown"; return 0; fi
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    n=$((n + 1))
+    only="$profile"
+  done <<< "$rows"
+  if [[ $n -eq 0 ]]; then return 0; fi
+  if [[ $n -eq 1 ]]; then printf '%s' "$only"; return 0; fi
 
-  if [[ -n "$udd_arg" ]]; then
-    # Preferred: parse from argv (most accurate at moment of capture).
-    local bn
-    bn=$("$AS_BIN_BASENAME" "$udd_arg")
-    case "$bn" in
-      Claude)        printf '%s' "primary"; return 0 ;;
-      Claude-*)      printf '%s' "${bn#Claude-}"; return 0 ;;
-    esac
+  if [[ -f "$STATUSLINE_MARKER" && -r "$STATUSLINE_MARKER" ]]; then
+    { IFS= read -r marker || :; } < "$STATUSLINE_MARKER"
+    marker="${marker//[[:space:]]/}"
+    if [[ "$marker" == "default" ]]; then marker="primary"; fi
   fi
-
-  # Argv-detection failed. Two reasons this happens:
-  # (1) Mac app launched without --user-data-dir flag (OS-default primary
-  #     path), in which case argv genuinely doesn't carry the flag.
-  # (2) Mac app WAS launched with --user-data-dir but Electron stripped it
-  #     from visible argv post-launch. Empirically observed in an e2e test
-  #     (reverse-swap from backup): the backup Mac app instance had no
-  #     --user-data-dir in ps output despite being launched against
-  #     Claude-backup. Without this fallback, the swapper incorrectly
-  #     recorded handoff direction as 'primary → primary'.
-  #
-  # Fallback chain when argv-parse is empty:
-  #   (a) If $STATUSLINE_MARKER exists, use its value (the swapper writes
-  #       this after every successful swap, so it reflects the
-  #       currently-active account regardless of Electron argv munging).
-  #   (b) If Claude.app is running but no marker, default to primary
-  #       (covers cold-start / first-ever-launch scenarios).
-  #   (c) If no Claude.app running at all, return empty (caller decides).
-  if "$AS_BIN_PGREP" -f "Claude.app/Contents/MacOS/Claude" >/dev/null 2>&1; then
-    if [[ -f "$STATUSLINE_MARKER" ]]; then
-      local marker_tag
-      marker_tag=$("$AS_BIN_CAT" "$STATUSLINE_MARKER" 2>/dev/null | "$AS_BIN_HEAD" -1 | "$AS_BIN_TR" -d '[:space:]')
-      if [[ -n "$marker_tag" ]]; then
-        printf '%s' "$marker_tag"
-        return 0
-      fi
-    fi
-    printf '%s' "primary"
+  if [[ -n "$marker" && "$marker" != "unknown" ]]; then
+    while IFS=$'\t' read -r pid profile method; do
+      [[ -n "$pid" ]] || continue
+      if [[ "$profile" == "$marker" ]]; then printf '%s' "$marker"; return 0; fi
+    done <<< "$rows"
   fi
+  printf '%s' "unknown"
   return 0
 }
 
@@ -892,41 +1016,30 @@ cmd_launch() {
 cmd_list_instances() {
   printf '\n=== Running Claude desktop app instances ===\n\n'
 
-  local found=0
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    found=1
-    local pid
-    pid=$(printf '%s' "$line" | "$AS_BIN_AWK" '{print $1}')
-    local args
-    args=$(printf '%s' "$line" | "$AS_BIN_CUT" -d' ' -f2-)
-
-    local udd tag
-    if printf '%s' "$args" | "$AS_BIN_GREP" -q -- '--user-data-dir='; then
-      udd=$(printf '%s' "$args" | "$AS_BIN_SED" -E 's/.*--user-data-dir=//')
-      udd=$(printf '%s' "$udd" | "$AS_BIN_SED" -E 's/ -[-]?[a-z][a-z-]*([= ].*)?$//')
-      local base
-      base=$("$AS_BIN_BASENAME" "$udd")
-      if [[ "$base" == "Claude" ]]; then
-        tag="primary"
-      elif [[ "$base" == Claude-* ]]; then
-        tag="${base#Claude-}"
+  # One row per main process from claude_instances. via= says how the tag
+  # was found, so primary is never shown without a reason.
+  local rows st=0 found=0 pid profile method udd
+  rows="$(claude_instances)" || st=$?
+  if [[ $st -ne 0 ]]; then
+    printf '  (the process table could not be read; running instances unknown)\n'
+  else
+    while IFS=$'\t' read -r pid profile method; do
+      [[ -n "$pid" ]] || continue
+      found=1
+      if [[ "$profile" == "unknown" ]]; then
+        udd="(unknown)"
       else
-        tag="(unknown)"
+        udd="$(udd_for_tag "$profile")"
       fi
+      printf '  PID %-7s tag=%-12s via=%-8s data-dir=%s\n' "$pid" "$profile" "$method" "$udd"
+    done <<< "$rows"
+    if [[ $found -eq 0 ]]; then
+      printf '  (no Claude desktop app instances running)\n'
     else
-      udd="${AS_PROFILE_ROOT}/Claude"
-      tag="primary"
+      printf '\n  via: argv = its --user-data-dir argument; flagless = the only instance\n'
+      printf '  started without one (primary); lsof = the profile folder it holds open;\n'
+      printf '  none = the tag could not be determined (tag=unknown).\n'
     fi
-
-    printf '  PID %-7s tag=%-12s data-dir=%s\n' "$pid" "$tag" "$udd"
-  done < <("$AS_BIN_PS" -axo pid,args 2>/dev/null \
-            | "$AS_BIN_GREP" "Claude.app/Contents/MacOS/Claude" \
-            | "$AS_BIN_GREP" -v "Claude Helper" \
-            | "$AS_BIN_GREP" -v grep)
-
-  if [[ $found -eq 0 ]]; then
-    printf '  (no Claude desktop app instances running)\n'
   fi
   printf '\n'
 
@@ -1059,9 +1172,18 @@ EOF
     local primary_udd
     primary_udd=$(udd_for_tag "primary")
     if [[ -d "$primary_udd" ]] && [[ -d "$target_udd" ]]; then
-      info "Auto-mirroring primary's user-facing prefs → ${target_tag}..."
-      cmd_clone_prefs "primary" "$target_tag" 2>&1 | "$AS_BIN_SED" 's/^/    /'
-      printf '\n'
+      # clone-prefs refuses when it cannot tell whether the target is
+      # running (is_tag_running = 2). swap does not stop for that: it quits
+      # every instance next, so it skips the mirror, says why, and goes on.
+      local mirror_rs=0
+      is_tag_running "$target_tag" || mirror_rs=$?
+      if [[ $mirror_rs -eq 2 ]]; then
+        warn "Skipping auto-mirror: cannot tell whether '${target_tag}' is running (an instance's tag is unknown; see 'account-switcher list'). The swap continues."
+      else
+        info "Auto-mirroring primary's user-facing prefs → ${target_tag}..."
+        cmd_clone_prefs "primary" "$target_tag" 2>&1 | "$AS_BIN_SED" 's/^/    /'
+        printf '\n'
+      fi
     elif [[ ! -d "$target_udd" ]]; then
       info "Skipping auto-mirror (target dir doesn't exist yet; first launch will create it)"
     fi
@@ -1179,9 +1301,15 @@ cmd_clone_prefs() {
   [[ -d "$target_udd" ]] || die "Target profile dir does not exist: ${target_udd}. Run 'launch ${target_tag}' first to create it."
 
   # Initial running-instance check: refuse if target is currently running
-  # (Electron may have config files open; overwrite could corrupt state).
-  if is_instance_running_for_udd "$target_udd"; then
+  # (Electron may have config files open; overwrite could corrupt state),
+  # and refuse when that cannot be determined (is_tag_running = 2).
+  local running_rs=0
+  is_tag_running "$target_tag" || running_rs=$?
+  if [[ $running_rs -eq 0 ]]; then
     die "Target instance ('${target_tag}') is currently running. Quit it before cloning prefs (e.g., 'account-switcher swap ${source_tag}' or Cmd+Q the target window)."
+  fi
+  if [[ $running_rs -eq 2 ]]; then
+    die "Cannot tell whether '${target_tag}' is running: a running Claude instance's tag is unknown, or the process list could not be read (see 'account-switcher list'). Refusing to write into a profile that may be open. Quit the instance shown as unknown (or run 'account-switcher quit --all') and retry."
   fi
 
   info "Cloning user-facing prefs: ${source_tag} → ${target_tag}"
@@ -1231,8 +1359,13 @@ cmd_clone_prefs() {
   # The race window is small (the operator clicks Claude in Dock during the
   # snapshot operation), but real. If a new instance launched, abort and
   # let the trap restore.
-  if is_instance_running_for_udd "$target_udd"; then
+  running_rs=0
+  is_tag_running "$target_tag" || running_rs=$?
+  if [[ $running_rs -eq 0 ]]; then
     die "Target instance ('${target_tag}') started while preparing snapshot. Aborting; trap will restore from snapshot (M-11)."
+  fi
+  if [[ $running_rs -eq 2 ]]; then
+    die "Cannot tell whether '${target_tag}' is running after preparing the snapshot (a running instance's tag is unknown; see 'account-switcher list'). Aborting; trap will restore from snapshot (M-11)."
   fi
 
   local mirrored=()
@@ -1572,10 +1705,15 @@ SUBCOMMANDS (Mac desktop app management):
                            - 15s wait
                            - SIGTERM via PID list
                            - SIGKILL via PID list (last resort)
-                           - Final pgrep verification (die if alive).
+                           - Final check by PID list (die if alive).
 
-  list (or instances)    Show running Claude desktop app instances + their
-                         user-data-dirs + on-disk profile dirs with sizes.
+  list (or instances)    Show running Claude desktop app instances, each with
+                         its tag and how the tag was found (via=argv: its
+                         --user-data-dir; via=flagless: the only instance
+                         without one, primary; via=lsof: the profile folder
+                         it holds open), or tag=unknown via=none when it
+                         cannot be determined; then on-disk profile dirs
+                         with sizes.
 
   status                 Show CLI identity (~/.claude.json + keychain
                          subscription type) + statusline marker.

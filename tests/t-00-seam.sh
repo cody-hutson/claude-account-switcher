@@ -225,8 +225,8 @@ case_positive() {
     assert_eq "$v_calls" "" "calls.log after version" &&
     assert_rc 0 &&
     assert_contains "$out" "(no Claude desktop app instances running)" &&
-    assert_called ps $'\t-axo\tpid,args' &&
-    assert_called grep "Claude.app/Contents/MacOS/Claude"
+    assert_called ps $'\t-axww\t-o\tpid=,args=' &&
+    assert_called awk "AS_MATCH_BIN"
   result "positive: a complete test environment runs, and list goes through the fakes" $?
 }
 

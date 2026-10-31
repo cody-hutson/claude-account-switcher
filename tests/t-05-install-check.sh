@@ -134,7 +134,7 @@ case_13_install_through_seam() {
   new_case; copy_repo
   run_install
   local calls_ok=0
-  for f in kill osascript open ps pgrep; do
+  for f in kill osascript open ps lsof; do
     assert_never_called "$f" || calls_ok=1
   done
   assert_rc 0 &&

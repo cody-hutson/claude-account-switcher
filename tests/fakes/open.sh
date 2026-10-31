@@ -2,9 +2,10 @@
 # as-fake: recording
 #
 # Fake open. Records the call and launches nothing. With
-# AS_FAKE_OPEN_SPAWNS_PID=<n>, a Claude main process with PID <n> joins the
-# process table ($AS_FIXTURE_PS) and alive.txt; it carries the
-# --user-data-dir argument passed to open unless AS_FAKE_OPEN_UDD=0. Exits 0.
+# AS_FAKE_OPEN_SPAWNS_PID=<n>, a Claude main process with PID <n> (argv[0]
+# the case's $AS_APP_BUNDLE/Contents/MacOS/Claude) joins the process table
+# ($AS_FIXTURE_PS) and alive.txt; it carries the --user-data-dir argument
+# passed to open unless AS_FAKE_OPEN_UDD=0. Exits 0.
 
 set -u
 if [[ -z "${AS_TEST_ROOT:-}" || ! -f "${AS_TEST_ROOT}/.as-test-root" ]]; then
@@ -24,7 +25,7 @@ printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
 
 pid="${AS_FAKE_OPEN_SPAWNS_PID:-}"
 if [[ -n "$pid" ]]; then
-  printf -v row '%5s %s' "$pid" "/Applications/Claude.app/Contents/MacOS/Claude"
+  printf -v row '%5s %s' "$pid" "${AS_APP_BUNDLE:-/Applications/Claude.app}/Contents/MacOS/Claude"
   if [[ -n "$udd" && "${AS_FAKE_OPEN_UDD:-1}" != "0" ]]; then
     row="${row} ${udd}"
   fi

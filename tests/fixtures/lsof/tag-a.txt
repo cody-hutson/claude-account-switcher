@@ -1,0 +1,9 @@
+p0
+fcwd
+n/
+ftxt
+n__APP__/Contents/MacOS/Claude
+f12
+n__HOME__/Library/Application Support/Claude-tag-a/Local Storage/leveldb/LOCK
+f13
+n__HOME__/Library/Application Support/Claude-tag-a/Session Storage/000003.log

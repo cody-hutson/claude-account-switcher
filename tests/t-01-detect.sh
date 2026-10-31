@@ -5,13 +5,16 @@
 # primary instance without --user-data-dir, then two tags with it, each path
 # containing the space in "Application Support".
 #
-# The detect_running_tag cases are CHARACTERIZATION #9: they pin today's
-# behaviour, not the intended one. Its `--user-data-dir=[^[:space:]]+` match
-# stops at that space, so the argument branch never matches a real profile
-# path and the function always falls back to the statusline marker, or to
-# `primary` without one. The slice that reworks detection flips these
-# expectations on purpose. detect_running_tag is reached through `swap`; the
-# observable is the Direction line of the handoff it writes.
+# The detect_running_tag cases were CHARACTERIZATION #9 and pinned the old
+# behaviour: its `--user-data-dir=[^[:space:]]+` match stopped at that
+# space, so the argument branch never matched a real profile path and the
+# function fell back to the statusline marker, or to `primary` without one.
+# The #9 rework (one exact matcher, unknown instead of a guess) flipped them
+# to the corrected behaviour under the same case names: with several
+# instances and no marker the source is `unknown`, and pgrep is gone.
+# detect_running_tag is reached through `swap`; the observable is the
+# Direction line of the handoff it writes. t-09-detect.sh covers the
+# matcher itself.
 
 set -uo pipefail
 # shellcheck source=tests/lib.sh
@@ -54,9 +57,9 @@ case_list_labels() {
   make_profiles
   set_ps_fixture ps-three.txt
   run_switcher list
-  printf -v primary '  PID %-7s tag=%-12s data-dir=%s' 501 primary "${AS_PROFILE_ROOT}/Claude"
-  printf -v tag_a '  PID %-7s tag=%-12s data-dir=%s' 502 tag-a "${AS_PROFILE_ROOT}/Claude-tag-a"
-  printf -v tag_b '  PID %-7s tag=%-12s data-dir=%s' 503 tag-b "${AS_PROFILE_ROOT}/Claude-tag-b"
+  printf -v primary '  PID %-7s tag=%-12s via=%-8s data-dir=%s' 501 primary flagless "${AS_PROFILE_ROOT}/Claude"
+  printf -v tag_a '  PID %-7s tag=%-12s via=%-8s data-dir=%s' 502 tag-a argv "${AS_PROFILE_ROOT}/Claude-tag-a"
+  printf -v tag_b '  PID %-7s tag=%-12s via=%-8s data-dir=%s' 503 tag-b argv "${AS_PROFILE_ROOT}/Claude-tag-b"
   printf -v profile_row '  %-12s %s  (' tag-a "${AS_PROFILE_ROOT}/Claude-tag-a"
   assert_rc 0 &&
     assert_contains "$out" "$primary" &&
@@ -64,8 +67,8 @@ case_list_labels() {
     assert_contains "$out" "$tag_b" &&
     assert_eq "$(count_lines "$(printf '%s\n' "$out" | /usr/bin/grep '^  PID ')")" "3" "instance rows" &&
     assert_contains "$out" "$profile_row" &&
-    assert_called ps $'\t-axo\tpid,args'
-  result "list labels primary (no flag), tag-a and tag-b, path with a space intact" $?
+    assert_called ps $'\t-axww\t-o\tpid=,args='
+  result "list labels primary (no flag, via=flagless), tag-a and tag-b (via=argv), path with a space intact" $?
 }
 
 case_detect_no_marker() {
@@ -74,14 +77,16 @@ case_detect_no_marker() {
   local handoff="${AS_STORE}/SWAP_HANDOFF.md" body=""
   [[ -f "$handoff" ]] && body="$(< "$handoff")"
   assert_rc 0 &&
-    assert_contains "$body" '- **Direction:** `primary` → `tag-b`' &&
+    assert_contains "$body" '- **Direction:** `unknown` → `tag-b`' &&
+    assert_not_contains "$body" '- **Direction:** `primary`' &&
     assert_contains "$body" "- Active worktree: \`${TEST_GIT_ROOT}\`" &&
     git_stayed_in_fixture &&
     assert_called osascript $'-e\ttell application "Claude" to quit' &&
     assert_called open "--user-data-dir=${AS_PROFILE_ROOT}/Claude-tag-b" &&
     assert_not_contains "$(calls_of kill)" "STRAY" &&
+    assert_never_called pgrep &&
     assert_eq "$(< "${AS_STORE}/.statusline-marker")" "tag-b" "marker after swap"
-  result "CHARACTERIZATION #9: tag-a and tag-b carry the flag, no marker -> source reads 'primary'" $?
+  result "#9 (was CHARACTERIZATION 'primary'): three instances, no marker -> source reads 'unknown'" $?
 }
 
 case_detect_marker() {
@@ -92,9 +97,9 @@ case_detect_marker() {
   [[ -f "$handoff" ]] && body="$(< "$handoff")"
   assert_rc 0 &&
     assert_contains "$body" '- **Direction:** `tag-a` → `tag-b`' &&
-    assert_called pgrep "Claude.app/Contents/MacOS/Claude" &&
+    assert_never_called pgrep &&
     git_stayed_in_fixture
-  result "CHARACTERIZATION #9: with a marker, the source is the marker value, whatever the flags say" $?
+  result "#9 (was CHARACTERIZATION): several instances, the marker names a running tag -> source is the marker value, no pgrep" $?
 }
 
 case_list_labels
