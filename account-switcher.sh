@@ -3856,10 +3856,19 @@ EOF
   local pre_pids
   pre_pids="$(get_claude_pids)"
 
+  # A failed open ends the swap here, with what was done and the remedy,
+  # before the Swapped line, the marker and the APP_SWAP row. The quit and
+  # the settings step are complete, so it is not an interrupted swap: the
+  # trap still cleans up, without its "interrupted" lines.
+  local open_rc=0
   if [[ "$is_primary" == "true" ]]; then
-    "$AS_BIN_OPEN" -n -a "Claude"
+    "$AS_BIN_OPEN" -n -a "Claude" || open_rc=$?
   else
-    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="${target_udd}"
+    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="${target_udd}" || open_rc=$?
+  fi
+  if [[ $open_rc -ne 0 ]]; then
+    __SWAP_IN_PROGRESS="false"
+    die "Could not open the '${target_tag}' instance (open failed); every Claude instance was quit. Run: account-switcher launch ${target_tag}"
   fi
 
   ok "Swapped to '${target_tag}'. Bridged Code billing will follow ${target_tag}'s account auth."
@@ -6043,8 +6052,9 @@ SUBCOMMANDS (Mac desktop app management):
                          before quitting or writing anything. Ends with the
                          same line as launch. Exit 0 swapped; 1 refused (a
                          MISMATCH, a tag that is not configured, update
-                         running, the app not where detection looks), or an
-                         instance would not quit.
+                         running, the app not where detection looks), an
+                         instance would not quit, or open failed (every
+                         instance was quit; run launch <tag>).
                          Flags:
                            --no-mirror       skip step 2
                            --force           swap even on a MISMATCH

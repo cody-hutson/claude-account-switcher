@@ -846,6 +846,28 @@ case_reopen_open_fails() {
   result "update's reopen when open fails -> each tag counted as not reopened (no LAUNCH row), the summary line, exit 3 (not an errexit stop)" $?
 }
 
+case_swap_open_fails() {
+  # swap opens the target with its own open call, not through
+  # open_tag_instance. It fails after the quit: swap must end through its
+  # refusal with the remedy, not through errexit, and before the Swapped
+  # line, the tag marker and the APP_SWAP row.
+  scenario "$OLD_V" none false 502:tag-a
+  printf 'tag-a\n' > "${AS_STORE}/.statusline-marker"
+  failing_open_fake
+  run_up "" swap tag-b --no-mirror --no-handoff
+  assert_rc 1 &&
+    assert_called osascript 'tell application "Claude" to quit' &&
+    assert_eq "$(count_lines "$(calls_of open)")" "1" "open calls" &&
+    assert_call_order osascript open &&
+    assert_contains "$err" "Could not open the 'tag-b' instance (open failed); every Claude instance was quit. Run: account-switcher launch tag-b" &&
+    assert_not_contains "$err" "Swap interrupted" &&
+    assert_not_contains "${out}${err}" "Swapped to" &&
+    assert_eq "$(< "${AS_STORE}/.statusline-marker")" "tag-a" "the tag marker" &&
+    assert_not_contains "$(history_text)" "APP_SWAP" &&
+    assert_helper_untouched
+  result "swap when its own open fails after the quit -> its refusal names account-switcher launch tag-b, exit 1, with no Swapped line, no APP_SWAP row and the tag marker unchanged (not an errexit stop)" $?
+}
+
 case_quit_failed() {
   # Neither instance quits: the graceful quit closes nothing and TERM and
   # KILL leave both alive.
@@ -1274,6 +1296,7 @@ case_listed_pid_gone_refuses
 case_unlisted_during_quit
 case_timeout_install_running
 case_reopen_open_fails
+case_swap_open_fails
 case_quit_failed
 case_unlisted_install_running
 case_quit_failed_install_running
