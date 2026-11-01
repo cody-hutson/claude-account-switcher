@@ -19,6 +19,10 @@
 #   $AS_TEST_ROOT/front.txt      PID of the front application (lsappinfo and
 #                                osascript fakes; absent until a rung moves
 #                                it, then $AS_FAKE_FRONT_PID, default 400)
+#   $AS_TEST_ROOT/Applications/Claude.app/Contents/MacOS/Claude
+#                                an empty placeholder for the app's main
+#                                binary ($APP_MAIN_BIN), where the matcher
+#                                looks (#9)
 #   $AS_TEST_ROOT/git-fixture    scratch git repository ($TEST_GIT_ROOT)
 #   $AS_TEST_ROOT/tmp            TMPDIR for the script under test
 # The harness itself never runs a fake: the fakes directory goes on PATH only
@@ -229,6 +233,13 @@ new_case() {
   AS_KEYCHAIN_SVC="as-test-credentials"
   export AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
     AS_APP_LOG_DIR AS_KEYCHAIN_SVC
+  # The app's main binary, where the matcher looks (#9): an empty placeholder,
+  # so the commands that refuse when it is missing run. A case removes it to
+  # test that refusal.
+  APP_MAIN_BIN="${AS_APP_BUNDLE}/Contents/MacOS/Claude"
+  /bin/mkdir -p "${APP_MAIN_BIN%/*}" || harness_error "cannot create the app bundle folder"
+  : > "$APP_MAIN_BIN" || harness_error "cannot write the app binary placeholder"
+  /bin/chmod 755 "$APP_MAIN_BIN" || harness_error "cannot chmod the app binary placeholder"
 
   AS_FIXTURE_PS="${AS_TEST_ROOT}/ps.txt"
   AS_FIXTURE_PS_AFTER_QUIT="${AS_TEST_ROOT}/ps-after-quit.txt"

@@ -411,6 +411,80 @@ case_quit_pid_set() {
   result "quit: the PID set holds the main processes only, never the non-Claude process that names the app path" $?
 }
 
+# ---- The app where detection looks -------------------------------------------
+
+# The app's main binary is missing from where the matcher looks (the harness
+# made a placeholder; this removes it). tag-a runs, [accounts] holds tag-a
+# and tag-b, and primary's and tag-a's settings differ, so a sync would
+# write.
+app_missing_scene() {
+  scenario ps-one-tag.txt
+  printf '[accounts]\ntag-a = { label = "Alpha", profile_email = "" }\ntag-b = { label = "Beta", profile_email = "" }\n' \
+    > "${AS_STORE}/config.toml"
+  printf '{"preferences":{"keepAwakeEnabled":true}}\n' > "${AS_PROFILE_ROOT}/Claude/claude_desktop_config.json"
+  printf '{"preferences":{"keepAwakeEnabled":false}}\n' > "${AS_PROFILE_ROOT}/Claude-tag-a/claude_desktop_config.json"
+  /bin/rm -f "$APP_MAIN_BIN"
+  [[ ! -e "$APP_MAIN_BIN" ]] || harness_error "the app binary placeholder is still there"
+}
+
+# Lines of $1 that contain $2.
+n_lines_with() {
+  local l n=0
+  while IFS= read -r l; do [[ "$l" == *"$2"* ]] && n=$((n + 1)); done <<< "$1"
+  printf '%d' "$n"
+}
+
+case_app_missing_refuses() {
+  local bad="" spec want before calls
+  local -a parts args
+  app_missing_scene
+  AS_TEST_STDIN_IS_TTY=1
+  export AS_TEST_STDIN_IS_TTY
+  before="$(tree_digest "$HOME")"
+  for spec in "1|swap|tag-a|--no-handoff" "1|quit|--all" "1|clone-prefs|primary|tag-a" \
+              "2|signin|tag-a|--yes" "2|update|--yes" "2|prefs|sync" "2|prefs|sync|tag-a" \
+              "2|prefs|adopt|keep-awake|--from|tag-a" "2|prefs|review" "2|prefs|pin|tag-a|keep-awake" \
+              "2|prefs|unpin|tag-a|keep-awake" "2|prefs|undo|tag-a"; do
+    IFS='|' read -r -a parts <<< "$spec"
+    want="${parts[0]}"
+    args=("${parts[@]:1}")
+    : > "${AS_TEST_ROOT}/calls.log"
+    run_switcher "${args[@]}"
+    calls="$(calls_of ps)$(calls_of lsof)$(calls_of osascript)$(calls_of kill)$(calls_of open)"
+    if [[ "$rc" != "$want" ]]; then bad="${bad} [${args[*]}]=exit${rc}"; fi
+    if [[ "$err" != *"The Claude app's main binary is not at ${APP_MAIN_BIN}, which is where the switcher looks to tell which profiles are running"* ]]; then
+      bad="${bad} [${args[*]}]=no-refusal-text"
+    fi
+    if [[ -n "$calls" ]]; then bad="${bad} [${args[*]}]=read-ps-or-signalled-or-opened"; fi
+  done
+  unset AS_TEST_STDIN_IS_TTY
+  assert_eq "${bad# }" "" "commands that did not refuse as expected" &&
+    assert_tree_unchanged "$HOME" "$before"
+  result "the app's main binary is not where detection looks -> swap, quit, clone-prefs (exit 1), signin, update and every writing prefs verb (exit 2) refuse naming the path, before reading the process table, signalling, opening or writing anything (HOME unchanged)" $?
+}
+
+case_app_missing_warns() {
+  local bad="" spec n
+  local -a args
+  app_missing_scene
+  for spec in "list" "identity" "status" "prefs|diff" "prefs|sync|--dry-run" "launch|tag-a"; do
+    IFS='|' read -r -a args <<< "$spec"
+    run_switcher "${args[@]}"
+    n="$(n_lines_with "$err" "The Claude app's main binary is not at ${APP_MAIN_BIN}, where the switcher looks for running instances")"
+    if [[ "$n" != "1" ]]; then bad="${bad} [${args[*]}]=${n}-warnings"; fi
+    case "${args[*]}" in
+      list) [[ "$rc" == "0" && "$out" == *"=== Running Claude desktop app instances ==="* ]] || bad="${bad} [list]=exit${rc}" ;;
+      identity) [[ "$rc" == "0" && "$out" == *"TAG"* ]] || bad="${bad} [identity]=exit${rc}" ;;
+      status) [[ "$rc" == "0" && "$out" == *"=== Claude Code Account Switcher"* ]] || bad="${bad} [status]=exit${rc}" ;;
+      "prefs diff") [[ "$rc" == "1" && "$out" == *"Synced settings (the allowlist)"* ]] || bad="${bad} [prefs diff]=exit${rc}" ;;
+      "prefs sync --dry-run") [[ "$rc" != "2" && "$err" == *"settings (dry run)"* ]] || bad="${bad} [prefs sync --dry-run]=exit${rc}" ;;
+      "launch tag-a") [[ "$rc" == "0" ]] && assert_called open "--user-data-dir=${AS_PROFILE_ROOT}/Claude-tag-a" > /dev/null || bad="${bad} [launch]=exit${rc}" ;;
+    esac
+  done
+  assert_eq "${bad# }" "" "commands that did not warn once and carry on"
+  result "the app's main binary is not where detection looks -> list, identity, status, prefs diff, prefs sync --dry-run and launch print one warning line naming the path and carry on" $?
+}
+
 # ---- No pgrep ----------------------------------------------------------------
 
 # Prints "<executable lines naming pgrep> <executable lines with 'pgrep -f'>
@@ -520,6 +594,8 @@ case_clone_recheck
 case_clone_tag_prefix
 case_swap_mirror_undetermined
 case_quit_pid_set
+case_app_missing_refuses
+case_app_missing_warns
 case_pgrep_lint
 case_pgrep_seam_removed
 case_lsof_recording_only

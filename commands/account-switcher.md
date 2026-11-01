@@ -39,6 +39,8 @@ persist on disk. OAuth state lives in:
 - `add-account <tag> <email> [label]` — Register a tag → email mapping in `[accounts]` of the runtime config.toml.
 - `version` (or `--version`) — Print the installed script's version. To check the install against the repo, run `bash install.sh --check` from the clone.
 
+**App location:** running instances are found only by the app's main binary at `/Applications/Claude.app/Contents/MacOS/Claude`. When it isn't there, `swap`, `quit`, `clone-prefs`, `signin`, `update` and the writing `prefs` verbs refuse and name that path; `list`, `identity`, `status`, `prefs diff`, `prefs sync --dry-run` and `launch` print one warning line and go on. Pass the message on: Claude has to be in `/Applications`.
+
 **Profile tag mapping (validated regex `^[a-z0-9-]{1,32}$`):**
 - `primary` (default) → `~/Library/Application Support/Claude` — preserves chat history
 - `<tag>` → `~/Library/Application Support/Claude-<tag>` — isolated; sign it in with `signin <tag>`

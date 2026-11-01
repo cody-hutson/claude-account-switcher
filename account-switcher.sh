@@ -541,6 +541,40 @@ is_tag_running() {
   return 1
 }
 
+# ---- Where detection looks for the app (#9) --------------------------------
+#
+# _claude_main_rows recognises a Claude main process only by its argv[0],
+# the app's main binary under AS_APP_BUNDLE, which outside test mode is fixed
+# at the default install location. With the app installed anywhere else,
+# every running check would read "nothing running". So every command whose
+# safety rests on knowing whether a profile is running (swap, quit,
+# clone-prefs, signin, update and the writing prefs verbs) refuses, before it
+# captures, quits, opens or writes anything, when that binary isn't there,
+# naming the path it expected, through its own refusal and exit code. The
+# read-only reports (list, identity, status, prefs diff, prefs sync
+# --dry-run) and launch, which uses the matcher only to find the new window
+# for its report, print one warning line and carry on. version and help read
+# no process table and report no running state, so they say nothing.
+
+readonly APP_MAIN_BIN="${AS_APP_BUNDLE}/Contents/MacOS/Claude"
+
+# Returns 0 when the app's main binary is where detection looks.
+app_binary_present() { [[ -f "$APP_MAIN_BIN" ]]; }
+
+# app_binary_refusal <what was not done>: the refusal text, without the
+# ERROR prefix (each command prints it through its own refusal).
+app_binary_refusal() {
+  printf "The Claude app's main binary is not at %s, which is where the switcher looks to tell which profiles are running, so it can't tell whether a profile is running. Nothing was %s. If Claude is installed somewhere else, move it there." \
+    "$APP_MAIN_BIN" "$1"
+}
+
+# One warning line when the binary is missing; always returns 0.
+app_binary_warn() {
+  app_binary_present && return 0
+  warn "The Claude app's main binary is not at ${APP_MAIN_BIN}, where the switcher looks for running instances, so an instance of an app installed elsewhere is not seen as running."
+  return 0
+}
+
 # ---- Mac app surface -----------------------------------------------------
 
 # Compute the user-data-dir for a profile tag.
@@ -2078,6 +2112,11 @@ cmd_launch() {
   # #10: one line when a staged app update has waited too long.
   update_wait_warning
 
+  # #9: launch never uses detection to avoid a second process (it always
+  # opens a new one), only to find the new window for its report, so a
+  # missing app binary is a warning here, not a refusal.
+  app_binary_warn
+
   local udd
   udd=$(udd_for_tag "$tag")
   local first_launch="false"
@@ -2113,6 +2152,7 @@ cmd_launch() {
 # ---- list (running instances + configured profile dirs) ------------------
 
 cmd_list_instances() {
+  app_binary_warn
   printf '\n=== Running Claude desktop app instances ===\n\n'
 
   # One row per main process from claude_instances. via= says how the tag
@@ -3094,9 +3134,16 @@ _prefs_tag() {
   esac
 }
 
-# Starts a writing verb: rotates the history log, sets the EXIT trap and
-# takes the lock.
+# _prefs_app_check: the writing verbs refuse when the app isn't where
+# detection looks (#9): "running profiles are never written" rests on it.
+_prefs_app_check() {
+  app_binary_present || _prefs_refuse "$(app_binary_refusal "written")"
+}
+
+# Starts a writing verb: refuses when the app isn't where detection looks,
+# rotates the history log, sets the EXIT trap and takes the lock.
 _prefs_begin() {
+  _prefs_app_check
   rotate_swap_log_if_needed
   trap _prefs_on_exit EXIT
   _prefs_lock "$1" || exit 2
@@ -3113,6 +3160,7 @@ _prefs_diff() {
       *) _prefs_usage; _prefs_refuse "prefs diff takes only --all (got: '${a}')." ;;
     esac
   done
+  app_binary_warn
   _prefs_state_load || _prefs_refuse "$(_prefs_state_bad)"
   PR_PARTS="$(_prefs_participants)"
   [[ -n "$PR_PARTS" ]] || _prefs_refuse "No participating profile folder exists (primary, plus every [accounts] tag whose profile folder exists)."
@@ -3183,6 +3231,7 @@ _prefs_sync_cmd() {
   fi
   if [[ "$dry" == "true" ]]; then
     # Read-only: no lock, no log rotation, no state write, no log row.
+    app_binary_warn
     _prefs_prepare strict read-only || exit 2
     named="$tag"
     [[ -n "$named" ]] || named="$PR_PARTS"
@@ -3199,6 +3248,7 @@ _prefs_sync_cmd() {
     fi
     exit 0
   fi
+  _prefs_app_check
   rotate_swap_log_if_needed
   trap _prefs_on_exit EXIT
   if [[ -n "$tag" ]]; then
@@ -3574,6 +3624,10 @@ EOF
   # H-1: Validate tag before any FS access.
   validate_tag "$target_tag"
 
+  # #9: its quit and its settings step rely on detection; refuse before the
+  # handoff capture, the quit or any write when the app isn't where it looks.
+  app_binary_present || die "$(app_binary_refusal "captured, quit, opened or written")"
+
   # #10: never while update holds its lock, and never a tag that is neither
   # configured nor on disk (--new allows it). Both run before the #6 check,
   # so a refusal quits, captures and writes nothing.
@@ -3784,6 +3838,9 @@ cmd_clone_prefs() {
   validate_tag "$source_tag"
   validate_tag "$target_tag"
 
+  # #9: its running checks rely on detection.
+  app_binary_present || die "$(app_binary_refusal "written")"
+
   local source_udd
   source_udd=$(udd_for_tag "$source_tag")
   local target_udd
@@ -3964,6 +4021,8 @@ cmd_quit() {
 
   case "$target" in
     --all|all|"")
+      # #9: the quit finds what to close through detection.
+      app_binary_present || die "$(app_binary_refusal "quit")"
       quit_all_claude
       printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG"
       ;;
@@ -4125,6 +4184,9 @@ cmd_update() {
   UPD_TAGS=""
   trap _update_on_exit EXIT
   trap _update_on_signal INT TERM
+
+  # #9: it lists and closes instances through detection.
+  app_binary_present || _update_refuse "$(app_binary_refusal "closed")"
 
   rotate_swap_log_if_needed
 
@@ -4341,6 +4403,7 @@ cmd_update() {
 # ---- status --------------------------------------------------------------
 
 cmd_status() {
+  app_binary_warn
   printf '\n=== Claude Code Account Switcher (v%s) ===\n\n' "$VERSION"
 
   # CLI identity (what bridged Code reads from when displaying the account name).
@@ -4544,6 +4607,7 @@ cmd_identity() {
     esac
   done
 
+  app_binary_warn
   [[ -f "$CONFIG_FILE" ]] || _die2 "No config.toml at ${CONFIG_FILE}, so there is nothing to check. Register a tag with: account-switcher add-account <tag> <email>"
   tags="$(accounts_tags)" || tags=""
   [[ -n "$tags" ]] || _die2 "No tag in [accounts] of ${CONFIG_FILE}, so there is nothing to check."
@@ -5454,6 +5518,10 @@ cmd_signin() {
   # replaced). A refusal, so exit 2 like every other one.
   if _update_lock_held; then _signin_refuse "$(_update_lock_refusal "signing in")"; fi
 
+  # #9: it relies on detection to use a running target instead of opening a
+  # second process on its profile, and to quit with --quit-others.
+  app_binary_present || _signin_refuse "$(app_binary_refusal "opened, quit or signed in")"
+
   # signin writes history rows; rotation runs here, inside the trap.
   rotate_swap_log_if_needed
 
@@ -6029,6 +6097,12 @@ NOTES:
     existing chat history, MCP connections, plugins. Don't rename this dir.
   - Multiple instances can run simultaneously. Each has its own dock icon (same
     Claude.app binary; different in-memory state).
+  - Running instances are found by the app's main binary at
+    ${APP_MAIN_BIN}. When it isn't there (Claude
+    installed somewhere else), swap, quit, clone-prefs, signin, update and the
+    writing prefs verbs refuse, naming that path, because they can't tell
+    which profiles are running; list, identity, status, prefs diff, prefs
+    sync --dry-run and launch print one warning line and carry on.
   - To bring a new window forward, launch and swap try lsappinfo setfront,
     then an AppKit activation, then System Events, each for that PID. The
     System Events step may show a one-time macOS prompt asking to control

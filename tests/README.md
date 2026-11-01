@@ -80,6 +80,7 @@ against this checkout.
 |---|---|
 | `.as-test-root` | the sentinel the interlock looks for |
 | `home` | the case's `HOME`; `AS_STORE`, `AS_PROFILE_ROOT` and the other roots sit beneath it, except `AS_APP_BUNDLE` (`$AS_TEST_ROOT/Applications/Claude.app`) |
+| `Applications/Claude.app/Contents/MacOS/Claude` | an empty placeholder for the app's main binary (`APP_MAIN_BIN`), where the matcher looks; the commands that rely on detection refuse without it, and a case removes it to test that |
 | `fakes` | the fakes (`AS_FAKES_DIR`) |
 | `calls.log` | one line per fake call: the fake's name, then each argument, tab-separated |
 | `ps.txt` | the process table the `ps` fake prints (`AS_FIXTURE_PS`) |
