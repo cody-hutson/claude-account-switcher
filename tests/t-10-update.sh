@@ -872,6 +872,110 @@ case_quit_failed() {
   result "an instance that won't quit -> the quit-failed path: no install wait, the still-running tags are not opened again, result=quit-failed, exit 1" $?
 }
 
+# osascript_fake_begins_install <log message> [<installed version>]: an
+# osascript fake that, on the quit script, plays the updater's helper starting
+# an install: it appends "<log message>" stamped now to the helper's log and,
+# with a version, rewrites the installed Info.plist to it; then it quits every
+# app when AS_FAKE_QUIT=graceful, and nothing otherwise, as the stock fake
+# does. The poll hook can't play this moment: it runs only during update's
+# install wait, which a stopped quit never reaches, and a line already in the
+# log when update starts is refused by its pre-check.
+osascript_fake_begins_install() {
+  printf '%s\n' "$1" > "${AS_TEST_ROOT}/install-msg.txt"
+  : > "${AS_TEST_ROOT}/install-plist.txt"
+  if [[ -n "${2:-}" ]]; then info_plist "${AS_TEST_ROOT}/install-plist.txt" "$2"; fi
+  /bin/cat > "${AS_FAKES_DIR}/osascript" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+set -u
+[[ -n "${AS_TEST_ROOT:-}" && -f "${AS_TEST_ROOT}/.as-test-root" ]] || exit 98
+line="osascript"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+quit=0
+for arg; do case "$arg" in *" to quit") quit=1 ;; esac; done
+[[ $quit -eq 1 ]] || exit 0
+IFS= read -r msg < "${AS_TEST_ROOT}/install-msg.txt"
+printf '%s.500 ShipIt[115:216] %s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "${AS_UPDATER_CACHE}/ShipIt_stderr.log"
+if [[ -s "${AS_TEST_ROOT}/install-plist.txt" ]]; then
+  /bin/cat "${AS_TEST_ROOT}/install-plist.txt" > "${AS_APP_BUNDLE}/Contents/Info.plist"
+fi
+if [[ "${AS_FAKE_QUIT:-}" == "graceful" ]]; then
+  : > "${AS_TEST_ROOT}/alive.txt"
+  /bin/cat "$AS_FIXTURE_PS_AFTER_QUIT" > "$AS_FIXTURE_PS"
+fi
+exit 0
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/osascript" || harness_error "cannot chmod the osascript fake"
+}
+
+case_unlisted_install_running() {
+  # As case_unlisted_during_quit (tag-b, PID 4500, appears while the quit
+  # runs), but the updater begins installing as the graceful quit closes the
+  # two listed instances. Reopening them now would start the app while its
+  # bundle is being replaced, so update prints a launch command per tag.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  printf '%5s %s --user-data-dir=%s\n' 4500 "${AS_APP_BUNDLE}/Contents/MacOS/Claude" "$(pdir tag-b)" >> "$AS_FIXTURE_PS_AFTER_QUIT"
+  osascript_fake_begins_install "Beginning installation"
+  helper_hook install
+  run_up "" update --yes
+  local k
+  k="$(calls_of kill)"
+  assert_rc 2 &&
+    assert_called osascript 'tell application "Claude" to quit' &&
+    assert_contains "$err" "A Claude instance that wasn't listed is running: tag-b · PID 4500. Stopping the quit; nothing more is signalled." &&
+    assert_contains "$err" "it closes only what it listed. The updater's log shows an install running, so nothing is reopened." &&
+    assert_not_contains "$err" "Reopening what it closed." &&
+    assert_not_contains "$k" $'\t4500' &&
+    assert_helper_untouched &&
+    { [[ ! -e "${AS_TEST_ROOT}/hook-polls.txt" ]] || { printf '    update waited for the install\n'; false; }; } &&
+    assert_contains "$out" "The updater's log shows an install running:"$'\n'"  " &&
+    assert_contains "$out" "ShipIt[115:216] Beginning installation" &&
+    assert_contains "$out" "Not reopening while the app is being replaced." &&
+    assert_contains "$out" "  account-switcher launch primary"$'\n'"  account-switcher launch tag-a" &&
+    assert_eq "$(count_matching "$out" "account-switcher launch ")" "2" "launch lines" &&
+    assert_never_called open &&
+    assert_contains "$out" "Installed version: ${OLD_V} before, ${OLD_V} after." &&
+    assert_contains "$out" "update before=${OLD_V} after=${OLD_V} result=unlisted reopened=0/2 exit=2" &&
+    assert_contains "$(history_text)" "UPDATE result=unlisted before=${OLD_V} after=${OLD_V} reopened=0/2" &&
+    assert_not_contains "$(history_text)" "LAUNCH tag=" &&
+    assert_no_lock
+  result "the updater's log shows an install running when an unlisted instance stops update's quit -> nothing reopened (no open call), a launch command per tag, result=unlisted reopened=0/2, exit 2, lock released" $?
+}
+
+case_quit_failed_install_running() {
+  # As case_quit_failed (neither instance quits), but when the quit stops the
+  # updater's log shows an install running and the installed Info.plist
+  # already reads the new version: nothing is reopened, and after is read
+  # from the Info.plist rather than repeating before.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  unset AS_FAKE_QUIT
+  osascript_fake_begins_install "Moved bundle" "$NEW_V"
+  AS_FAKE_KILL_EFFECTIVE=0
+  export AS_FAKE_KILL_EFFECTIVE
+  helper_hook install
+  run_up "" update --yes
+  unset AS_FAKE_KILL_EFFECTIVE
+  assert_rc 1 &&
+    assert_called kill $'-TERM\t501' &&
+    assert_called kill $'-KILL\t502' &&
+    assert_contains "$err" "Could not close every instance (see above), but the updater's log shows an install running, so nothing is reopened." &&
+    assert_not_contains "$err" "Reopening what was closed." &&
+    { [[ ! -e "${AS_TEST_ROOT}/hook-polls.txt" ]] || { printf '    update waited for the install\n'; false; }; } &&
+    assert_contains "$out" "ShipIt[115:216] Moved bundle" &&
+    assert_contains "$out" "Not reopening while the app is being replaced." &&
+    assert_contains "$out" "  account-switcher launch primary"$'\n'"  account-switcher launch tag-a" &&
+    assert_eq "$(count_matching "$out" "account-switcher launch ")" "2" "launch lines" &&
+    assert_never_called open &&
+    assert_contains "$out" "Installed version: ${OLD_V} before, ${NEW_V} after." &&
+    assert_not_contains "$out" "nothing was installed" &&
+    assert_contains "$out" "update before=${OLD_V} after=${NEW_V} result=quit-failed reopened=0/2 exit=1" &&
+    assert_contains "$(history_text)" "UPDATE result=quit-failed before=${OLD_V} after=${NEW_V} reopened=0/2" &&
+    assert_helper_untouched &&
+    assert_no_lock
+  result "the updater's log shows an install running when an instance won't quit -> nothing reopened (no open call), a launch command per tag, after read from the installed Info.plist, result=quit-failed reopened=0/2, exit 1, lock released" $?
+}
+
 # An osascript fake that, on the quit script, sends TERM to the switcher
 # (switcher.pid) and then quits every app, as AS_FAKE_QUIT=graceful does.
 # TERM, not INT: the switcher runs in the background here, and bash starts a
@@ -1171,6 +1275,8 @@ case_unlisted_during_quit
 case_timeout_install_running
 case_reopen_open_fails
 case_quit_failed
+case_unlisted_install_running
+case_quit_failed_install_running
 case_interrupt_during_quit
 case_install_running_refuses
 case_log_line_controls

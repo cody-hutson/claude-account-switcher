@@ -4305,6 +4305,16 @@ _update_reopen() {
   return 0
 }
 
+# _update_install_handoff: an install is running (the caller has printed the
+# log's last line), so nothing is reopened: starting the app now would start
+# it while its bundle is being replaced (#10). Prints, instead, the launch
+# command for each tag in UPD_TAGS.
+_update_install_handoff() {
+  local t
+  printf "Not reopening while the app is being replaced. When the log shows 'Installation completed successfully' (account-switcher list shows the version), reopen each tag:\n"
+  for t in $UPD_TAGS; do printf '  account-switcher launch %s\n' "$t"; done
+}
+
 cmd_update() {
   local yes="false" arg
   for arg; do
@@ -4438,24 +4448,47 @@ cmd_update() {
       printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
     fi
   fi
-  if [[ $quit_rc -eq 3 ]]; then
-    # An instance that wasn't listed appeared during the quit: nothing more
-    # was signalled, so the updater can't install. No install wait; reopen
-    # what update closed.
-    printf '\033[31mERROR:\033[0m %s\n' "The open instances changed during the quit (named above), so update stopped before the install: it closes only what it listed. Reopening what it closed." >&2
-    _update_reopen false 0
-    printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$before"
-    _update_history unlisted "$before" "$before" "${UPD_REOPENED}/${n_tags}"
-    printf 'update before=%s after=%s result=unlisted reopened=%s/%s exit=2\n' "$before" "$before" "$UPD_REOPENED" "$n_tags"
-    exit 2
-  fi
   if [[ $quit_rc -ne 0 ]]; then
-    printf '\033[31mERROR:\033[0m %s\n' "Could not close every instance (see above), so the updater can't install. Reopening what was closed." >&2
+    # The quit stopped: status 3, an instance that wasn't listed appeared
+    # (nothing more was signalled); otherwise an instance would not close.
+    # There is no install wait, but the graceful quit may already have closed
+    # every listed instance, and the updater may have begun replacing the
+    # bundle. So the log is read first, as after the wait: with an install
+    # running nothing is reopened (#10), and the installed version is read
+    # either way.
+    local stop_result stop_code stop_reopen stop_hold stop_after
+    if [[ $quit_rc -eq 3 ]]; then
+      stop_result="unlisted"
+      stop_code=2
+      stop_reopen="The open instances changed during the quit (named above), so update stopped before the install: it closes only what it listed. Reopening what it closed."
+      stop_hold="The open instances changed during the quit (named above), so update stopped before the install: it closes only what it listed. The updater's log shows an install running, so nothing is reopened."
+    else
+      stop_result="quit-failed"
+      stop_code=1
+      stop_reopen="Could not close every instance (see above), so the updater can't install. Reopening what was closed."
+      stop_hold="Could not close every instance (see above), but the updater's log shows an install running, so nothing is reopened."
+    fi
+    stop_after="$(_plist_version "$APP_INFO_PLIST")" || stop_after="unknown"
+    _updater_log_scan "" || UPD_LOG_LAST=""
+    if _updater_installing; then
+      printf '\033[31mERROR:\033[0m %s\n' "$stop_hold" >&2
+      printf "The updater's log shows an install running:\n  %s\n" "$UPD_LOG_LAST"
+      _update_install_handoff
+      printf 'Installed version: %s before, %s after.\n' "$before" "$stop_after"
+      _update_history "$stop_result" "$before" "$stop_after" "0/${n_tags}"
+      printf 'update before=%s after=%s result=%s reopened=0/%s exit=%s\n' "$before" "$stop_after" "$stop_result" "$n_tags" "$stop_code"
+      exit "$stop_code"
+    fi
+    printf '\033[31mERROR:\033[0m %s\n' "$stop_reopen" >&2
     _update_reopen false 0
-    printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$before"
-    _update_history quit-failed "$before" "$before" "${UPD_REOPENED}/${n_tags}"
-    printf 'update before=%s after=%s result=quit-failed reopened=%s/%s exit=1\n' "$before" "$before" "$UPD_REOPENED" "$n_tags"
-    exit 1
+    if [[ "$stop_after" == "$before" ]]; then
+      printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$stop_after"
+    else
+      printf 'Installed version: %s before, %s after.\n' "$before" "$stop_after"
+    fi
+    _update_history "$stop_result" "$before" "$stop_after" "${UPD_REOPENED}/${n_tags}"
+    printf 'update before=%s after=%s result=%s reopened=%s/%s exit=%s\n' "$before" "$stop_after" "$stop_result" "$UPD_REOPENED" "$n_tags" "$stop_code"
+    exit "$stop_code"
   fi
 
   # 7. The bounded wait for the helper's completion line.
@@ -4488,8 +4521,7 @@ cmd_update() {
   # the app while its bundle is being replaced.
   if [[ "$result" == "timeout" ]] && _updater_installing; then
     printf "No 'Installation completed successfully' within %s s, and the updater's log shows an install still running:\n  %s\n" "$timeout" "$UPD_LOG_LAST"
-    printf "Not reopening while the app is being replaced. When the log shows 'Installation completed successfully' (account-switcher list shows the version), reopen each tag:\n"
-    for t in $UPD_TAGS; do printf '  account-switcher launch %s\n' "$t"; done
+    _update_install_handoff
     printf 'Installed version: %s before, %s after.\n' "$before" "$after"
     _update_history timeout "$before" "$after" "0/${n_tags}"
     printf 'update before=%s after=%s result=timeout reopened=0/%s exit=1\n' "$before" "$after" "$n_tags"
