@@ -132,7 +132,7 @@ _as_test_mode_interlock() {
   esac
 }
 
-AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKDIR MKTEMP MV OD OPEN OSASCRIPT PLISTBUDDY PLUTIL PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKDIR MKTEMP MV OD OPEN OSASCRIPT PLISTBUDDY PLUTIL PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
 # Test-only names, honoured only in test mode like every seam name:
 # AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal (signin #7, update
@@ -154,7 +154,6 @@ fi
 : "${AS_BIN_CHMOD:=/bin/chmod}"
 : "${AS_BIN_COMMAND:=/usr/bin/command}"
 : "${AS_BIN_CP:=/bin/cp}"
-: "${AS_BIN_CUT:=/usr/bin/cut}"
 : "${AS_BIN_DATE:=/bin/date}"
 : "${AS_BIN_DU:=/usr/bin/du}"
 : "${AS_BIN_GIT:=/usr/bin/git}"
@@ -193,7 +192,7 @@ fi
 : "${AS_KEYCHAIN_SVC:=Claude Code-credentials}"
 if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
 readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
-  AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
+  AS_BIN_CP AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
   AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSAPPINFO AS_BIN_LSOF \
   AS_BIN_MKDIR AS_BIN_MKTEMP AS_BIN_MV AS_BIN_OD \
   AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PLISTBUDDY AS_BIN_PLUTIL AS_BIN_PS AS_BIN_PYTHON3 \
@@ -2012,9 +2011,9 @@ _lock_held() {
 }
 
 # _lock_refusal <dir> <doing>: the refusal text for a held lock (call it
-# after _lock_held returned 0); <doing> is e.g. "launching". The update lock
-# is named by its path, as slice 7 prints it; the settings-sync lock by its
-# path under ~, because settings output never prints an absolute path.
+# after _lock_held returned 0); <doing> is e.g. "launching". Both locks are
+# named by their path under ~ (_tilde_path), so no message prints the home
+# folder's absolute path.
 _lock_refusal() {
   local dir="$1" shown
   if [[ "$dir" == "$PREFS_LOCK" ]]; then
@@ -2028,12 +2027,13 @@ _lock_refusal() {
     fi
     return 0
   fi
+  shown="$(_tilde_path "$dir")"
   if [[ "$LOCK_STALE" == "0" ]]; then
     printf 'An update is running (the lock %s is %s, taken by PID %s). Not %s while the app bundle may be being replaced; wait for account-switcher update to finish.' \
-      "$dir" "$LOCK_AGE" "$LOCK_PID" "$2"
+      "$shown" "$LOCK_AGE" "$LOCK_PID" "$2"
   else
     printf "The update lock %s is %s (taken by PID %s), past the 10-minute limit, so it is probably left from an update that stopped. Not %s. The switcher never removes a lock it did not take. If no update is running (the updater's log does not end with 'Beginning installation'; account-switcher list shows the versions), remove it: trash %s" \
-      "$dir" "$LOCK_AGE" "$LOCK_PID" "$2" "$dir"
+      "$shown" "$LOCK_AGE" "$LOCK_PID" "$2" "$shown"
   fi
 }
 
@@ -2057,7 +2057,7 @@ _lock_release() {
     if [[ "$dir" == "$PREFS_LOCK" ]]; then
       warn "Could not remove the settings-sync lock $(_tilde_path "$dir"); remove it with: trash $(_tilde_path "$dir")"
     else
-      warn "Could not remove the update lock ${dir}; remove it with: trash ${dir}"
+      warn "Could not remove the update lock $(_tilde_path "$dir"); remove it with: trash $(_tilde_path "$dir")"
     fi
   fi
   return 0
@@ -2213,9 +2213,9 @@ cmd_launch() {
 
   if [[ "$first_launch" == "true" ]]; then
     info ""
-    info "Next: in the new Claude window, log in with the account for this profile."
-    info "After login, the user-data-dir will hold that account's auth + chat + plugins."
-    info "Future 'launch ${tag}' invocations will skip the login prompt."
+    info "Next: sign this profile in with: account-switcher signin ${tag}"
+    info "(it uses this window, names the account to sign in as, and checks that no other profile changed)."
+    info "After sign-in, the user-data-dir holds that account's auth + chat + plugins, and later launches skip the sign-in screen."
   fi
 
   # #8: wait for the new instance, bring it to the front, end with its line.
@@ -2309,8 +2309,8 @@ cmd_list_instances() {
     if [[ "$LOCK_STALE" == "0" ]]; then
       printf '  update:    running (lock %s, taken by PID %s)\n' "$LOCK_AGE" "$LOCK_PID"
     else
-      printf '  update:    stale lock (%s, taken by PID %s): %s\n' "$LOCK_AGE" "$LOCK_PID" "$UPDATE_LOCK"
-      printf '             If no update is running, remove it: trash %s\n' "$UPDATE_LOCK"
+      printf '  update:    stale lock (%s, taken by PID %s): %s\n' "$LOCK_AGE" "$LOCK_PID" "$(_tilde_path "$UPDATE_LOCK")"
+      printf '             If no update is running, remove it: trash %s\n' "$(_tilde_path "$UPDATE_LOCK")"
     fi
   fi
   case "$UPD_STAGED" in
@@ -3733,7 +3733,7 @@ cmd_swap_app() {
     "$AS_BIN_CAT" <<EOF >&2
 Usage: account-switcher swap <tag> [flags]
   flags:
-    --no-mirror              skip auto-clone-prefs (default: auto-mirror primary→target)
+    --no-mirror              skip the settings step
     --no-handoff             skip handoff-bridge capture (default: capture)
     --note "<text>"          optional operator-supplied note recorded in SWAP_HANDOFF.md
                               (240 char max; not auto-redacted — operator's responsibility)
@@ -3873,7 +3873,8 @@ EOF
 
   if [[ "$first_launch" == "true" ]]; then
     info ""
-    info "After login, future 'swap ${target_tag}' invocations skip the login prompt."
+    info "Next: sign this profile in with: account-switcher signin ${target_tag}"
+    info "After sign-in, later 'swap ${target_tag}' runs skip the sign-in screen."
   fi
 
   # Warn when target tag isn't declared in [accounts]. cmd_add_account is the
@@ -4194,6 +4195,7 @@ cmd_quit() {
 #      appeared (result=unlisted: it is named, nothing more is signalled,
 #      nothing is installed, and what update closed is reopened)
 #   3  installed, but a tag did not reopen in time (named)
+#   130  interrupted (INT or TERM): what was closed, and how to reopen it
 # History rows: QUIT_ALL (as quit writes it), one LAUNCH row per tag it opens
 # (open_tag_instance), and one UPDATE row: result, both versions, reopened.
 
@@ -4344,7 +4346,7 @@ cmd_update() {
   fi
   _updater_flag
   if [[ "$UPD_FLAG" == "unknown" ]]; then
-    _update_refuse "The updater's state file (${UPDATER_STATE_FILE}) is missing or can't be read, so no install request may be on file, and update can't tell whether the updater will reopen Claude itself. Nothing was closed. Leave Claude open for a minute (each launch files an install request), then retry."
+    _update_refuse "The updater's state file ($(_tilde_path "$UPDATER_STATE_FILE")) is missing or can't be read, so no install request may be on file, and update can't tell whether the updater will reopen Claude itself. Nothing was closed. Leave Claude open for a minute (each launch files an install request), then retry."
   fi
 
   # 1. Each instance it will close, from the exact matcher (#9).
@@ -4396,7 +4398,7 @@ cmd_update() {
   fi
 
   # 4. The lock.
-  _update_lock_take || _update_refuse "Another update took the lock (${UPDATE_LOCK}) just now. Nothing was closed."
+  _update_lock_take || _update_refuse "Another update took the lock ($(_tilde_path "$UPDATE_LOCK")) just now. Nothing was closed."
   _update_state_write "$staged" "$before" "$UPD_FIRST_SEEN" updating "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$$"
 
   # 5. launchAfterInstallation, read immediately before the quit.
@@ -6004,9 +6006,13 @@ SUBCOMMANDS (Mac desktop app management):
                               the front
                          Result: identity display + Mac-app billing align with tgt.
                          Workspace (~/.claude/) stays bidirectional.
-                         Runs the account check (see identity) first: on a
-                         MISMATCH it refuses before quitting or writing
-                         anything. Ends with the same line as launch.
+                         Runs the account check (see identity) before it
+                         opens or quits anything: on a MISMATCH it refuses
+                         before quitting or writing anything. Ends with the
+                         same line as launch. Exit 0 swapped; 1 refused (a
+                         MISMATCH, a tag that is not configured, update
+                         running, the app not where detection looks), or an
+                         instance would not quit.
                          Flags:
                            --no-mirror       skip step 2
                            --force           swap even on a MISMATCH
@@ -6016,9 +6022,10 @@ SUBCOMMANDS (Mac desktop app management):
   launch <tag> [--force] [--new]
                          ADDITIVE launch. Spawns target instance WITHOUT
                          quitting others. Use for running both side-by-side.
-                         Runs the account check (see identity) first: on a
-                         MISMATCH it refuses and opens nothing; --force
-                         launches anyway, with the warning.
+                         Runs the account check (see identity) before it
+                         opens or quits anything: on a MISMATCH it refuses
+                         and opens nothing; --force launches anyway, with
+                         the warning.
                          launch and swap refuse a tag that is not in
                          [accounts] and has no profile folder yet (a typo
                          would create a new, empty profile), naming the
@@ -6034,6 +6041,9 @@ SUBCOMMANDS (Mac desktop app management):
                          (one line). front=no adds "Switch with Cmd-backtick
                          or the Dock". pid=unknown: no new instance
                          appeared in time; the launch still happened.
+                         Exit 0 launched; 1 refused (a MISMATCH, a tag that
+                         is not configured, update running, or open failed),
+                         nothing opened.
 
   signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]
                          (or login) Sign one tag in. Other instances stay
@@ -6095,7 +6105,9 @@ SUBCOMMANDS (Mac desktop app management):
                          Snapshot-rollback semantics for those three: target
                          snapshotted before apply; restored on failure (M-7).
                          Refuses if target instance is running (re-checked
-                         after snapshot, before apply, M-11).
+                         after snapshot, before apply, M-11). Exit 0 done;
+                         1 refused (nothing written) or failed (the
+                         snapshot is restored).
 
   prefs <verb>           Keep 8 global UI settings (the allowlist) the same
                          in every profile, one key at a time: primary plus
@@ -6177,7 +6189,9 @@ SUBCOMMANDS (Mac desktop app management):
                          version did not change (the updater log's last
                          line is printed); 2 refused, nothing closed, or
                          stopped by an unlisted instance (result=unlisted);
-                         3 installed, but a tag did not reopen.
+                         3 installed, but a tag did not reopen; 130
+                         interrupted (it says what it closed and how to
+                         reopen each tag).
 
   list (or instances)    Show running Claude desktop app instances, each with
                          its tag and how the tag was found (via=argv: its

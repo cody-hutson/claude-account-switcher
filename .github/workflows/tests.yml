@@ -21,6 +21,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The job runs pull-request code; leave no job token in the
+          # checkout's git config for it to read.
+          persist-credentials: false
       - name: Toolchain facts
         run: |
           /bin/bash --version

@@ -75,7 +75,8 @@ from the repo root).
 
 The check is read-only. It skips your runtime state and never opens it:
 `config.toml`, `swap-history.log`, `swap-history.log.1`, `.statusline-marker`,
-`prefs-sync.json` and `.DS_Store`.
+`prefs-sync.json`, `.prefs-sync.lock`, `update-state.json`, `.update.lock`
+and `.DS_Store`.
 
 To see which version is installed without the repo:
 
@@ -444,7 +445,9 @@ closed and ends with `result=unlisted`, exit `2`.
 Exit codes: `0` installed (or nothing staged), `1` the installed version
 did not change (it prints the updater log's last line), `2` refused before
 anything closed, or stopped during the quit by an instance it hadn't
-listed, `3` installed but a tag did not reopen in time.
+listed, `3` installed but a tag did not reopen in time, `130` interrupted
+(Ctrl-C or a stop signal; it says what it closed and how to reopen each
+tag).
 
 While `update` runs it holds a lock, the directory
 `~/.claude/account-switcher/.update.lock`, and `launch`, `swap` and
@@ -682,13 +685,13 @@ non-ASCII characters are rejected (prevents shell injection in the
 
 | Subcommand | Action |
 |---|---|
-| `swap <tag> [flags]` | Quit current, run the settings step for the target (see § Settings sync between profiles), launch target. Flags: `--no-mirror` (skip the settings step), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`), `--new` (allow a tag that is not in `[accounts]` and has no folder). Ends with the same closing line as `launch`. |
-| `launch <tag> [--force] [--new]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`, a tag neither configured nor on disk unless `--new` (see § New tags), and while `update` runs. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
-| `update [--yes]` | Install the waiting app update: list the instances it will close, ask (`--yes` skips), close them through the quit path, wait for the install, reopen the same tags, print the version before and after. Exit `0` installed or nothing staged, `1` version unchanged, `2` refused, `3` a tag did not reopen. See § App updates. |
+| `swap <tag> [flags]` | Quit current, run the settings step for the target (see § Settings sync between profiles), launch target. Flags: `--no-mirror` (skip the settings step), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`), `--new` (allow a tag that is not in `[accounts]` and has no folder). Ends with the same closing line as `launch`. Exit `0` swapped, `1` refused (a `MISMATCH`, an unconfigured tag, `update` running, the app not where detection looks) or an instance would not quit. |
+| `launch <tag> [--force] [--new]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`, a tag neither configured nor on disk unless `--new` (see § New tags), and while `update` runs. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. Exit `0` launched, `1` refused (nothing opened). |
+| `update [--yes]` | Install the waiting app update: list the instances it will close, ask (`--yes` skips), close them through the quit path, wait for the install, reopen the same tags, print the version before and after. Exit `0` installed or nothing staged, `1` version unchanged, `2` refused (or stopped by an instance it didn't list), `3` a tag did not reopen, `130` interrupted. See § App updates. |
 | `signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]` (or `login`) | Sign one tag in. Other instances stay open by default; afterwards it checks that no other profile's account changed (a change is detected after the fact, not prevented), and reports `match`, `MISMATCH` or `unknown` for the tag. `--quit-others` signs in with nothing else open. Exit `0`/`1`/`3` for the tag, `2` refused, `4` another profile changed. See § Signing in a tag. |
 | `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. `--show-ids` is terminal-only. See § Checking each tag's account. |
 | `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
-| `clone-prefs [src] [tgt]` | The key-level settings step for tgt (the whole settings file is no longer copied), then mirror `Claude Extensions/`, `Claude Extensions Settings/` and `git-worktrees.json` src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
+| `clone-prefs [src] [tgt]` | The key-level settings step for tgt (the whole settings file is no longer copied), then mirror `Claude Extensions/`, `Claude Extensions Settings/` and `git-worktrees.json` src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. Exit `0` done, `1` refused (nothing written) or failed (the snapshot restored). |
 | `prefs diff [--all]` | Read-only: every difference between the profiles' settings, with no ids or paths. Exit `0` in sync, `1` not, `2` error. |
 | `prefs sync [<tag>] [--dry-run]` | Sync the 8 allowlisted keys into `<tag>`, or every profile not running. Exit `0`, `1` a key needs review or a write was skipped, `2` refused. |
 | `prefs review` | Decide each key that differs (needs a terminal). Exit `0`, `1` left pending or declined, `2` refused. |

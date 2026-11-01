@@ -51,6 +51,10 @@ staged_plist() { printf '%s' "${AS_UPDATER_CACHE}/update.fake1/Claude.app/Conten
 state_path() { printf '%s' "${AS_UPDATER_CACHE}/ShipItState.plist"; }
 log_path() { printf '%s' "${AS_UPDATER_CACHE}/ShipIt_stderr.log"; }
 lock_path() { printf '%s' "${AS_STORE}/.update.lock"; }
+# The lock as messages show it: under ~, never the home folder's absolute path.
+# A literal ~ is the point here (display text).
+# shellcheck disable=SC2088
+LOCK_SHOWN='~/.claude/account-switcher/.update.lock'
 
 # info_plist <path> <version>: a generated Info.plist (XML).
 info_plist() {
@@ -977,7 +981,8 @@ case_lock_refuses() {
   local ok=0 owner_before
   owner_before="$(/usr/bin/shasum < "$(lock_path)/owner")"
   run_up "" launch tag-a
-  [[ "$rc" == "1" && "$err" == *"An update is running (the lock $(lock_path) is"* && "$err" == *"Not launching"* ]] || { ok=1; printf '    launch rc=%s\n' "$rc"; }
+  [[ "$rc" == "1" && "$err" == *"An update is running (the lock ${LOCK_SHOWN} is"* && "$err" == *"Not launching"* \
+     && "$err" != *"$(lock_path)"* ]] || { ok=1; printf '    launch rc=%s\n' "$rc"; }
   run_up "" swap tag-a --no-handoff
   [[ "$rc" == "1" && "$err" == *"Not swapping"* ]] || { ok=1; printf '    swap rc=%s\n' "$rc"; }
   run_up "" signin tag-a --yes
@@ -1001,9 +1006,11 @@ case_stale_lock() {
   owner_before="$(/usr/bin/shasum < "$(lock_path)/owner")"
   run_up "" launch tag-a
   [[ "$rc" == "1" && "$err" == *"is 1h 0m old (taken by PID 4242), past the 10-minute limit"* \
-     && "$err" == *"The switcher never removes a lock it did not take."* && "$err" == *"remove it: trash $(lock_path)"* ]] || { ok=1; printf '    launch rc=%s\n' "$rc"; }
+     && "$err" == *"The switcher never removes a lock it did not take."* && "$err" == *"remove it: trash ${LOCK_SHOWN}"* \
+     && "$err" != *"$(lock_path)"* ]] || { ok=1; printf '    launch rc=%s\n' "$rc"; }
   run_switcher list
-  [[ "$out" == *"  update:    stale lock (1h 0m old, taken by PID 4242)"* && "$out" == *"If no update is running, remove it: trash $(lock_path)"* ]] || ok=1
+  [[ "$out" == *"  update:    stale lock (1h 0m old, taken by PID 4242): ${LOCK_SHOWN}"* \
+     && "$out" == *"If no update is running, remove it: trash ${LOCK_SHOWN}"* && "$out" != *"$(lock_path)"* ]] || ok=1
   assert_unchanged "$(lock_path)/owner" "$owner_before" || ok=1
   # A lock with no owner line is of unknown age: reported the same way.
   scenario "$OLD_V" "$NEW_V" false
