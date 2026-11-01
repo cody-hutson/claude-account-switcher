@@ -6220,13 +6220,18 @@ SUBCOMMANDS (Mac desktop app management):
                          above (never the updater's helper), signalling
                          only the instances it listed: one it didn't list
                          that appears during the quit stops it (named;
-                         nothing more is signalled, nothing installed, what
-                         it closed is reopened). It waits up to
+                         nothing more is signalled, and what it closed is
+                         reopened). It waits up to
                          [update] install_timeout_s (default 120) for the
                          install, reopens the same tags, and prints the
-                         installed version before and after. When the
-                         updater reopens primary itself, update does not
-                         open it a second time. Ends with:
+                         installed version before and after. If the
+                         updater's log shows an install running when the
+                         quit stops (that way, or an instance won't close)
+                         or the wait times out, it reopens nothing and
+                         prints, per tag, the command to run once the
+                         install finishes. When the updater reopens
+                         primary itself, update does not open it a second
+                         time. Ends with:
                            update before=<v> after=<v>
                            result=<updated|unchanged|timeout|quit-failed|unlisted>
                            reopened=<n>/<m> exit=<code>

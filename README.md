@@ -440,7 +440,11 @@ already running, or when the instances change between the list and the
 quit. It signals only the instances it listed: if one it didn't list
 appears while it quits (opened from the Dock, say), it signals nothing
 more, names it (tag and PID), skips the install wait, reopens what it
-closed and ends with `result=unlisted`, exit `2`.
+closed and ends with `result=unlisted`, exit `2`. If the quit stops that
+way, or because an instance won't close (`result=quit-failed`, exit `1`),
+while the updater's log shows an install running, `update` reopens nothing
+and prints, per tag, the command to run once the install finishes, as when
+the wait ends that way.
 
 Exit codes: `0` installed (or nothing staged), `1` the installed version
 did not change (it prints the updater log's last line), `2` refused before
