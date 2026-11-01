@@ -744,6 +744,33 @@ case_pids_changed_refuses() {
   result "update compares get_claude_pids with the listed PIDs just before the quit: a new instance refuses, exit 2, nothing closed" $?
 }
 
+case_unlisted_during_quit() {
+  # tag-b (PID 4500) is opened from the Dock while update's quit runs: the
+  # graceful quit closes the two listed instances and leaves tag-b's in the
+  # table. The quit must signal only the listed PIDs, so 4500 is named and
+  # never signalled, and update stops before the install.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  printf '%5s %s --user-data-dir=%s\n' 4500 "${AS_APP_BUNDLE}/Contents/MacOS/Claude" "$(pdir tag-b)" >> "$AS_FIXTURE_PS_AFTER_QUIT"
+  helper_hook install
+  run_up "" update --yes
+  local k
+  k="$(calls_of kill)"
+  assert_rc 2 &&
+    assert_called osascript 'tell application "Claude" to quit' &&
+    assert_contains "$err" "A Claude instance that wasn't listed is running: tag-b · PID 4500. Stopping the quit; nothing more is signalled." &&
+    assert_not_contains "$k" $'\t4500' &&
+    assert_helper_untouched &&
+    { [[ ! -e "${AS_TEST_ROOT}/hook-polls.txt" ]] || { printf '    update waited for the install\n'; false; }; } &&
+    assert_not_contains "$out" "Waiting up to" &&
+    assert_eq "$(opens_flagless)" "1" "open calls for primary (reopened)" &&
+    assert_eq "$(opens_tag tag-a)" "1" "open calls for tag-a (reopened)" &&
+    assert_eq "$(opens_tag tag-b)" "0" "open calls for tag-b" &&
+    assert_contains "$out" "update before=${OLD_V} after=${OLD_V} result=unlisted reopened=2/2 exit=2" &&
+    assert_contains "$(history_text)" "UPDATE result=unlisted before=${OLD_V} after=${OLD_V} reopened=2/2" &&
+    assert_no_lock
+  result "an instance that wasn't listed appears during update's quit -> named (tag-b · PID 4500), never signalled, no install wait, the listed tags reopened, result=unlisted, exit 2" $?
+}
+
 case_install_running_refuses() {
   scenario "$OLD_V" "$NEW_V" false 501:primary
   {
@@ -968,6 +995,7 @@ case_state_not_json
 case_lai_false_reopens_primary
 case_tag_not_reopened
 case_pids_changed_refuses
+case_unlisted_during_quit
 case_install_running_refuses
 case_bad_arguments
 case_lock_refuses

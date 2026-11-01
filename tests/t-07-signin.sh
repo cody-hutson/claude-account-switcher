@@ -931,6 +931,26 @@ case_15d_quit_interrupted() {
   finish_case "15d. a stop signal (TERM) while quit_all_claude runs -> the QUIT_ALL row, what was listed and what still runs, nothing opened, exit 2" $?
 }
 
+case_15e_quit_unlisted_appears() {
+  # fresh (PID 504) is opened from the Dock while the quit runs: the graceful
+  # quit closes alpha and beta and leaves fresh's instance in the table. The
+  # quit signals only the confirmed PIDs, so 504 is named, never signalled.
+  quit_scenario
+  ps_line 504:fresh >> "$AS_FIXTURE_PS_AFTER_QUIT"
+  run_si /dev/null signin alpha --quit-others --yes --settle 0
+  local k
+  k="$(calls_of kill)"
+  assert_rc 2 &&
+    assert_called osascript "to quit" &&
+    assert_contains "$err" "A Claude instance that wasn't listed is running: fresh · PID 504. Stopping the quit; nothing more is signalled." &&
+    assert_not_contains "$k" $'\t504' &&
+    assert_contains "$out" "Stopped the quit: an instance that wasn't listed appeared (named above), and signin closes only what it listed. Listed before the quit: PIDs ${A_PID} ${B_PID}. Closed: ${A_PID} ${B_PID}. Still running: 504. Nothing was signed in." &&
+    assert_contains "$(history_text)" "QUIT_ALL" &&
+    assert_never_called open &&
+    assert_clean
+  finish_case "15e. an instance that wasn't listed appears during --quit-others' quit -> named (fresh · PID 504), never signalled, what was closed and what still runs, nothing opened, exit 2" $?
+}
+
 # ---- Cases 16-16d: refusals and the exit-code invariant -------------------------
 
 case_16_refusals() {
@@ -1421,6 +1441,7 @@ case_15_quit_no_terminal
 case_15b_quit_yes
 case_15c_quit_set_differs
 case_15d_quit_interrupted
+case_15e_quit_unlisted_appears
 case_16_refusals
 case_16b_failure_before_open
 case_16c_failure_after_open

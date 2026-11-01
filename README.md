@@ -292,7 +292,11 @@ other windows first, or use `--quit-others`.
 every open instance (the target too, when it is running: it is quit and
 reopened), asks before quitting them (`--yes` skips the question; without a
 terminal and without `--yes` it quits nothing and exits `2`), quits them the
-way `quit` does, and signs the tag in with only its instance running.
+way `quit` does, and signs the tag in with only its instance running. It
+signals only the instances it listed: if one it didn't list appears while
+it quits (opened from the Dock, say), it signals nothing more, names it
+(tag and PID), says what it closed and what is still running, opens nothing
+and exits `2`.
 
 Exit codes: `0` match; `1` MISMATCH; `2` refused before anything was opened
 or quit (including every argument error); `3` unknown (no pin yet, not seen
@@ -427,11 +431,15 @@ itself, the updater opens `primary`; `update` counts that window as
 primary's and never opens primary a second time. It refuses, closing
 nothing, when it can't name every open instance's tag, when an install is
 already running, or when the instances change between the list and the
-quit.
+quit. It signals only the instances it listed: if one it didn't list
+appears while it quits (opened from the Dock, say), it signals nothing
+more, names it (tag and PID), skips the install wait, reopens what it
+closed and ends with `result=unlisted`, exit `2`.
 
 Exit codes: `0` installed (or nothing staged), `1` the installed version
 did not change (it prints the updater log's last line), `2` refused before
-anything closed, `3` installed but a tag did not reopen in time.
+anything closed, or stopped during the quit by an instance it hadn't
+listed, `3` installed but a tag did not reopen in time.
 
 While `update` runs it holds a lock, the directory
 `~/.claude/account-switcher/.update.lock`, and `launch`, `swap` and

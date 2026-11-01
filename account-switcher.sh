@@ -1170,6 +1170,37 @@ _alive_pids() {
   [[ "$any_alive" == "true" ]] && return 0 || return 1
 }
 
+# _quit_listed_check <listed>: the listed mode's check (see quit_all_claude).
+# Returns 0 when every Claude main process running now is one of <listed>
+# (PIDs, space-separated, with spaces around). Otherwise names each other
+# one (tag · PID, from the matcher) in one error line and returns 1. A table
+# that can't be read is no evidence of a new instance: it returns 0, and the
+# quit still signals only the listed PIDs.
+_quit_listed_check() {
+  local rows st=0 pid profile method extra=""
+  rows="$(claude_instances)" || st=$?
+  [[ $st -eq 0 ]] || return 0
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    case "$1" in *" ${pid} "*) continue ;; esac
+    extra="${extra:+${extra}, }${profile} · PID ${pid}"
+  done <<< "$rows"
+  [[ -n "$extra" ]] || return 0
+  printf "\033[31mERROR:\033[0m A Claude instance that wasn't listed is running: %s. Stopping the quit; nothing more is signalled.\n" "$extra" >&2
+  return 1
+}
+
+# quit_all_claude [listed <pid> ...]
+#   With no argument (swap, quit): closes every Claude main process.
+#   With listed and the PIDs the caller listed and the operator confirmed
+#   (update, signin --quit-others): signals only those PIDs. At every read
+#   of the process table during the quit (on entry, each second of the
+#   graceful wait, before TERM, before KILL, and at the final check), a main
+#   process that is not one of them stops the quit at once: nothing more is
+#   signalled, it is named (tag · PID), and the function returns 3.
+# The graceful step is the same in both modes: one AppleScript quit to the
+# app by name. Ends through die (exit 1) when a process it signalled is
+# still alive; callers that must not end run it in a subshell.
 quit_all_claude() {
   # F2: Capture initial PID list at function entry. We track THESE
   # specific processes through the quit lifecycle via /bin/kill -0 instead
@@ -1178,12 +1209,23 @@ quit_all_claude() {
   # argv modifications) pgrep -f could transiently fail to match a live
   # process, causing the wait loop and SIGTERM/SIGKILL guards to clause
   # through and return "success" while the process remained alive.
-  local initial_pids
-  initial_pids=$(get_claude_pids)
+  local initial_pids="" mode="all" listed=" " q
+  if [[ "${1:-}" == "listed" ]]; then
+    mode="listed"
+    shift
+    for q; do
+      [[ -n "$q" ]] || continue
+      initial_pids="${initial_pids}${q}"$'\n'
+      listed="${listed}${q} "
+    done
+  else
+    initial_pids=$(get_claude_pids)
+  fi
 
   if [[ -z "$initial_pids" ]]; then
     return 0
   fi
+  if [[ "$mode" == "listed" ]]; then _quit_listed_check "$listed" || return 3; fi
 
   info "Sending graceful quit to running Claude instances..."
   "$AS_BIN_OSASCRIPT" -e 'tell application "Claude" to quit' 2>/dev/null || true
@@ -1200,17 +1242,24 @@ quit_all_claude() {
     if ! _alive_pids "$initial_pids" >/dev/null 2>&1; then
       break
     fi
+    if [[ "$mode" == "listed" ]]; then _quit_listed_check "$listed" || return 3; fi
     "$AS_BIN_SLEEP" 1
     n=$((n + 1))
   done
 
   # M-4 + F2: SIGTERM step. Send SIGTERM to any initial PID still alive
   # per kill -0, plus any new Claude processes started during the wait
-  # (e.g., LaunchAgent re-spawn, user clicked Dock icon).
+  # (e.g., LaunchAgent re-spawn, user clicked Dock icon). In listed mode a
+  # new process stops the quit instead (above), so only listed PIDs are
+  # signalled.
   local alive_initial
   alive_initial=$(_alive_pids "$initial_pids" 2>/dev/null || true)
-  local fresh_pids
-  fresh_pids=$(get_claude_pids)
+  local fresh_pids=""
+  if [[ "$mode" == "listed" ]]; then
+    _quit_listed_check "$listed" || return 3
+  else
+    fresh_pids=$(get_claude_pids)
+  fi
   if [[ -n "$alive_initial" ]] || [[ -n "$fresh_pids" ]]; then
     warn "Some Claude processes did not exit gracefully; sending SIGTERM"
     local p
@@ -1229,7 +1278,11 @@ quit_all_claude() {
   # get_claude_pids in case the process state changed during SIGTERM
   # (e.g., process briefly went argv-visible, or new instance launched).
   alive_initial=$(_alive_pids "$initial_pids" 2>/dev/null || true)
-  fresh_pids=$(get_claude_pids)
+  if [[ "$mode" == "listed" ]]; then
+    _quit_listed_check "$listed" || return 3
+  else
+    fresh_pids=$(get_claude_pids)
+  fi
   if [[ -n "$alive_initial" ]] || [[ -n "$fresh_pids" ]]; then
     warn "Claude processes resisting SIGTERM; sending SIGKILL via PID list"
     local p
@@ -1254,7 +1307,11 @@ quit_all_claude() {
     [[ -z "$p" ]] && continue
     stragglers+=("${p} (initial; survived quit)")
   done <<< "$alive_initial"
-  fresh_pids=$(get_claude_pids)
+  if [[ "$mode" == "listed" ]]; then
+    _quit_listed_check "$listed" || return 3
+  else
+    fresh_pids=$(get_claude_pids)
+  fi
   while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     # Only count fresh PIDs that were not in the initial set (already counted above).
@@ -3896,8 +3953,9 @@ cmd_quit() {
 # scheduled tasks pause while Claude is closed, and asks (--yes skips; with
 # no terminal and no --yes it refuses). Then it takes the lock, reads
 # launchAfterInstallation, checks that the open instances are still exactly
-# the ones it listed, quits through quit_all_claude (graceful, TERM, KILL,
-# final check; it signals main processes only, never the updater's helper),
+# the ones it listed, quits through quit_all_claude in its listed mode
+# (graceful, TERM, KILL, final check; it signals only the listed PIDs, never
+# the updater's helper, and stops if an instance it didn't list appears),
 # waits up to [update] install_timeout_s (default 120) for
 # "Installation completed successfully" stamped at or after the quit began,
 # reopens every tag that was open through open_tag_instance, prints the
@@ -3915,7 +3973,10 @@ cmd_quit() {
 #   1  the installed version did not change (the wait timed out, or the
 #      helper finished without changing it), or an instance would not quit;
 #      the helper log's last timestamped line is printed
-#   2  refused, or declined, before anything was closed (also bad arguments)
+#   2  refused, or declined, before anything was closed (also bad arguments);
+#      or stopped during the quit because an instance it hadn't listed
+#      appeared (result=unlisted: it is named, nothing more is signalled,
+#      nothing is installed, and what update closed is reopened)
 #   3  installed, but a tag did not reopen in time (named)
 # History rows: QUIT_ALL (as quit writes it), one LAUNCH row per tag it opens
 # (open_tag_instance), and one UPDATE row: result, both versions, reopened.
@@ -4122,8 +4183,10 @@ cmd_update() {
   fi
 
   # 6. The quit, only of the instances listed (and confirmed): the same
-  #    check signin --quit-others makes, immediately before quit_all_claude.
-  local now p since quit_ok=1
+  #    check signin --quit-others makes, immediately before quit_all_claude,
+  #    which then signals only the listed PIDs and stops (status 3) if an
+  #    instance that wasn't listed appears during the quit.
+  local now p since quit_rc=0
   now="$(get_claude_pids)"
   now=" ${now//$'\n'/ } "
   for p in $listed; do
@@ -4141,12 +4204,25 @@ cmd_update() {
   since="$("$AS_BIN_DATE" '+%Y-%m-%d %H:%M:%S')"
   if [[ -n "$listed" ]]; then
     UPD_CLOSED=1
-    if ! ( quit_all_claude ); then quit_ok=0; fi
+    # The PIDs are numbers, so word splitting is the point.
+    # shellcheck disable=SC2086
+    ( quit_all_claude listed $listed ) || quit_rc=$?
     if [[ -d "$STORE" ]]; then
       printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
     fi
   fi
-  if [[ $quit_ok -eq 0 ]]; then
+  if [[ $quit_rc -eq 3 ]]; then
+    # An instance that wasn't listed appeared during the quit: nothing more
+    # was signalled, so the updater can't install. No install wait; reopen
+    # what update closed.
+    printf '\033[31mERROR:\033[0m %s\n' "The open instances changed during the quit (named above), so update stopped before the install: it closes only what it listed. Reopening what it closed." >&2
+    _update_reopen false 0
+    printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$before"
+    _update_history unlisted "$before" "$before" "${UPD_REOPENED}/${n_tags}"
+    printf 'update before=%s after=%s result=unlisted reopened=%s/%s exit=2\n' "$before" "$before" "$UPD_REOPENED" "$n_tags"
+    exit 2
+  fi
+  if [[ $quit_rc -ne 0 ]]; then
     printf '\033[31mERROR:\033[0m %s\n' "Could not close every instance (see above), so the updater can't install. Reopening what was closed." >&2
     _update_reopen false 0
     printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$before"
@@ -4863,14 +4939,20 @@ _signin_quit_row() {
   fi
 }
 
-# After an interrupt or an unexpected stop during --quit-others' quit: what
-# was listed and what is still running. Nothing was opened yet.
+# _signin_quit_report [<lead>]: after an interrupt, an unexpected stop, or a
+# quit stopped by an instance that wasn't listed, during --quit-others' quit:
+# what was listed, what of it was closed, and what is still running. Nothing
+# was opened yet. <lead> defaults to the interrupt's wording.
 _signin_quit_report() {
-  local now
+  local lead="${1:-Interrupted while quitting.}" now closed="" p
   now="$(get_claude_pids)"
   now="${now//$'\n'/ }"
-  printf 'Interrupted while quitting. Listed before the quit: PIDs%s. Still running: %s. Nothing was signed in.\n' \
-    "${SG_CONFIRMED% }" "${now:-none}"
+  for p in $SG_CONFIRMED; do
+    case " ${now} " in *" ${p} "*) ;; *) closed="${closed} ${p}" ;; esac
+  done
+  closed="${closed# }"
+  printf '%s Listed before the quit: PIDs%s. Closed: %s. Still running: %s. Nothing was signed in.\n' \
+    "$lead" "${SG_CONFIRMED% }" "${closed:-none}" "${now:-none}"
 }
 
 # The EXIT trap, set at signin's entry. An exit that came through
@@ -5473,7 +5555,8 @@ cmd_signin() {
   fi
 
   # --quit-others: list, confirm, check the quit path would signal exactly
-  # the listed PIDs, quit through quit_all_claude, check nothing is left.
+  # the listed PIDs, quit them through quit_all_claude's listed mode (only
+  # those PIDs; a new instance stops it), check nothing is left.
   if [[ "$quit_others" == "true" ]]; then
     local mark now p
     if [[ -z "${SG_PRE_ALL// /}" ]]; then
@@ -5510,7 +5593,18 @@ cmd_signin() {
         fi
       done
       SIGNIN_PHASE="quit"
-      if ! ( quit_all_claude ); then
+      # The listed mode signals only the confirmed PIDs, and stops (status
+      # 3) if an instance that wasn't listed appears during the quit.
+      local quit_rc=0
+      # The PIDs are numbers, so word splitting is the point.
+      # shellcheck disable=SC2086
+      ( quit_all_claude listed $SG_CONFIRMED ) || quit_rc=$?
+      if [[ $quit_rc -eq 3 ]]; then
+        _signin_quit_row
+        _signin_quit_report "Stopped the quit: an instance that wasn't listed appeared (named above), and signin closes only what it listed."
+        _signin_exit 2
+      fi
+      if [[ $quit_rc -ne 0 ]]; then
         _signin_quit_row
         _signin_refuse "Could not quit every instance; nothing was signed in."
       fi
@@ -5703,7 +5797,10 @@ SUBCOMMANDS (Mac desktop app management):
                          that tag, detected after the fact, not prevented.
                          --quit-others lists every instance, asks (--yes
                          skips), quits them all, and signs in with only the
-                         target running. --timeout 30-1800 (default ${SIGNIN_TIMEOUT_DEFAULT});
+                         target running; it signals only the instances it
+                         listed, and one it didn't list that appears during
+                         the quit stops it (named, exit 2, nothing opened).
+                         --timeout 30-1800 (default ${SIGNIN_TIMEOUT_DEFAULT});
                          --new allows a tag not in [accounts]. Ends with:
                            signin tag=<tag> mode=<others-open|quit-others>
                            result=<match|MISMATCH|unknown> detail=<word>
@@ -5804,19 +5901,24 @@ SUBCOMMANDS (Mac desktop app management):
                          scheduled tasks pause while Claude is closed, and
                          asks (--yes skips; no terminal and no --yes
                          refuses). It quits them through the quit path
-                         above (never the updater's helper), waits up to
+                         above (never the updater's helper), signalling
+                         only the instances it listed: one it didn't list
+                         that appears during the quit stops it (named;
+                         nothing more is signalled, nothing installed, what
+                         it closed is reopened). It waits up to
                          [update] install_timeout_s (default 120) for the
                          install, reopens the same tags, and prints the
                          installed version before and after. When the
                          updater reopens primary itself, update does not
                          open it a second time. Ends with:
                            update before=<v> after=<v>
-                           result=<updated|unchanged|timeout|quit-failed>
+                           result=<updated|unchanged|timeout|quit-failed|unlisted>
                            reopened=<n>/<m> exit=<code>
                          Exit 0 installed (or nothing staged); 1 the
                          version did not change (the updater log's last
-                         line is printed); 2 refused, nothing closed; 3
-                         installed, but a tag did not reopen.
+                         line is printed); 2 refused, nothing closed, or
+                         stopped by an unlisted instance (result=unlisted);
+                         3 installed, but a tag did not reopen.
 
   list (or instances)    Show running Claude desktop app instances, each with
                          its tag and how the tag was found (via=argv: its
