@@ -146,6 +146,9 @@ account-switcher identity pin backup
 
 # Quit all running Claude instances (graceful → SIGTERM → SIGKILL via PID list)
 account-switcher quit --all
+
+# Install a waiting app update: close every instance, install, reopen the same tags
+account-switcher update
 ```
 
 ## How `swap` works internally (4 steps)
@@ -356,6 +359,99 @@ you sign out, so a signed-out profile still reads as its last account.
 `config.json` is an undocumented app file; if a future app version changes
 it, rows read `unknown` rather than `match`.
 
+## App updates (`update`)
+
+Every tag runs the same app (`/Applications/Claude.app`); only its
+`--user-data-dir` differs. So there is **one app and one updater for all
+tags**. When an instance downloads an update, the updater's helper stages
+it in `~/Library/Caches/com.anthropic.claudefordesktop.ShipIt/` and installs
+it **only once every Claude instance is closed**, in every account. With
+tags open side by side, that rarely happens, so an update can wait for days.
+The "Relaunch to retry update" banner that some windows show and others
+don't is a sign of this; all the windows still run the same build.
+
+`account-switcher list` ends with the update state:
+
+```
+App update (one app and one updater serve every tag):
+  installed: 4.29.0
+  staged:    4.4212.0
+  waiting:   2d 6h (since 2026-10-29T17:37:33Z)
+```
+
+`staged` reads `none` when nothing is waiting, and `unknown` (with the
+reason) whenever the updater's files can't be read, never `none`. Versions
+are shown as written and never compared as numbers. "Waiting since" is the
+switcher's own record (`~/.claude/account-switcher/update-state.json`):
+the updater rewrites its cache files at every launch, so their times say
+nothing; the first time the switcher sees a staged version, it takes the
+time from the updater log's first install request after the last
+completed install. Once an update has waited longer than
+`[update] warn_after_hours` (default 24), `launch` and `swap` print a
+one-line warning naming `update`.
+
+To install it:
+
+```bash
+account-switcher update          # lists what it will close, then asks
+account-switcher update --yes    # the same, without the question
+```
+
+`update` lists every instance it will close (tag and PID) and warns that
+scheduled tasks pause while Claude is closed. It asks before closing
+anything; without a terminal it needs `--yes`. It then closes the instances
+through the same path as `quit` (graceful, then `TERM`, then `KILL`, then a
+final check), never signalling the updater's helper, and waits up to
+`[update] install_timeout_s` (default 120) for the install. Afterwards it
+reopens every tag that was open and prints the installed version before
+and after. When the install request asked the updater to reopen the app
+itself, the updater opens `primary`; `update` counts that window as
+primary's and never opens primary a second time. It refuses, closing
+nothing, when it can't name every open instance's tag, when an install is
+already running, or when the instances change between the list and the
+quit.
+
+Exit codes: `0` installed (or nothing staged), `1` the installed version
+did not change (it prints the updater log's last line), `2` refused before
+anything closed, `3` installed but a tag did not reopen in time.
+
+While `update` runs it holds a lock, the directory
+`~/.claude/account-switcher/.update.lock`, and `launch`, `swap` and
+`signin` refuse until it is gone, so the switcher never starts the app
+while its bundle is being replaced. (Opening Claude from the Dock is not
+stopped.) A lock older than 10 minutes is reported as stale, with how to
+remove it, and still refuses: its age alone does not prove the update that
+took it has stopped, so the switcher never removes another run's lock.
+Check that no update is running (`account-switcher list`), then
+`trash ~/.claude/account-switcher/.update.lock`.
+
+Installing automatically when the Mac is idle is not part of this; `update`
+runs only when you ask.
+
+## New tags and `--new`
+
+`launch <tag>` and `swap <tag>` refuse a tag that is not in `[accounts]` and
+has no profile folder yet, because opening it would quietly create a new,
+empty profile, which is what a typo does. The message lists the configured
+tags and the closest match:
+
+```
+ERROR: Tag 'bakup' is not in [accounts] and has no profile folder, so launch would create a new, empty profile. Configured tags: primary, backup. Closest match: backup. ...
+```
+
+When the new tag is intended, say so with `--new` (the same flag `signin`
+takes):
+
+```bash
+account-switcher launch newtag --new
+```
+
+A folder that already exists is accepted. `list` marks every `Claude-*`
+folder whose tag is not in `[accounts]` as `unconfigured`, so a stray
+profile is visible. The switcher never deletes one; register it with
+`add-account`, or trash the folder yourself once you are sure nothing in it
+is needed.
+
 ## What's shared automatically across accounts
 
 | Surface | Path | Why shared |
@@ -393,6 +489,9 @@ Key sections:
   ids by hand). A tag with no line here reads `unknown`. The header must be
   exactly `[identity]`. An install from before this check has no such table;
   the first `identity pin` adds it.
+- `[update]` — `warn_after_hours` (default 24): when `launch` and `swap`
+  warn about a waiting app update; `install_timeout_s` (default 120): how
+  long `update` waits for the install. See § App updates.
 - `[notifications]` — channels for swap-success awareness signals
   (statusline / log / stderr).
 - `[swap_handoff]` — optional handoff tuning (all default-safe):
@@ -416,14 +515,15 @@ non-ASCII characters are rejected (prevents shell injection in the
 
 | Subcommand | Action |
 |---|---|
-| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`). Ends with the same closing line as `launch`. |
-| `launch <tag> [--force]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
+| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`), `--new` (allow a tag that is not in `[accounts]` and has no folder). Ends with the same closing line as `launch`. |
+| `launch <tag> [--force] [--new]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`, a tag neither configured nor on disk unless `--new` (see § New tags), and while `update` runs. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
+| `update [--yes]` | Install the waiting app update: list the instances it will close, ask (`--yes` skips), close them through the quit path, wait for the install, reopen the same tags, print the version before and after. Exit `0` installed or nothing staged, `1` version unchanged, `2` refused, `3` a tag did not reopen. See § App updates. |
 | `signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]` (or `login`) | Sign one tag in. Other instances stay open by default; afterwards it checks that no other profile's account changed (a change is detected after the fact, not prevented), and reports `match`, `MISMATCH` or `unknown` for the tag. `--quit-others` signs in with nothing else open. Exit `0`/`1`/`3` for the tag, `2` refused, `4` another profile changed. See § Signing in a tag. |
 | `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. See § Checking each tag's account. |
 | `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
 | `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
 | `quit [--all]` | Quit running Claude instances. `--all` quits every instance; bare `quit` quits only the current foreground instance. Graceful → SIGTERM → SIGKILL escalation. |
-| `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. |
+| `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. Profile folders whose tag is not in `[accounts]` are marked `unconfigured` (never deleted), and the last block shows the installed app version, the staged one (or `none`, or `unknown`) and how long it has waited. |
 | `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |
 | `config show` | Display the active config.toml. |
 | `config get <key>` | Read a single config.toml key (supports flat keys and one-level `table.key` form). |
@@ -439,6 +539,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
 - `signin` compares every profile's identity before and after the sign-in without holding the value: `jq` writes it into a pipe that `shasum` reads, and only a salted SHA-256 digest comes back. The digests and the salt are never printed, logged, written to a file or passed to another program; history rows carry tags, status words and counts only.
 - The account check reads one non-secret value, `lastKnownAccountUuid`, from each profile's `config.json`. That file also holds the app's token caches, so `jq` reads it in place and only that one value (at most 36 characters, and only when it is shaped like an account id) reaches the script; no shell variable ever holds the file's contents, the file is never copied, and core dumps are turned off for the run. Nothing else in a profile is opened.
+- Update detection (`list`, `update`, and the `launch` / `swap` warning) reads only the updater's state file, the installed and staged `Info.plist` files, the updater's log, and the process list. It opens no cookies, Local Storage, keychain items or tokens, and nothing in any profile folder. The updater's cache is found by the app's bundle id, never by a pattern that could match another app's updater.
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
 
 ## Safety

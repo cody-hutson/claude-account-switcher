@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | signin | identity | clone-prefs | quit | list | status | config | add-account | version | help
+# Subcommands: swap | launch | signin | identity | clone-prefs | quit | update | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript + lsappinfo. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -56,7 +56,9 @@ _as_test_under() {
 _as_test_mode_interlock() {
   local root="${AS_TEST_ROOT:-}" fakes="${AS_FAKES_DIR:-}"
   local danger=" KILL SECURITY OSASCRIPT OPEN PS LSOF LSAPPINFO "
-  local write=" RM MV CP RSYNC CHMOD INSTALL MKTEMP "
+  # PlistBuddy and plutil can rewrite a property list, so they are guarded
+  # like the write tools (#10).
+  local write=" RM MV CP RSYNC CHMOD INSTALL MKTEMP MKDIR PLISTBUDDY PLUTIL "
   local name var value line1 line2 class need
 
   # 1. The scratch root: absolute, normalised, not /, a directory, and marked
@@ -108,20 +110,20 @@ _as_test_mode_interlock() {
   # 7. A keychain service name that no real item uses.
   [[ "${AS_KEYCHAIN_SVC:-}" == as-test-* ]] || _as_test_refuse "AS_KEYCHAIN_SVC does not begin with as-test- (got '${AS_KEYCHAIN_SVC:-}')"
 
-  # 8. signin's per-poll test hook (#7), when set, is an executable file
-  #    under the scratch root.
+  # 8. The per-poll test hook signin (#7) and update (#10) run, when set, is
+  #    an executable file under the scratch root.
   if [[ -n "${AS_TEST_POLL_HOOK:-}" ]]; then
     _as_test_under "${AS_TEST_POLL_HOOK:-}" "$root" || _as_test_refuse "AS_TEST_POLL_HOOK is not under AS_TEST_ROOT (got '${AS_TEST_POLL_HOOK:-}')"
     [[ -f "${AS_TEST_POLL_HOOK:-}" && -x "${AS_TEST_POLL_HOOK:-}" ]] || _as_test_refuse "AS_TEST_POLL_HOOK is not an executable file (got '${AS_TEST_POLL_HOOK:-}')"
   fi
 }
 
-AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKTEMP MV OD OPEN OSASCRIPT PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
+AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKDIR MKTEMP MV OD OPEN OSASCRIPT PLISTBUDDY PLUTIL PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
-# Two test-only names for signin (#7), honoured only in test mode like every
-# seam name: AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal, and
-# AS_TEST_POLL_HOOK names a scratch script signin runs once per poll, so a
-# case can change the scenario between polls in either timer mode.
+# Two test-only names for signin (#7) and update (#10), honoured only in test
+# mode like every seam name: AS_TEST_STDIN_IS_TTY=1 makes stdin count as a
+# terminal, and AS_TEST_POLL_HOOK names a scratch script signin and update
+# run once per poll, so a case can change the scenario between polls.
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
   for _n in $AS_SEAM_BINS; do unset "AS_BIN_${_n}"; done
@@ -145,11 +147,14 @@ fi
 : "${AS_BIN_KILL:=/bin/kill}"
 : "${AS_BIN_LSAPPINFO:=/usr/bin/lsappinfo}"
 : "${AS_BIN_LSOF:=/usr/sbin/lsof}"
+: "${AS_BIN_MKDIR:=/bin/mkdir}"
 : "${AS_BIN_MKTEMP:=/usr/bin/mktemp}"
 : "${AS_BIN_MV:=/bin/mv}"
 : "${AS_BIN_OD:=/usr/bin/od}"
 : "${AS_BIN_OPEN:=/usr/bin/open}"
 : "${AS_BIN_OSASCRIPT:=/usr/bin/osascript}"
+: "${AS_BIN_PLISTBUDDY:=/usr/libexec/PlistBuddy}"
+: "${AS_BIN_PLUTIL:=/usr/bin/plutil}"
 : "${AS_BIN_PS:=/bin/ps}"
 : "${AS_BIN_PYTHON3:=/usr/bin/python3}"
 : "${AS_BIN_RM:=/bin/rm}"
@@ -172,8 +177,8 @@ if [[ "${AS_TEST_MODE:-0}" == "1" ]]; then _as_test_mode_interlock; fi
 readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
   AS_BIN_CP AS_BIN_CUT AS_BIN_DATE AS_BIN_DU AS_BIN_GIT AS_BIN_GREP \
   AS_BIN_HEAD AS_BIN_INSTALL AS_BIN_JQ AS_BIN_KILL AS_BIN_LSAPPINFO AS_BIN_LSOF \
-  AS_BIN_MKTEMP AS_BIN_MV AS_BIN_OD \
-  AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PS AS_BIN_PYTHON3 \
+  AS_BIN_MKDIR AS_BIN_MKTEMP AS_BIN_MV AS_BIN_OD \
+  AS_BIN_OPEN AS_BIN_OSASCRIPT AS_BIN_PLISTBUDDY AS_BIN_PLUTIL AS_BIN_PS AS_BIN_PYTHON3 \
   AS_BIN_RM AS_BIN_RSYNC AS_BIN_SECURITY AS_BIN_SED AS_BIN_SHASUM AS_BIN_SLEEP AS_BIN_TAIL \
   AS_BIN_TR AS_BIN_WC
 readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
@@ -1448,6 +1453,469 @@ _launch_report() {
   return 0
 }
 
+# ---- App updates: the reader, the record and the lock (#10) ---------------
+#
+# Every tag runs the same app bundle, so one updater serves every tag. An
+# instance that downloads an update hands it to the updater's helper
+# (ShipIt), which works in AS_UPDATER_CACHE: the cache folder named by the
+# app's bundle id, ~/Library/Caches/com.anthropic.claudefordesktop.ShipIt.
+# Other apps keep ShipIt caches too, so the folder is always named, never
+# found with a *ShipIt* pattern. The helper installs only once no instance
+# of the app is running.
+#
+# The reader opens exactly four files, each through a seamed command, so the
+# test suite's recording fakes can show what was read: the helper's state
+# file (ShipItState.plist, which is JSON despite its name: read with jq, and
+# through plutil only when it is not JSON), the installed and the staged
+# Info.plist (PlistBuddy) and the helper's log (awk). Beyond those it lists
+# the cache folder (a glob), and update reads the process list. It opens no
+# cookies, no Local Storage, no keychain item, no token and nothing in any
+# profile folder. When the cache folder is absent it runs no command at all.
+#
+# Versions are strings. They are compared for equality only, never ordered:
+# the middle component restarts with each major (3.6556.2, then 4.29.0).
+#
+# What cannot be read is unknown, never none. none means the cache was read
+# and holds no staged bundle other than the installed version.
+
+readonly UPDATER_STATE_FILE="${AS_UPDATER_CACHE}/ShipItState.plist"
+readonly UPDATER_LOG="${AS_UPDATER_CACHE}/ShipIt_stderr.log"
+readonly APP_INFO_PLIST="${AS_APP_BUNDLE}/Contents/Info.plist"
+readonly UPDATE_STATE="${STORE}/update-state.json"
+readonly UPDATE_LOCK="${STORE}/.update.lock"
+readonly UPDATE_LOCK_STALE_S=600
+readonly UPDATE_WARN_HOURS_DEFAULT=24
+readonly UPDATE_TIMEOUT_DEFAULT=120
+readonly AS_VERSION_RE='^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$'
+readonly AS_UTC_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+
+# The jq filter for launchAfterInstallation: "true" or "false", or "unknown"
+# when the top level is not one object or the value is not a boolean.
+# shellcheck disable=SC2016
+readonly UPD_FLAG_JQ='if type == "object" and (.launchAfterInstallation | type) == "boolean"
+  then (.launchAfterInstallation | tostring) else "unknown" end'
+
+UPD_INSTALLED="unknown"
+UPD_INSTALLED_WHY=""
+UPD_STAGED="unknown"
+UPD_WHY=""
+UPD_FIRST_SEEN=""
+UPD_WAIT_S=""
+UPD_FLAG="unknown"
+UPD_LOG_LAST=""
+UPD_LOG_SEED=""
+UPD_LOG_DONE=0
+UPD_LOCK_OWNED=0
+
+# _plist_version <Info.plist>: prints its CFBundleShortVersionString and
+# returns 0, or prints nothing and returns 1 (absent, unreadable, no such
+# key, or a value that is not version-shaped).
+_plist_version() {
+  local f="${1:-}" v=""
+  [[ -f "$f" && -r "$f" ]] || return 1
+  v="$("$AS_BIN_PLISTBUDDY" -c 'Print :CFBundleShortVersionString' "$f" 2>/dev/null)" || return 1
+  [[ "$v" =~ $AS_VERSION_RE ]] || return 1
+  printf '%s' "$v"
+}
+
+# Sets UPD_INSTALLED (a version or unknown) and UPD_INSTALLED_WHY.
+_update_installed() {
+  UPD_INSTALLED_WHY=""
+  if UPD_INSTALLED="$(_plist_version "$APP_INFO_PLIST")"; then return 0; fi
+  UPD_INSTALLED="unknown"
+  if [[ -e "$APP_INFO_PLIST" ]]; then
+    UPD_INSTALLED_WHY="the app's Info.plist can't be read"
+  else
+    UPD_INSTALLED_WHY="the app's Info.plist is missing"
+  fi
+}
+
+# Sets UPD_STAGED to the staged bundle's version, none or unknown, and
+# UPD_WHY to the reason for unknown. A staged bundle is
+# <cache>/update.<random>/Claude.app. One whose version equals
+# UPD_INSTALLED is not waiting (none); several with different versions, or
+# any folder or Info.plist that can't be read, are unknown.
+_update_staged() {
+  local d v found=""
+  UPD_STAGED="unknown"
+  UPD_WHY=""
+  if [[ ! -d "$AS_UPDATER_CACHE" ]]; then UPD_WHY="no updater cache folder"; return 0; fi
+  if [[ ! -r "$AS_UPDATER_CACHE" || ! -x "$AS_UPDATER_CACHE" ]]; then
+    UPD_WHY="the updater cache folder can't be read"
+    return 0
+  fi
+  for d in "$AS_UPDATER_CACHE"/update.*; do
+    [[ -d "$d" ]] || continue
+    if [[ ! -r "$d" || ! -x "$d" ]]; then UPD_WHY="a staged update folder can't be read"; return 0; fi
+    [[ -e "${d}/Claude.app" ]] || continue
+    if ! v="$(_plist_version "${d}/Claude.app/Contents/Info.plist")"; then
+      UPD_WHY="the staged bundle's Info.plist can't be read"
+      return 0
+    fi
+    if [[ -n "$found" && "$v" != "$found" ]]; then UPD_WHY="several staged bundles"; return 0; fi
+    found="$v"
+  done
+  if [[ -z "$found" || "$found" == "$UPD_INSTALLED" ]]; then UPD_STAGED="none"; else UPD_STAGED="$found"; fi
+}
+
+# Sets UPD_FLAG to true, false or unknown: the helper state file's
+# launchAfterInstallation. The file is JSON, which PlistBuddy can't read, so
+# jq reads it; only when jq can't parse it (it is not JSON) does plutil
+# convert it to JSON for jq. unknown when both reads fail, and when the file
+# parses but holds no boolean there.
+_updater_flag() {
+  local f="$UPDATER_STATE_FILE" v=""
+  UPD_FLAG="unknown"
+  [[ -f "$f" && -r "$f" ]] || return 0
+  if ! v="$("$AS_BIN_JQ" -r "$UPD_FLAG_JQ" "$f" 2>/dev/null)"; then
+    v="$("$AS_BIN_PLUTIL" -convert json -o - "$f" 2>/dev/null | "$AS_BIN_JQ" -r "$UPD_FLAG_JQ" 2>/dev/null)" || v=""
+  fi
+  case "$v" in
+    true|false) UPD_FLAG="$v" ;;
+  esac
+  return 0
+}
+
+# _updater_log_scan [<since>]: one awk pass over the helper's log. Lines
+# that do not start with a timestamp (the "ERROR: Unrecognized attribute"
+# lines and the indented NSFilePath / NSURL dumps) are skipped. Sets:
+#   UPD_LOG_LAST  the last timestamped line ("" when there is none)
+#   UPD_LOG_SEED  the time of the first "Detected this as an install request"
+#                 after the last "Installation completed successfully"
+#                 (YYYY-MM-DD HH:MM:SS, local time; "" when there is none)
+#   UPD_LOG_DONE  the number of "Installation completed successfully" lines
+#                 stamped at or after <since> (0 without <since>)
+# Returns 1 when the log can't be read.
+#
+# Time zone: the helper stamps each line in local time, with milliseconds
+# and no zone ("2026-10-31 11:21:05.123") [INFERRED: the logger's usual
+# convention; not verified]. So every comparison here is in local time:
+# <since> is `date '+%Y-%m-%d %H:%M:%S'` in this zone, and both sides are
+# compared to the second as fixed-width strings (the milliseconds are
+# dropped). A completion stamped in the same second as <since> counts; a
+# real install finishes seconds after the quit begins. Only first_seen_utc
+# is converted to UTC (_update_local_to_utc). In the hour a daylight-saving
+# change repeats, local times are ambiguous, and a line stamped in it can be
+# misordered.
+_updater_log_scan() {
+  local since="${1:-}" out="" k v
+  UPD_LOG_LAST=""
+  UPD_LOG_SEED=""
+  UPD_LOG_DONE=0
+  [[ -f "$UPDATER_LOG" && -r "$UPDATER_LOG" ]] || return 1
+  out="$(AS_SINCE="$since" "$AS_BIN_AWK" '
+    BEGIN { since = ENVIRON["AS_SINCE"]; n = 0; seed = ""; last = "" }
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9] / {
+      t = substr($0, 1, 19)
+      last = $0
+      msg = substr($0, 25)
+      i = index(msg, "] ")
+      if (i > 0) msg = substr(msg, i + 2)
+      if (index(msg, "Installation completed successfully") == 1) {
+        seed = ""
+        if (since != "" && t >= since) n++
+      } else if (index(msg, "Detected this as an install request") == 1) {
+        if (seed == "") seed = t
+      }
+    }
+    END { gsub(/\t/, " ", last); printf "L\t%s\nS\t%s\nN\t%d\n", last, seed, n }' "$UPDATER_LOG" 2>/dev/null)" || return 1
+  while IFS=$'\t' read -r k v; do
+    case "$k" in
+      L) UPD_LOG_LAST="$v" ;;
+      S) UPD_LOG_SEED="$v" ;;
+      N) if [[ "$v" =~ ^[0-9]+$ ]]; then UPD_LOG_DONE="$v"; fi ;;
+    esac
+  done <<< "$out"
+  return 0
+}
+
+# Returns 0 when the last timestamped log line (from _updater_log_scan) says
+# an install is under way. Whether a ShipIt process exists is not the test:
+# one waits for hours in the normal staged state.
+_updater_installing() {
+  local msg="${UPD_LOG_LAST:24}"
+  msg="${msg#*] }"
+  case "$msg" in
+    "Beginning installation"*|"Moving bundle"*|"Moved bundle"*) return 0 ;;
+  esac
+  return 1
+}
+
+# _update_local_to_utc <YYYY-MM-DD HH:MM:SS>: prints the same instant as an
+# ISO UTC string (BSD date reads the local time with -j -f), or returns 1.
+_update_local_to_utc() {
+  local e=""
+  e="$("$AS_BIN_DATE" -j -f '%Y-%m-%d %H:%M:%S' "${1:-}" +%s 2>/dev/null)" || return 1
+  [[ "$e" =~ ^[0-9]+$ ]] || return 1
+  "$AS_BIN_DATE" -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+# _utc_epoch <ISO UTC>: prints its epoch seconds, or returns 1.
+_utc_epoch() {
+  local e=""
+  e="$("$AS_BIN_DATE" -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${1:-}" +%s 2>/dev/null)" || return 1
+  [[ "$e" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$e"
+}
+
+# _fmt_duration <seconds>: "2d 3h", "3h 12m", "12m" or "under 1m".
+_fmt_duration() {
+  local s="${1:-0}" d h m
+  [[ "$s" =~ ^[0-9]+$ ]] || s=0
+  d=$((s / 86400))
+  h=$(((s % 86400) / 3600))
+  m=$(((s % 3600) / 60))
+  if [[ $d -gt 0 ]]; then printf '%dd %dh' "$d" "$h"
+  elif [[ $h -gt 0 ]]; then printf '%dh %dm' "$h" "$m"
+  elif [[ $m -gt 0 ]]; then printf '%dm' "$m"
+  else printf 'under 1m'
+  fi
+}
+
+# The switcher's own record, update-state.json (mode 600), so a status line
+# can show "update waiting" without reading the helper's files:
+#   {"schema": 1, "staged_version": "<version>" | "none",
+#    "installed_version": "<version>" | "unknown",
+#    "first_seen_utc": "<ISO UTC>" | null, "phase": "idle" | "updating",
+#    "run": null | {"started_utc": "<ISO UTC>", "pid": <n>}}
+# first_seen_utc is when the switcher first saw that staged version. It
+# cannot come from the cache's file times, which are rewritten at every app
+# launch, so with no record it is seeded from the helper log's first install
+# request after the last completed install, and otherwise it is the time of
+# the observation. It never touches the tag marker (.statusline-marker),
+# whose first line detect_running_tag reads as a tag.
+
+# Sets UPD_REC_STAGED, UPD_REC_INSTALLED, UPD_REC_FIRST and UPD_REC_PHASE from
+# the record ("" each when it is absent, unreadable or malformed).
+_update_state_read() {
+  local line=""
+  UPD_REC_STAGED="" UPD_REC_INSTALLED="" UPD_REC_FIRST="" UPD_REC_PHASE=""
+  [[ -f "$UPDATE_STATE" && -r "$UPDATE_STATE" ]] || return 0
+  line="$("$AS_BIN_JQ" -r 'if type == "object" then
+      [(.staged_version // "" | tostring), (.installed_version // "" | tostring),
+       (.first_seen_utc // "" | tostring), (.phase // "" | tostring)] | join("|")
+    else empty end' "$UPDATE_STATE" 2>/dev/null)" || line=""
+  IFS='|' read -r UPD_REC_STAGED UPD_REC_INSTALLED UPD_REC_FIRST UPD_REC_PHASE <<< "$line" || :
+  [[ "$UPD_REC_STAGED" =~ $AS_VERSION_RE ]] || UPD_REC_STAGED=""
+  [[ "$UPD_REC_INSTALLED" =~ $AS_VERSION_RE ]] || UPD_REC_INSTALLED=""
+  [[ "$UPD_REC_FIRST" =~ $AS_UTC_RE ]] || UPD_REC_FIRST=""
+  return 0
+}
+
+# _update_state_write <staged> <installed> <first_seen> <phase> [<run started> <run pid>]
+# Writes the record through a temp file, mv and chmod 600. Only when the
+# store exists; a write that fails leaves the old record and returns 0.
+_update_state_write() {
+  local tmp=""
+  [[ -d "$STORE" ]] || return 0
+  tmp="$("$AS_BIN_MKTEMP" 2>/dev/null)" || return 0
+  if "$AS_BIN_JQ" -n --arg s "${1:-}" --arg i "${2:-}" --arg f "${3:-}" --arg p "${4:-idle}" \
+        --arg rs "${5:-}" --arg rp "${6:-0}" \
+        '{schema: 1, staged_version: $s, installed_version: $i,
+          first_seen_utc: (if $f == "" then null else $f end), phase: $p,
+          run: (if $rs == "" then null else {started_utc: $rs, pid: ($rp | tonumber)} end)}' \
+        > "$tmp" 2>/dev/null \
+      && "$AS_BIN_MV" -f "$tmp" "$UPDATE_STATE" 2>/dev/null \
+      && "$AS_BIN_CHMOD" 600 "$UPDATE_STATE" 2>/dev/null; then
+    return 0
+  fi
+  "$AS_BIN_RM" -f "$tmp" 2>/dev/null || :
+  return 0
+}
+
+# update_observe: reads the installed and staged versions and how long the
+# staged one has waited, and rewrites update-state.json when what it holds
+# changed. While the update lock exists it writes nothing (that run owns the
+# record). Sets UPD_INSTALLED, UPD_INSTALLED_WHY, UPD_STAGED, UPD_WHY,
+# UPD_FIRST_SEEN and UPD_WAIT_S (seconds, or "" when unknown). Always
+# returns 0.
+update_observe() {
+  local first="" now="" fe=""
+  UPD_FIRST_SEEN=""
+  UPD_WAIT_S=""
+  _update_installed
+  _update_staged
+  if [[ "$UPD_STAGED" == "unknown" ]]; then return 0; fi
+  _update_state_read
+  if [[ "$UPD_STAGED" != "none" ]]; then
+    if [[ "$UPD_REC_STAGED" == "$UPD_STAGED" && -n "$UPD_REC_FIRST" ]]; then
+      first="$UPD_REC_FIRST"
+    elif [[ -z "$UPD_REC_STAGED" ]] && _updater_log_scan "" && [[ -n "$UPD_LOG_SEED" ]]; then
+      first="$(_update_local_to_utc "$UPD_LOG_SEED")" || first=""
+    fi
+    if [[ ! "$first" =~ $AS_UTC_RE ]]; then first="$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)"; fi
+    UPD_FIRST_SEEN="$first"
+    now="$("$AS_BIN_DATE" +%s)"
+    fe="$(_utc_epoch "$first")" || fe=""
+    if [[ -n "$fe" && "$now" =~ ^[0-9]+$ ]]; then
+      UPD_WAIT_S=$((now - fe))
+      if [[ $UPD_WAIT_S -lt 0 ]]; then UPD_WAIT_S=0; fi
+    fi
+  fi
+  if [[ ! -d "$UPDATE_LOCK" ]] && [[ "$UPD_REC_STAGED" != "$UPD_STAGED" \
+        || "$UPD_REC_INSTALLED" != "$UPD_INSTALLED" || "$UPD_REC_FIRST" != "$UPD_FIRST_SEEN" \
+        || "$UPD_REC_PHASE" != "idle" ]]; then
+    _update_state_write "$UPD_STAGED" "$UPD_INSTALLED" "$UPD_FIRST_SEEN" idle
+  fi
+  return 0
+}
+
+# _update_config_int <key> <default> <min> <max>: the whole number at
+# [update].<key> in config.toml, or <default> when unset; a value that is not
+# a whole number in range warns and reads <default>.
+_update_config_int() {
+  local v=""
+  v="$(toml_get "update.$1" 2>/dev/null)" || v=""
+  if [[ -z "$v" ]]; then printf '%s' "$2"; return 0; fi
+  if [[ "$v" =~ ^[0-9]{1,5}$ ]] && [[ $((10#$v)) -ge $3 && $((10#$v)) -le $4 ]]; then
+    printf '%s' "$((10#$v))"
+    return 0
+  fi
+  warn "config.toml [update] $1 = '${v}' is not a whole number from $3 to $4; using $2."
+  printf '%s' "$2"
+}
+
+# update_wait_warning: launch and swap call this before they open anything.
+# When the staged update has waited longer than [update] warn_after_hours
+# (default 24), one warning line naming the update command. Never refuses.
+update_wait_warning() {
+  local hours
+  update_observe
+  [[ "$UPD_STAGED" != "unknown" && "$UPD_STAGED" != "none" && -n "$UPD_WAIT_S" ]] || return 0
+  hours="$(_update_config_int warn_after_hours "$UPDATE_WARN_HOURS_DEFAULT" 1 8760)"
+  if [[ $UPD_WAIT_S -gt $((hours * 3600)) ]]; then
+    warn "Claude ${UPD_STAGED} has waited $(_fmt_duration "$UPD_WAIT_S") to install (over ${hours} h); it installs only when every Claude instance is closed. To install it now: account-switcher update"
+  fi
+  return 0
+}
+
+# The update lock is a directory, made with mkdir, which fails when the
+# directory exists, so two runs cannot both take it. It holds one file,
+# owner: "pid=<n> started_epoch=<n> started_utc=<ISO UTC>". update takes it
+# before it closes anything and releases it last (also from its EXIT trap);
+# launch, swap and signin refuse while it exists, so the switcher never
+# starts the app while its bundle may be being replaced. (Opening Claude from
+# the Dock is not stopped.)
+#
+# A lock older than 10 minutes is reported as stale, with its remedy, and
+# still refuses. The switcher never removes a lock it did not take: age
+# alone does not show that the run which took it has stopped (an install can
+# hang, and a PID can be reused), and starting the app mid-install is what
+# the lock exists to prevent. The operator checks, then removes it with
+# trash.
+
+# Returns 0 and sets UPD_LOCK_STALE (1 or 0), UPD_LOCK_AGE (text) and
+# UPD_LOCK_PID when the lock exists; returns 1 otherwise. Builtins only
+# until a lock is found.
+_update_lock_held() {
+  local line="" ep="" now="" age="" re='^pid=([0-9]+) started_epoch=([0-9]+) '
+  UPD_LOCK_STALE=1
+  UPD_LOCK_AGE="of unknown age"
+  UPD_LOCK_PID="unknown"
+  [[ -d "$UPDATE_LOCK" ]] || return 1
+  if [[ -f "${UPDATE_LOCK}/owner" && -r "${UPDATE_LOCK}/owner" ]]; then
+    { IFS= read -r line || :; } < "${UPDATE_LOCK}/owner"
+  fi
+  if [[ "${line} " =~ $re ]]; then
+    UPD_LOCK_PID="${BASH_REMATCH[1]}"
+    ep="${BASH_REMATCH[2]}"
+  fi
+  now="$("$AS_BIN_DATE" +%s 2>/dev/null)" || now=""
+  if [[ -n "$ep" && "$now" =~ ^[0-9]+$ ]]; then
+    age=$((now - ep))
+    if [[ $age -lt 0 ]]; then age=0; fi
+    UPD_LOCK_AGE="$(_fmt_duration "$age") old"
+    if [[ $age -le $UPDATE_LOCK_STALE_S ]]; then UPD_LOCK_STALE=0; fi
+  fi
+  return 0
+}
+
+# _update_lock_refusal <doing>: the refusal text for a held lock (call it
+# after _update_lock_held returned 0); <doing> is e.g. "launching".
+_update_lock_refusal() {
+  if [[ "$UPD_LOCK_STALE" == "0" ]]; then
+    printf 'An update is running (the lock %s is %s, taken by PID %s). Not %s while the app bundle may be being replaced; wait for account-switcher update to finish.' \
+      "$UPDATE_LOCK" "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$1"
+  else
+    printf "The update lock %s is %s (taken by PID %s), past the 10-minute limit, so it is probably left from an update that stopped. Not %s. The switcher never removes a lock it did not take. If no update is running (the updater's log does not end with 'Beginning installation'; account-switcher list shows the versions), remove it: trash %s" \
+      "$UPDATE_LOCK" "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$1" "$UPDATE_LOCK"
+  fi
+}
+
+# Takes the lock for this run, or returns 1 when it exists.
+_update_lock_take() {
+  "$AS_BIN_MKDIR" -m 700 "$UPDATE_LOCK" 2>/dev/null || return 1
+  UPD_LOCK_OWNED=1
+  printf 'pid=%s started_epoch=%s started_utc=%s\n' "$$" "$("$AS_BIN_DATE" +%s)" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" > "${UPDATE_LOCK}/owner" || :
+  return 0
+}
+
+# Releases the lock, only when this run took it.
+_update_lock_release() {
+  [[ "$UPD_LOCK_OWNED" == "1" ]] || return 0
+  UPD_LOCK_OWNED=0
+  "$AS_BIN_RM" -f "${UPDATE_LOCK}/owner" 2>/dev/null || :
+  if ! "$AS_BIN_RM" -d "$UPDATE_LOCK" 2>/dev/null; then
+    warn "Could not remove the update lock ${UPDATE_LOCK}; remove it with: trash ${UPDATE_LOCK}"
+  fi
+  return 0
+}
+
+# ---- The unknown-tag guard (#10) ------------------------------------------
+#
+# launch and swap would create a new, empty profile folder for any tag that
+# passes the format check, a typo included. They refuse a tag that is not in
+# [accounts] and has no profile folder, unless --new (the same flag, with the
+# same meaning, as signin's). primary and default always pass: they name the
+# app's own default folder. A folder that exists passes even when its tag is
+# not in [accounts]; list reports it as unconfigured.
+
+# _closest_tag <tag> <candidates, one per line>: the candidate with the
+# smallest edit distance to <tag> (the first one on a tie), or nothing.
+_closest_tag() {
+  printf '%s\n' "${2:-}" | AS_WANT="${1:-}" "$AS_BIN_AWK" '
+    function lev(s, t,   m, n, i, j, c, x, d) {
+      split("", d)
+      m = length(s); n = length(t)
+      for (i = 0; i <= m; i++) d[i, 0] = i
+      for (j = 0; j <= n; j++) d[0, j] = j
+      for (i = 1; i <= m; i++) {
+        for (j = 1; j <= n; j++) {
+          c = (substr(s, i, 1) == substr(t, j, 1)) ? 0 : 1
+          x = d[i - 1, j] + 1
+          if (d[i, j - 1] + 1 < x) x = d[i, j - 1] + 1
+          if (d[i - 1, j - 1] + c < x) x = d[i - 1, j - 1] + c
+          d[i, j] = x
+        }
+      }
+      return d[m, n]
+    }
+    NF { x = lev(ENVIRON["AS_WANT"], $0); if (best == "" || x < bd) { best = $0; bd = x } }
+    END { if (best != "") print best }'
+}
+
+# unknown_tag_guard <tag> <new: true|false> <launch|swap>: returns 0, or
+# refuses (exit 1) with the configured tags and the closest match, before
+# anything is opened, quit or written.
+unknown_tag_guard() {
+  local tag="$1" new="$2" verb="$3" tags="" list="" closest=""
+  case "$tag" in primary|default) return 0 ;; esac
+  if tag_is_in_accounts "$tag"; then return 0; fi
+  if [[ -d "$(udd_for_tag "$tag")" ]]; then return 0; fi
+  if [[ "$new" == "true" ]]; then
+    info "'${tag}' is not in [accounts] and has no profile folder; ${verb} creates a new one (--new)."
+    return 0
+  fi
+  tags="$(accounts_tags)" || tags=""
+  if [[ -n "$tags" ]]; then
+    list="${tags//$'\n'/, }"
+    closest="$(_closest_tag "$tag" "$tags")" || closest=""
+    die "Tag '${tag}' is not in [accounts] and has no profile folder, so ${verb} would create a new, empty profile. Configured tags: ${list}. Closest match: ${closest:-none}. If '${tag}' is a new tag on purpose: account-switcher ${verb} ${tag} --new"
+  fi
+  die "Tag '${tag}' is not in [accounts] and has no profile folder, so ${verb} would create a new, empty profile. No tag is configured in [accounts] of ${CONFIG_FILE}. If '${tag}' is a new tag on purpose: account-switcher ${verb} ${tag} --new"
+}
+
 # ---- launch (additive; H-1) ----------------------------------------------
 
 # open_tag_instance <tag> <user-data-dir> <first_launch: true|false>
@@ -1470,24 +1938,33 @@ open_tag_instance() {
 }
 
 cmd_launch() {
-  local tag="" force="false" arg
+  local tag="" force="false" new="false" arg
   for arg; do
     case "$arg" in
       --force) force="true" ;;
-      -*) die "Unknown flag: ${arg} (launch takes <tag> [--force])" ;;
+      --new) new="true" ;;
+      -*) die "Unknown flag: ${arg} (launch takes <tag> [--force] [--new])" ;;
       *)
         if [[ -z "$tag" ]]; then tag="$arg"; else die "Unexpected arg: ${arg}"; fi
         ;;
     esac
   done
   if [[ -z "$tag" ]]; then
-    die "Usage: account-switcher launch <tag> [--force]  (e.g. primary, backup)"
+    die "Usage: account-switcher launch <tag> [--force] [--new]  (e.g. primary, backup)"
   fi
   validate_tag "$tag"
+
+  # #10: never while update holds its lock, and never a tag that is neither
+  # configured nor on disk (--new allows it). Both run before the #6 check.
+  if _update_lock_held; then die "$(_update_lock_refusal launching)"; fi
+  unknown_tag_guard "$tag" "$new" launch
 
   # #6: check the account the profile records before opening anything. A
   # MISMATCH refuses here (--force overrides); unknown proceeds with a hint.
   identity_gate "$tag" "$force" launch
+
+  # #10: one line when a staged app update has waited too long.
+  update_wait_warning
 
   local udd
   udd=$(udd_for_tag "$tag")
@@ -1553,15 +2030,70 @@ cmd_list_instances() {
   fi
   printf '\n'
 
-  printf 'Configured profiles (under "%s"):\n' "${AS_PROFILE_ROOT}/"
+  # #10: every Claude-* folder whose tag is not in [accounts] is marked
+  # unconfigured. list only reports it; it never deletes a folder.
+  printf 'Profile folders (under "%s"):\n' "${AS_PROFILE_ROOT}/"
+  local tag size note unconfigured=0
   for d in "${AS_PROFILE_ROOT}/Claude" "${AS_PROFILE_ROOT}/Claude-"*; do
     [[ -d "$d" ]] || continue
-    local tag
     tag=$("$AS_BIN_BASENAME" "$d" | "$AS_BIN_SED" 's/^Claude-//; s/^Claude$/primary/')
-    local size
     size=$("$AS_BIN_DU" -sh "$d" 2>/dev/null | "$AS_BIN_AWK" '{print $1}')
-    printf '  %-12s %s  (%s)\n' "$tag" "$d" "${size:-?}"
+    note=""
+    if [[ "$d" != "${AS_PROFILE_ROOT}/Claude" ]]; then
+      if [[ ! "$tag" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || ! tag_is_in_accounts "$tag"; then
+        note="  unconfigured"
+        unconfigured=$((unconfigured + 1))
+      fi
+    fi
+    printf '  %-12s %s  (%s)%s\n' "$tag" "$d" "${size:-?}" "$note"
   done
+  if [[ $unconfigured -gt 0 ]]; then
+    printf '\n  unconfigured: a Claude-* folder whose tag is not in [accounts]. The switcher\n'
+    printf '  never deletes one. Register it (account-switcher add-account <tag> <email>),\n'
+    printf '  or, once you are sure nothing in it is needed, trash the folder yourself.\n'
+  fi
+  printf '\n'
+
+  # #10: the one app and its updater, shared by every tag.
+  update_observe
+  printf 'App update (one app and one updater serve every tag):\n'
+  if [[ "$UPD_INSTALLED" == "unknown" ]]; then
+    printf '  installed: unknown (%s)\n' "$UPD_INSTALLED_WHY"
+  else
+    printf '  installed: %s\n' "$UPD_INSTALLED"
+  fi
+  case "$UPD_STAGED" in
+    unknown)
+      printf '  staged:    unknown (%s)\n' "$UPD_WHY"
+      printf '  waiting:   unknown\n'
+      ;;
+    none)
+      printf '  staged:    none\n'
+      ;;
+    *)
+      printf '  staged:    %s\n' "$UPD_STAGED"
+      if [[ -n "$UPD_WAIT_S" ]]; then
+        printf '  waiting:   %s (since %s)\n' "$(_fmt_duration "$UPD_WAIT_S")" "$UPD_FIRST_SEEN"
+      else
+        printf '  waiting:   unknown\n'
+      fi
+      ;;
+  esac
+  if _update_lock_held; then
+    if [[ "$UPD_LOCK_STALE" == "0" ]]; then
+      printf '  update:    running (lock %s, taken by PID %s)\n' "$UPD_LOCK_AGE" "$UPD_LOCK_PID"
+    else
+      printf '  update:    stale lock (%s, taken by PID %s): %s\n' "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$UPDATE_LOCK"
+      printf '             If no update is running, remove it: trash %s\n' "$UPDATE_LOCK"
+    fi
+  fi
+  case "$UPD_STAGED" in
+    unknown|none) ;;
+    *)
+      printf '  An update installs only when every Claude instance is closed.\n'
+      printf '  To close them, install it and reopen the same tags: account-switcher update\n'
+      ;;
+  esac
   printf '\n'
 }
 
@@ -1590,12 +2122,14 @@ cmd_swap_app() {
   local skip_handoff="false"
   local operator_note=""
   local force="false"
+  local new="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-mirror) skip_mirror="true"; shift ;;
       --no-handoff) skip_handoff="true"; shift ;;
       --force) force="true"; shift ;;
+      --new) new="true"; shift ;;
       --note)
         if [[ $# -lt 2 ]]; then
           die "Flag --note requires a value (e.g., --note \"hit primary usage limit\")"
@@ -1629,6 +2163,8 @@ Usage: account-switcher swap <tag> [flags]
                               (240 char max; not auto-redacted — operator's responsibility)
     --force                  swap even when the target's profile is recorded on
                               another account (MISMATCH; see 'identity')
+    --new                    allow a tag that is not in [accounts] and has no
+                              profile folder yet (it creates one)
 EOF
     return 1
   fi
@@ -1636,11 +2172,20 @@ EOF
   # H-1: Validate tag before any FS access.
   validate_tag "$target_tag"
 
+  # #10: never while update holds its lock, and never a tag that is neither
+  # configured nor on disk (--new allows it). Both run before the #6 check,
+  # so a refusal quits, captures and writes nothing.
+  if _update_lock_held; then die "$(_update_lock_refusal swapping)"; fi
+  unknown_tag_guard "$target_tag" "$new" swap
+
   # #6: check the account the target's profile records before anything else:
   # before the handoff capture and before the M-15 trap, so a MISMATCH
   # refusal (--force overrides) has no side effect at all and leaves the
   # running instances alone. unknown proceeds with a hint.
   identity_gate "$target_tag" "$force" swap
+
+  # #10: one line when a staged app update has waited too long.
+  update_wait_warning
 
   # M-15: Register cleanup trap before any side-effects.
   __SWAP_IN_PROGRESS="true"
@@ -2000,6 +2545,349 @@ cmd_quit() {
       die "Per-tag quit not yet supported (would require PID-to-udd matching). Use 'quit --all' or Cmd+Q in the target window."
       ;;
   esac
+}
+
+# ---- update (#10) ---------------------------------------------------------
+#
+# update [--yes] installs the staged app update on request. It lists each
+# instance it will close (tag · PID, from the exact matcher), warns that
+# scheduled tasks pause while Claude is closed, and asks (--yes skips; with
+# no terminal and no --yes it refuses). Then it takes the lock, reads
+# launchAfterInstallation, checks that the open instances are still exactly
+# the ones it listed, quits through quit_all_claude (graceful, TERM, KILL,
+# final check; it signals main processes only, never the updater's helper),
+# waits up to [update] install_timeout_s (default 120) for
+# "Installation completed successfully" stamped at or after the quit began,
+# reopens every tag that was open through open_tag_instance, prints the
+# installed version before and after, and releases the lock.
+#
+# The helper reopens the app itself when the install request asked it to
+# (launchAfterInstallation true; most completed installs did): it opens one
+# instance without --user-data-dir, which is primary. update then counts that
+# instance as primary's reopen when primary was open, reports it and leaves
+# it running when primary was not, and never launches primary a second time.
+# It also never opens a tag that is already running again.
+#
+# Exit codes, with precedence 1 > 3 > 0:
+#   0  nothing staged (nothing closed), or installed, every tag reopened
+#   1  the installed version did not change (the wait timed out, or the
+#      helper finished without changing it), or an instance would not quit;
+#      the helper log's last timestamped line is printed
+#   2  refused, or declined, before anything was closed (also bad arguments)
+#   3  installed, but a tag did not reopen in time (named)
+# History rows: QUIT_ALL (as quit writes it), one LAUNCH row per tag it opens
+# (open_tag_instance), and one UPDATE row: result, both versions, reopened.
+
+UPD_CLOSED=0
+UPD_TAGS=""
+
+_update_usage() {
+  printf 'Usage: account-switcher update [--yes]\n' >&2
+}
+
+# A refusal before anything was closed: one error line, exit 2.
+_update_refuse() {
+  printf '\033[31mERROR:\033[0m %s\n' "$*" >&2
+  exit 2
+}
+
+# The EXIT trap: releases the lock if this run took it, then refreshes the
+# record (phase idle).
+_update_on_exit() {
+  local rc=$?
+  set +e
+  trap '' INT TERM
+  if [[ "$UPD_LOCK_OWNED" == "1" ]]; then
+    _update_lock_release
+    update_observe
+  fi
+  exit "$rc"
+}
+
+# The INT/TERM trap: says what was closed and how to reopen it; the EXIT trap
+# then releases the lock.
+_update_on_signal() {
+  local t
+  trap '' INT TERM
+  printf '\nInterrupted.\n' >&2
+  if [[ "$UPD_CLOSED" == "1" && -n "$UPD_TAGS" ]]; then
+    printf "Claude was closed for the update. Once the updater's log no longer ends with 'Beginning installation', reopen each tag:\n" >&2
+    for t in $UPD_TAGS; do printf '  account-switcher launch %s\n' "$t" >&2; done
+  else
+    printf 'Nothing was closed.\n' >&2
+  fi
+  exit 130
+}
+
+_update_history() {
+  if [[ -d "$STORE" ]]; then
+    printf '[%s] UPDATE result=%s before=%s after=%s reopened=%s\n' \
+      "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" >> "$SWAP_LOG" || :
+  fi
+}
+
+# _update_reopen <lai: true|false> <installed: 1|0>: reopens every tag in
+# UPD_TAGS and sets UPD_REOPENED and UPD_MISSING. With lai true after an
+# install, primary is the helper's to reopen: update waits for it and never
+# opens it. A tag that is already running is not opened again; a tag whose
+# state can't be told is not opened either (named, for launch by hand).
+_update_reopen() {
+  local lai="$1" installed="$2" t rs pre npid helper=""
+  UPD_REOPENED=0
+  UPD_MISSING=""
+  if [[ "$lai" == "true" && "$installed" == "1" ]]; then
+    helper="$(wait_for_new_instance primary "" "$NEW_INSTANCE_WAIT_S")"
+  fi
+  if [[ -n "$UPD_TAGS" ]]; then printf 'Reopening:\n'; fi
+  for t in $UPD_TAGS; do
+    if [[ "$t" == "primary" && "$lai" == "true" && "$installed" == "1" ]]; then
+      if [[ -n "$helper" ]]; then
+        printf '  primary · PID %s (opened by the updater; not opened again)\n' "$helper"
+        UPD_REOPENED=$((UPD_REOPENED + 1))
+      else
+        printf "  primary: not seen within %s s. The updater was asked to reopen it, so update does not open it a second time; if it does not appear, run: account-switcher launch primary\n" "$NEW_INSTANCE_WAIT_S"
+        UPD_MISSING="${UPD_MISSING} primary"
+      fi
+      continue
+    fi
+    rs=0
+    is_tag_running "$t" || rs=$?
+    if [[ $rs -eq 0 ]]; then
+      printf '  %s: already running; not opened again\n' "$t"
+      UPD_REOPENED=$((UPD_REOPENED + 1))
+      continue
+    fi
+    if [[ $rs -eq 2 ]]; then
+      printf "  %s: can't tell whether it is running (an instance's tag is unknown), so it is not opened; check account-switcher list, then: account-switcher launch %s\n" "$t" "$t"
+      UPD_MISSING="${UPD_MISSING} ${t}"
+      continue
+    fi
+    pre="$(get_claude_pids)"
+    open_tag_instance "$t" "$(udd_for_tag "$t")" false
+    npid="$(wait_for_new_instance "$t" "$pre" "$NEW_INSTANCE_WAIT_S")"
+    if [[ -n "$npid" ]]; then
+      printf '  %s · PID %s\n' "$t" "$npid"
+      UPD_REOPENED=$((UPD_REOPENED + 1))
+    else
+      printf "  %s: opened, but no new instance appeared within %s s (account-switcher list)\n" "$t" "$NEW_INSTANCE_WAIT_S"
+      UPD_MISSING="${UPD_MISSING} ${t}"
+    fi
+  done
+  if [[ -n "$helper" && " ${UPD_TAGS} " != *" primary "* ]]; then
+    printf '  primary · PID %s was opened by the updater (primary was not open before); it is left running.\n' "$helper"
+  fi
+  return 0
+}
+
+cmd_update() {
+  local yes="false" arg
+  for arg; do
+    case "$arg" in
+      "") ;;
+      --yes) yes="true" ;;
+      *) _update_usage; _update_refuse "Unknown argument for update: ${arg}" ;;
+    esac
+  done
+  UPD_CLOSED=0
+  UPD_TAGS=""
+  trap _update_on_exit EXIT
+  trap _update_on_signal INT TERM
+
+  rotate_swap_log_if_needed
+
+  if _update_lock_held; then _update_refuse "$(_update_lock_refusal updating)"; fi
+
+  # What is installed and staged (the reader; nothing is closed yet).
+  update_observe
+  local before="$UPD_INSTALLED" staged="$UPD_STAGED"
+  if [[ "$before" == "unknown" ]]; then
+    _update_refuse "The installed app's version can't be read (${UPD_INSTALLED_WHY}), so update could not tell whether an install worked. Nothing was closed."
+  fi
+  case "$staged" in
+    none)
+      printf 'No update is staged (installed: %s). Nothing to install; nothing was closed.\n' "$before"
+      exit 0
+      ;;
+    unknown)
+      _update_refuse "Can't tell whether an update is staged (${UPD_WHY}). Nothing was closed."
+      ;;
+  esac
+  if _updater_log_scan "" && _updater_installing; then
+    _update_refuse "The updater is installing right now (its log's last line: ${UPD_LOG_LAST}). Nothing was closed; check again in a minute with: account-switcher list"
+  fi
+  _updater_flag
+  if [[ "$UPD_FLAG" == "unknown" ]]; then
+    _update_refuse "The updater's state file (${UPDATER_STATE_FILE}) is missing or can't be read, so no install request may be on file, and update can't tell whether the updater will reopen Claude itself. Nothing was closed. Leave Claude open for a minute (each launch files an install request), then retry."
+  fi
+
+  # 1. Each instance it will close, from the exact matcher (#9).
+  local rows st=0 pid profile method listed="" unknown=""
+  rows="$(claude_instances)" || st=$?
+  if [[ $st -ne 0 ]]; then
+    _update_refuse "The process table could not be read, so update can't name what it would close. Nothing was closed."
+  fi
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$profile" == "unknown" ]]; then unknown="${unknown} ${pid}"; continue; fi
+    listed="${listed} ${pid}"
+    case " ${UPD_TAGS} " in
+      *" ${profile} "*) ;;
+      *) UPD_TAGS="${UPD_TAGS} ${profile}" ;;
+    esac
+  done <<< "$rows"
+  UPD_TAGS="${UPD_TAGS# }"
+  local n_tags=0 t
+  for t in $UPD_TAGS; do n_tags=$((n_tags + 1)); done
+  if [[ -n "$unknown" ]]; then
+    _update_refuse "PID${unknown} runs on a profile update can't determine, so it could not reopen it. Nothing was closed; see account-switcher list, and close that window yourself first."
+  fi
+
+  printf 'Install the staged Claude update: %s installed, %s staged.\n' "$before" "$staged"
+  printf 'Every tag runs the same app, so the update installs only once every Claude instance, in every account, is closed.\n'
+  if [[ -n "$listed" ]]; then
+    printf 'It will close:\n'
+    while IFS=$'\t' read -r pid profile method; do
+      [[ -n "$pid" ]] || continue
+      printf '  %s · PID %s\n' "$profile" "$pid"
+    done <<< "$rows"
+    printf 'Work in progress in those windows may be lost. Afterwards it reopens: %s\n' "$UPD_TAGS"
+  else
+    printf 'No Claude instance is open; nothing will be closed.\n'
+  fi
+  # 2. The scheduled-task warning.
+  printf 'Scheduled tasks pause while Claude is closed.\n'
+
+  # 3. The confirmation.
+  if [[ -n "$listed" && "$yes" != "true" ]]; then
+    _signin_tty || _update_refuse "update needs a terminal to confirm the list above, or --yes. Nothing was closed."
+    if ! _signin_ask "Close them and install ${staged}?"; then
+      printf '\n'
+      printf 'Not updating; nothing was closed.\n'
+      exit 2
+    fi
+    printf '\n'
+  fi
+
+  # 4. The lock.
+  _update_lock_take || _update_refuse "Another update took the lock (${UPDATE_LOCK}) just now. Nothing was closed."
+  _update_state_write "$staged" "$before" "$UPD_FIRST_SEEN" updating "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$$"
+
+  # 5. launchAfterInstallation, read immediately before the quit.
+  _updater_flag
+  local lai="$UPD_FLAG"
+  if [[ "$lai" == "unknown" ]]; then
+    _update_refuse "The updater's state file can no longer be read, so update can't tell whether the updater will reopen Claude itself. Nothing was closed."
+  fi
+
+  # 6. The quit, only of the instances listed (and confirmed): the same
+  #    check signin --quit-others makes, immediately before quit_all_claude.
+  local now p since quit_ok=1
+  now="$(get_claude_pids)"
+  now=" ${now//$'\n'/ } "
+  for p in $listed; do
+    if [[ "$now" != *" ${p} "* ]]; then
+      _update_refuse "The open instances changed since the list (PID ${p} is gone). Nothing was closed; run update again."
+    fi
+  done
+  for p in $now; do
+    if [[ " ${listed} " != *" ${p} "* ]]; then
+      _update_refuse "The open instances changed since the list (PID ${p} was not listed). Nothing was closed; run update again."
+    fi
+  done
+  # The step's start, in local time like the helper log's stamps (see
+  # _updater_log_scan): a completion stamped at or after it counts.
+  since="$("$AS_BIN_DATE" '+%Y-%m-%d %H:%M:%S')"
+  if [[ -n "$listed" ]]; then
+    UPD_CLOSED=1
+    if ! ( quit_all_claude ); then quit_ok=0; fi
+    if [[ -d "$STORE" ]]; then
+      printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
+    fi
+  fi
+  if [[ $quit_ok -eq 0 ]]; then
+    printf '\033[31mERROR:\033[0m %s\n' "Could not close every instance (see above), so the updater can't install. Reopening what was closed." >&2
+    _update_reopen false 0
+    printf 'Installed version: %s before, %s after (nothing was installed).\n' "$before" "$before"
+    _update_history quit-failed "$before" "$before" "${UPD_REOPENED}/${n_tags}"
+    printf 'update before=%s after=%s result=quit-failed reopened=%s/%s exit=1\n' "$before" "$before" "$UPD_REOPENED" "$n_tags"
+    exit 1
+  fi
+
+  # 7. The bounded wait for the helper's completion line.
+  local timeout polls=0 done_seen=0
+  timeout="$(_update_config_int install_timeout_s "$UPDATE_TIMEOUT_DEFAULT" 10 3600)"
+  printf 'Waiting up to %s s for the updater to install %s...\n' "$timeout" "$staged"
+  while [[ $polls -lt $timeout ]]; do
+    polls=$((polls + 1))
+    if [[ -n "$AS_TEST_POLL_HOOK" ]]; then "$AS_TEST_POLL_HOOK" "$polls" || :; fi
+    if _updater_log_scan "$since" && [[ $UPD_LOG_DONE -gt 0 ]]; then
+      done_seen=1
+      break
+    fi
+    "$AS_BIN_SLEEP" 1
+  done
+
+  # The result, from the installed Info.plist: the version is the evidence.
+  local after result
+  after="$(_plist_version "$APP_INFO_PLIST")" || after="unknown"
+  _updater_log_scan "" || UPD_LOG_LAST=""
+  if [[ "$after" != "unknown" && "$after" != "$before" ]]; then
+    result="updated"
+  elif [[ $done_seen -eq 1 ]]; then
+    result="unchanged"
+  else
+    result="timeout"
+  fi
+
+  # An install still running when the wait ends: reopening now would start
+  # the app while its bundle is being replaced.
+  if [[ "$result" == "timeout" ]] && _updater_installing; then
+    printf "No 'Installation completed successfully' within %s s, and the updater's log shows an install still running:\n  %s\n" "$timeout" "$UPD_LOG_LAST"
+    printf "Not reopening while the app is being replaced. When the log shows 'Installation completed successfully' (account-switcher list shows the version), reopen each tag:\n"
+    for t in $UPD_TAGS; do printf '  account-switcher launch %s\n' "$t"; done
+    printf 'Installed version: %s before, %s after.\n' "$before" "$after"
+    _update_history timeout "$before" "$after" "0/${n_tags}"
+    printf 'update before=%s after=%s result=timeout reopened=0/%s exit=1\n' "$before" "$after" "$n_tags"
+    exit 1
+  fi
+
+  # 8. Reopen every tag that was open.
+  local installed=0
+  if [[ "$result" != "timeout" ]]; then installed=1; fi
+  _update_reopen "$lai" "$installed"
+
+  # 9. The versions, before and after.
+  printf 'Installed version: %s before, %s after.\n' "$before" "$after"
+  local code=0
+  case "$result" in
+    updated)
+      if [[ $done_seen -eq 0 ]]; then
+        warn "The installed version changed, but the updater's log shows no 'Installation completed successfully' since the update began."
+      fi
+      if [[ -n "$UPD_MISSING" ]]; then
+        code=3
+        warn "Not every tag reopened:${UPD_MISSING}. Open each with: account-switcher launch <tag>"
+      else
+        ok "Claude ${after} is installed."
+      fi
+      ;;
+    unchanged)
+      code=1
+      printf "The updater reported 'Installation completed successfully', but the installed version did not change. The updater log's last line:\n  %s\n" "${UPD_LOG_LAST:-(none)}"
+      ;;
+    *)
+      code=1
+      printf "No 'Installation completed successfully' within %s s, and the installed version did not change. The updater log's last line:\n  %s\n" "$timeout" "${UPD_LOG_LAST:-(none)}"
+      ;;
+  esac
+  _update_history "$result" "$before" "$after" "${UPD_REOPENED}/${n_tags}"
+  printf 'update before=%s after=%s result=%s reopened=%s/%s exit=%s\n' "$before" "$after" "$result" "$UPD_REOPENED" "$n_tags" "$code"
+
+  # 10. Release the lock, then refresh the record (phase idle). On any other
+  #     exit the EXIT trap does the same.
+  _update_lock_release
+  update_observe
+  exit "$code"
 }
 
 # ---- status --------------------------------------------------------------
@@ -3108,6 +3996,10 @@ cmd_signin() {
   timeout=$((10#$timeout))
   settle=$((10#$settle))
 
+  # #10: never while update holds its lock (the app bundle may be being
+  # replaced). A refusal, so exit 2 like every other one.
+  if _update_lock_held; then _signin_refuse "$(_update_lock_refusal "signing in")"; fi
+
   # signin writes history rows; rotation runs here, inside the trap.
   rotate_swap_log_if_needed
 
@@ -3424,12 +4316,22 @@ SUBCOMMANDS (Mac desktop app management):
                          Flags:
                            --no-mirror       skip step 1
                            --force           swap even on a MISMATCH
+                           --new             allow a tag that is not in
+                                             [accounts] and has no folder
 
-  launch <tag> [--force] ADDITIVE launch. Spawns target instance WITHOUT
+  launch <tag> [--force] [--new]
+                         ADDITIVE launch. Spawns target instance WITHOUT
                          quitting others. Use for running both side-by-side.
                          Runs the account check (see identity) first: on a
                          MISMATCH it refuses and opens nothing; --force
                          launches anyway, with the warning.
+                         launch and swap refuse a tag that is not in
+                         [accounts] and has no profile folder yet (a typo
+                         would create a new, empty profile), naming the
+                         configured tags and the closest match; --new
+                         allows it. They also refuse while update runs, and
+                         warn (one line) when a staged app update has waited
+                         longer than [update] warn_after_hours (default 24).
                          Then waits up to ${NEW_INSTANCE_WAIT_S} s for the new instance, brings
                          its window to the front by PID, and ends with:
                            tag=<tag> pid=<pid> front=yes|no
@@ -3503,13 +4405,38 @@ SUBCOMMANDS (Mac desktop app management):
                            - SIGKILL via PID list (last resort)
                            - Final check by PID list (die if alive).
 
+  update [--yes]         Install the staged Claude app update. Every tag
+                         runs the same app, and its updater installs only
+                         once every instance is closed. update lists each
+                         instance it will close (tag · PID), warns that
+                         scheduled tasks pause while Claude is closed, and
+                         asks (--yes skips; no terminal and no --yes
+                         refuses). It quits them through the quit path
+                         above (never the updater's helper), waits up to
+                         [update] install_timeout_s (default 120) for the
+                         install, reopens the same tags, and prints the
+                         installed version before and after. When the
+                         updater reopens primary itself, update does not
+                         open it a second time. Ends with:
+                           update before=<v> after=<v>
+                           result=<updated|unchanged|timeout|quit-failed>
+                           reopened=<n>/<m> exit=<code>
+                         Exit 0 installed (or nothing staged); 1 the
+                         version did not change (the updater log's last
+                         line is printed); 2 refused, nothing closed; 3
+                         installed, but a tag did not reopen.
+
   list (or instances)    Show running Claude desktop app instances, each with
                          its tag and how the tag was found (via=argv: its
                          --user-data-dir; via=flagless: the only instance
                          without one, primary; via=lsof: the profile folder
                          it holds open), or tag=unknown via=none when it
-                         cannot be determined; then on-disk profile dirs
-                         with sizes.
+                         cannot be determined; then on-disk profile folders
+                         with sizes, each Claude-* folder not in [accounts]
+                         marked unconfigured (never deleted); then the
+                         installed app version, the staged one (or none),
+                         and how long it has waited (unknown, never none,
+                         when the updater's files can't be read).
 
   status                 Show CLI identity (~/.claude.json + keychain
                          subscription type) + statusline marker.
@@ -3558,6 +4485,13 @@ EXAMPLES:
 
   # Cleanup
   account-switcher quit --all                 # quit all instances
+
+  # A staged app update (list shows it): close every instance, install,
+  # reopen the same tags
+  account-switcher update
+
+  # A new tag on purpose (otherwise launch refuses a tag with no folder)
+  account-switcher launch newtag --new
 
 NOTES:
   - Each non-primary user-data-dir is created on first launch, which shows the
@@ -3609,6 +4543,18 @@ main() {
         if ! ( validate_argv_safe "$_a" ); then exit 2; fi
       done
       cmd_signin "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}"
+      return 0
+      ;;
+    update)
+      # update (#10) gives exit 1 a meaning of its own (the version did not
+      # change), so, like signin, it checks its arguments here and refuses a
+      # bad one with 2 rather than through the shared check's die.
+      local _u
+      for _u; do
+        if ! ( validate_argv_safe "$_u" ); then exit 2; fi
+      done
+      shift
+      cmd_update "$@"
       return 0
       ;;
   esac

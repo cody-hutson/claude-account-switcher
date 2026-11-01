@@ -50,10 +50,10 @@ err=""
 rc=0
 
 # Commands that get the guarded pass-through fake. The interlock requires
-# the write set (RM MV CP RSYNC CHMOD INSTALL MKTEMP) to be guarded; GIT is
-# guarded as well, so no case can aim git at a path outside the scratch
-# root, the real checkout included.
-FAKE_GUARDED=" RM MV CP RSYNC CHMOD INSTALL MKTEMP GIT "
+# the write set (RM MV CP RSYNC CHMOD INSTALL MKTEMP MKDIR PLISTBUDDY PLUTIL)
+# to be guarded; GIT is guarded as well, so no case can aim git at a path
+# outside the scratch root, the real checkout included.
+FAKE_GUARDED=" RM MV CP RSYNC CHMOD INSTALL MKTEMP MKDIR PLISTBUDDY PLUTIL GIT "
 
 harness_error() {
   printf 'HARNESS ERROR (%s): %s\n' "$TEST_NAME" "$*" >&2

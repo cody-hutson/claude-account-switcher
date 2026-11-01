@@ -1,0 +1,19 @@
+2026-10-28 09:10:11.123 ShipIt[101:202] Detected this as an install request
+2026-10-28 09:10:42.456 ShipIt[101:202] Beginning installation
+ERROR: Unrecognized attribute string flag 'X' in attribute string "T,X,N" for property fake
+2026-10-28 09:10:44.789 ShipIt[101:202] Installation completed successfully
+2026-10-28 09:10:45.001 ShipIt[103:204] Detected this as a launch request
+2026-10-29 00:37:01.500 ShipIt[105:206] Detected this as an install request
+2026-10-29 00:37:18.250 ShipIt[105:206] Beginning installation
+    NSFilePath = "__HOME__/Library/Caches/com.anthropic.claudefordesktop.ShipIt/update.fake/Claude.app";
+    NSURL = "file://__HOME__/Library/Caches/com.anthropic.claudefordesktop.ShipIt/update.fake/Claude.app";
+2026-10-29 00:37:21.789 ShipIt[105:206] Installation completed successfully
+2026-10-29 00:37:22.010 ShipIt[107:208] Detected this as a launch request
+2026-10-29 12:37:33.250 ShipIt[109:210] Detected this as an install request
+ERROR: Unrecognized attribute string flag 'X' in attribute string "T,X,N" for property fake
+2026-10-30 08:02:14.600 ShipIt[111:212] Detected this as an install request
+ERROR: Unrecognized attribute string flag 'X' in attribute string "T,X,N" for property fake
+2026-10-31 11:21:05.500 ShipIt[113:214] Detected this as an install request
+ERROR: Unrecognized attribute string flag 'X' in attribute string "T,X,N" for property fake
+    NSFilePath = "__HOME__/Library/Caches/com.anthropic.claudefordesktop.ShipIt/update.fake/Claude.app";
+    NSURL = "file://__HOME__/Library/Caches/com.anthropic.claudefordesktop.ShipIt/update.fake/Claude.app";

@@ -52,13 +52,17 @@ readonly MANAGED
 # Operator-state files in ~/.claude/account-switcher/. Install never
 # overwrites them (config.toml is only created when absent) and --check never
 # opens them. prefs-sync.json is reserved for the planned profile-settings
-# sync; .DS_Store is Finder metadata.
+# sync; update-state.json is the switcher's record of the app update it saw,
+# and .update.lock the directory `update` holds while it runs; .DS_Store is
+# Finder metadata.
 OPERATOR_STATE=(
   config.toml
   swap-history.log
   swap-history.log.1
   .statusline-marker
   prefs-sync.json
+  update-state.json
+  .update.lock
   .DS_Store
 )
 readonly OPERATOR_STATE
