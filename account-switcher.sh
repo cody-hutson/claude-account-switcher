@@ -2228,7 +2228,9 @@ cmd_list_instances() {
 # Commands: swap (its target, after every instance has quit), clone-prefs
 # (its target), and `prefs` (diff, sync, review, adopt, pin, unpin, undo).
 # launch never reads or writes a settings file. Nothing deletes: no command
-# removes a settings file, a key in one, or a prior copy. Output names tags,
+# removes a settings file, a key in one, or a prior copy, with one stated
+# exception: `prefs undo <tag>` removes a key the last sync added to <tag>
+# that still holds the value that sync wrote. Output names tags,
 # key ids, allowlisted values (booleans and short strings) and counts, never
 # an account, org, session or project id, a path or an email.
 #
@@ -2740,7 +2742,11 @@ _prefs_write() {
   if [[ -n "$restore" ]]; then
     "$AS_BIN_CAT" "$restore" > "$PR_TMP" 2>/dev/null || { _prefs_rm_tmp; return 2; }
   else
-    if ! "$AS_BIN_JQ" --argjson ops "$ops" 'reduce $ops[] as $o (.; setpath($o[0]; $o[1]))' \
+    # An op whose value is the absent marker removes the key (prefs undo of a
+    # key the last sync added); allowlisted values are scalars, so the marker
+    # can't be a value.
+    if ! "$AS_BIN_JQ" --argjson ops "$ops" 'reduce $ops[] as $o (.;
+        if ($o[1] | type) == "object" and $o[1].absent == true then delpaths([$o[0]]) else setpath($o[0]; $o[1]) end)' \
         "$f" > "$PR_TMP" 2>/dev/null; then
       _prefs_rm_tmp
       return 2
@@ -3272,7 +3278,7 @@ _prefs_pin() {
 # ---- prefs undo ----------------------------------------------------------------
 
 _prefs_undo() {
-  local tag="" whole=false a rec f prev res ops ids n wrc none='{}'
+  local tag="" whole=false a rec f prev res ops ids rem="" n wrc none='{}'
   for a in "$@"; do
     case "$a" in
       --whole-file) whole=true ;;
@@ -3298,6 +3304,10 @@ _prefs_undo() {
     _prefs_write "$tag" "[]" strict keep "$prev" || wrc=$?
     [[ $wrc -eq 0 ]] || _prefs_refuse "'${tag}' was not restored: ${PR_HOLD:-its settings file could not be written}."
     ids="$(printf '%s' "${rec:-$none}" | "$AS_BIN_JQ" -r '[(.changes // {}) | keys[]] | join(",")')"
+    # The prior copy lacks a key the last sync added, so restoring it removed
+    # that key.
+    rem="$(printf '%s' "${rec:-$none}" | "$AS_BIN_JQ" -r "${PREFS_DEFS}"'
+      [(.changes // {}) | to_entries[] | select(.value.before | isabs) | .key] | join(",")')"
   else
     if [[ -z "$rec" ]]; then
       info "Nothing to undo for '${tag}': the sync state has no record of a sync that wrote it."
@@ -3306,19 +3316,24 @@ _prefs_undo() {
     case "$PR_BAD" in
       "${tag}"$'\t'*|*$'\n'"${tag}"$'\t'*) _prefs_refuse "'${tag}' has no settings file that can be read; nothing was changed." ;;
     esac
+    # Each key that still holds the value the last sync wrote is undone: back
+    # to its previous value, or, when that sync added it (its previous value
+    # is the absent marker), removed. That removal is the one exception to
+    # "nothing deletes". A key the app changed since is left alone.
     res="$("$AS_BIN_JQ" -c --argjson rec "$rec" --argjson allow "$PREFS_ALLOW" "${PREFS_DEFS}"'
       . as $d
       | [ $rec.changes | to_entries[] | .key as $id | .value as $c
           | ([$allow[] | select(.id == $id)][0]) as $k
           | select($k != null)
           | ($d | val($k.path)) as $cur
-          | if $cur == $c.after and ($c.before | isabs | not) and ($d | parentok($k.path))
-            then {id: $id, ok: true, op: [$k.path, $c.before], v: ($c.before | show)}
-            elif $cur == $c.after then {id: $id, ok: false, why: "it was added by that sync, and the switcher never removes a key"}
+          | if $cur == $c.after and ($d | parentok($k.path)) then
+              (if ($c.before | isabs) then {id: $id, ok: true, removed: true, op: [$k.path, ABS]}
+               else {id: $id, ok: true, removed: false, op: [$k.path, $c.before], v: ($c.before | show)} end)
             else {id: $id, ok: false, why: "it changed since that sync"} end ]' "$f")" \
       || _prefs_refuse "'${tag}''s settings file could not be read; nothing was changed."
     ops="$(printf '%s' "$res" | "$AS_BIN_JQ" -c '[.[] | select(.ok) | .op]')"
     ids="$(printf '%s' "$res" | "$AS_BIN_JQ" -r '[.[] | select(.ok) | .id] | join(",")')"
+    rem="$(printf '%s' "$res" | "$AS_BIN_JQ" -r '[.[] | select(.ok and .removed) | .id] | join(",")')"
     printf '%s' "$res" | "$AS_BIN_JQ" -r --arg t "$tag" '.[] | select(.ok | not) | "  Left \(.id) in \($t): \(.why)."' >&2
     if [[ "$ops" == "[]" ]]; then
       info "Nothing to undo for '${tag}': no key still holds the value the last sync wrote."
@@ -3327,24 +3342,39 @@ _prefs_undo() {
     wrc=0
     _prefs_write "$tag" "$ops" strict keep || wrc=$?
     [[ $wrc -eq 0 ]] || _prefs_refuse "'${tag}' was not changed: ${PR_HOLD:-its settings file could not be written}."
-    printf '%s' "$res" | "$AS_BIN_JQ" -r --arg t "$tag" '.[] | select(.ok) | "  Restored \(.id) in \($t) to \(.v)."' >&2
+    printf '%s' "$res" | "$AS_BIN_JQ" -r --arg t "$tag" '.[] | select(.ok)
+      | if .removed then "  Removed \(.id) from \($t): the last sync added it, and it still held the value that sync wrote."
+        else "  Restored \(.id) in \($t) to \(.v)." end' >&2
   fi
   # Undone keys need review, so the next sync neither re-applies them nor
-  # spreads the restored values as a new change; the undo record is cleared.
-  _prefs_state_write "$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --arg t "$tag" --arg ids "$ids" --arg now "$(_prefs_now)" \
-    --argjson rec "${rec:-$none}" '
+  # spreads the restored values (or a removed key's absence) as a new change;
+  # the undo record is cleared. A removed key's last-seen value becomes the
+  # plain absent marker, not the app's "removed" one, so a later review or
+  # adopt can still set it there.
+  _prefs_state_write "$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --arg t "$tag" --arg ids "$ids" --arg rem "$rem" \
+    --arg now "$(_prefs_now)" --argjson rec "${rec:-$none}" '
     ($ids | split(",") | map(select(. != ""))) as $u
+    | ($rem | split(",") | map(select(. != ""))) as $r
     | .schema = 1
     | .keys = (reduce $u[] as $id ((.keys // {});
         .[$id] = ((.[$id] // {}) + {pending: {since: $now, reason: "undo",
                    candidates: {($t): ($rec.changes[$id].before // {absent: true})}}})))
+    | .keys = (reduce $r[] as $id (.keys; .[$id].seen = ((.[$id].seen // {}) + {($t): {absent: true}})))
     | .undo = ((.undo // {}) | del(.[$t]))')" \
-    || warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the restored keys are not marked needs review."
-  n=0
-  if [[ -n "$ids" ]]; then n=$(( $(printf '%s' "$ids" | "$AS_BIN_TR" ',' '\n' | "$AS_BIN_WC" -l) + 1 )); fi
-  printf '[%s] PREFS_UNDO cmd=undo target=%s mode=%s undone=%s keys=%s\n' "$(_prefs_now)" "$tag" \
-    "$([[ "$whole" == "true" ]] && printf 'whole-file' || printf 'keys')" "$n" "${ids:-none}" >> "$SWAP_LOG"
+    || warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the undone keys are not marked needs review."
+  # Counts and key ids, never values: undone, restored (back to the previous
+  # value) and removed (the sync had added them).
+  local counts n_rst rst n_rem
+  counts="$("$AS_BIN_JQ" -rn --arg ids "$ids" --arg rem "$rem" '
+    ($ids | split(",") | map(select(. != ""))) as $u | ($rem | split(",") | map(select(. != ""))) as $r
+    | ($u - $r) as $s
+    | "\($u | length)|\($s | length)|\($s | join(","))|\($r | length)"')"
+  IFS='|' read -r n n_rst rst n_rem <<< "$counts"
+  printf '[%s] PREFS_UNDO cmd=undo target=%s mode=%s undone=%s keys=%s restored=%s restored_keys=%s removed=%s removed_keys=%s\n' \
+    "$(_prefs_now)" "$tag" "$([[ "$whole" == "true" ]] && printf 'whole-file' || printf 'keys')" "$n" "${ids:-none}" \
+    "$n_rst" "${rst:-none}" "$n_rem" "${rem:-none}" >> "$SWAP_LOG"
   if [[ "$whole" == "true" ]]; then ok "Restored the prior copy of '${tag}'; the copy is kept."; fi
+  info "Undid the last sync to '${tag}': ${n_rst} restored (${rst:-none}), ${n_rem} removed (${rem:-none})."
   if [[ -n "$ids" ]]; then
     info "Marked needs review: ${ids//,/, }. Decide with 'account-switcher prefs review' or 'prefs adopt'."
   fi
@@ -5851,8 +5881,9 @@ SUBCOMMANDS (Mac desktop app management):
                          has no history and the profiles disagree, the key
                          needs review (primary's value is proposed). Nothing
                          else in the file is ever written, and nothing is
-                         deleted. Runs at swap and on request, never at
-                         launch. Running profiles are never written.
+                         deleted, except that prefs undo removes a key the
+                         last sync added. Runs at swap and on request, never
+                         at launch. Running profiles are never written.
                            diff [--all]       every difference, with no ids
                                               or paths (read-only). Exit 0
                                               in sync, 1 not, 2 error
@@ -5880,8 +5911,12 @@ SUBCOMMANDS (Mac desktop app management):
                                               Exit 0, 2 refused
                            undo <tag> [--whole-file]
                                               reverse the last sync to <tag>,
-                                              key by key (--whole-file:
-                                              restore the prior copy, after a
+                                              key by key: a key it changed
+                                              goes back to its previous
+                                              value, a key it added is
+                                              removed; both then need review
+                                              (--whole-file: restore the
+                                              prior copy, after a
                                               confirmation). Exit 0 restored,
                                               1 nothing to restore, 2 refused
                          Without a terminal, use diff, sync, adopt, pin,

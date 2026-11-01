@@ -611,6 +611,53 @@ case_prior_copy_undo() {
   result "one prior copy, one-step undo: a write leaves exactly one .sync-prev, mode 600; undo restores only keys still holding the synced value, keeps later app changes and marks them needs review, so the next swap doesn't re-apply them; --whole-file restores the copy after a confirmation" $?
 }
 
+# join_tag_c <key-id>: tag-c joins after the seeding sync ([accounts] and a
+# profile folder), with every allowlisted key but <key-id>.
+join_tag_c() {
+  printf 'tag-c = { label = "Gamma", profile_email = "" }\n' >> "${AS_STORE}/config.toml"
+  /bin/mkdir -p "$(pdir tag-c)" || harness_error "cannot create tag-c's folder"
+  write_prof tag-c "$($JQ -c --arg k "$1" 'del(.[$k])' <<< "$G_ALL")"
+}
+
+case_undo_removes_added() {
+  local ok=0 pre
+  # A sync adds preferred-editor to tag-c, which joined without it; undo
+  # removes it again (the one exception to nothing deletes).
+  seeded
+  join_tag_c preferred-editor
+  pre="$($JQ -S . "$(pfile tag-c)")"
+  run_p prefs sync tag-c
+  [[ "$rc" == "0" && "$(gv tag-c preferred-editor)" == "code" ]] || { ok=1; printf '    sync rc=%s\n' "$rc"; }
+  [[ "$(state '.undo["tag-c"].changes["preferred-editor"].before')" == '{"absent":true}' ]] || { ok=1; printf '    the sync did not record the key as added\n'; }
+  run_p prefs undo tag-c
+  [[ "$rc" == "0" && "$(gv tag-c preferred-editor)" == "absent" ]] || { ok=1; printf '    undo rc=%s\n' "$rc"; }
+  [[ "$($JQ -S . "$(pfile tag-c)")" == "$pre" ]] || { ok=1; printf '    the file is not the pre-sync file (jq -S)\n'; }
+  [[ "$err" == *"Removed preferred-editor from tag-c: the last sync added it"* ]] || { ok=1; printf '    no removal line\n'; }
+  [[ "$err" == *"Undid the last sync to 'tag-c': 0 restored (none), 1 removed (preferred-editor)."* ]] || { ok=1; printf '    no counts line\n'; }
+  [[ "$(rows_of PREFS_UNDO)" == *"PREFS_UNDO cmd=undo target=tag-c mode=keys undone=1 keys=preferred-editor restored=0 restored_keys=none removed=1 removed_keys=preferred-editor"* ]] || { ok=1; printf '    PREFS_UNDO row: %s\n' "$(rows_of PREFS_UNDO)"; }
+  [[ "$(state '.keys["preferred-editor"].pending.reason')" == '"undo"' ]] || { ok=1; printf '    not marked needs review\n'; }
+  [[ "$(state '.keys["preferred-editor"].pending.candidates["tag-c"]')" == '{"absent":true}' ]] || { ok=1; printf '    the candidate is not the absence\n'; }
+  [[ "$(state '.keys["preferred-editor"].seen["tag-c"]')" == '{"absent":true}' ]] || { ok=1; printf '    the removal was recorded as the app removing the key\n'; }
+  # The next swap neither re-adds it nor spreads the absence.
+  export AS_FAKE_QUIT=graceful
+  run_p swap tag-c --no-handoff
+  [[ "$(gv tag-c preferred-editor)|$(gv primary preferred-editor)|$(gv tag-a preferred-editor)" == "absent|code|code" ]] || { ok=1; printf '    the next swap re-added the key or spread its absence\n'; }
+  [[ "$out$err" == *"1 needs review"* ]] || { ok=1; printf '    the swap did not report it as needing review\n'; }
+  # prefs adopt can still set it there: the removal is not the app's.
+  run_p prefs adopt preferred-editor --from primary
+  [[ "$rc" == "0" && "$(gv tag-c preferred-editor)" == "code" ]] || { ok=1; printf '    adopt did not set it again (rc=%s)\n' "$rc"; }
+  # A key the sync added that the app changed since is left alone.
+  seeded
+  join_tag_c projects-library-layout
+  run_p prefs sync tag-c
+  setg tag-c projects-library-layout '"list"'
+  run_p prefs undo tag-c
+  [[ "$rc" == "1" && "$(gv tag-c projects-library-layout)" == "list" ]] || { ok=1; printf '    changed key: rc=%s\n' "$rc"; }
+  [[ "$err" == *"Left projects-library-layout in tag-c: it changed since that sync."* ]] || { ok=1; printf '    no note for the changed key\n'; }
+  assert_eq "$ok" "0" "undo of an added key" && assert_no_ids
+  result "undo of a key the last sync added: prefs undo removes it (the file equals the pre-sync file, jq -S), says so by key id in the message and the PREFS_UNDO row, marks it needs review with its absence as the candidate (not as the app's removal), so the next swap doesn't re-add it and adopt can set it later; a key the app changed since is left alone" $?
+}
+
 case_half_written() {
   local ok=0
   seeded
@@ -802,6 +849,7 @@ case_clone_prefs
 case_read_only
 case_diff_output
 case_prior_copy_undo
+case_undo_removes_added
 case_half_written
 case_visible_logged
 case_documented

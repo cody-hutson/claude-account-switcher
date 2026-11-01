@@ -543,11 +543,13 @@ run sends every disagreement to review, never to a whole-file copy.
 | `prefs review` | after the final confirmation, updates the profiles not running | replaced in each profile written | fleet values, pins, pending keys | `PREFS_SYNC` |
 | `prefs adopt <key-id> --from <tag>` | updates that key in every unpinned profile not running | replaced in each profile written | fleet value set, pending cleared | `PREFS_SYNC` |
 | `prefs pin`, `prefs unpin` | not touched | not touched | pins | `PREFS_PIN` |
-| `prefs undo <tag> [--whole-file]` | updates `<tag>` | read for `--whole-file`, and kept | undone keys need review; undo record cleared | `PREFS_UNDO` |
+| `prefs undo <tag> [--whole-file]` | updates `<tag>`; removes a key the last sync added | read for `--whole-file`, and kept | undone keys need review; undo record cleared | `PREFS_UNDO` |
 | `quit`, `list`, `status`, `config`, `add-account`, `help` | not touched | not touched | not touched | as before |
 
 **Nothing deletes.** No command removes a profile's settings file, a key in
-it, or a prior copy. Before a write, the switcher replaces
+it, or a prior copy, with one stated exception: `prefs undo <tag>` removes a
+key that the last sync added to `<tag>` and that still holds the value that
+sync wrote (see **Undo** below). Before a write, the switcher replaces
 `claude_desktop_config.json.sync-prev` in that profile's own folder with the
 current file (mode 600): exactly one per profile, and no copy of a profile's
 settings outside its folder. Every write builds the new file inside the
@@ -588,8 +590,14 @@ profile and asks once. Without a terminal, use `prefs adopt <key-id> --from
 sync that wrote `<tag>`: each key that still holds the synced value goes back
 to its previous value, everything else in the file stays as it is now, and
 the undone keys need review, so the next `swap` neither re-applies them nor
-spreads the restored values. A key that sync added is left, since nothing
-deletes. `--whole-file` restores the prior copy, after a confirmation that
+spreads the restored values. A key that sync added (`<tag>` didn't have it)
+is removed again, the one exception to *nothing deletes*; it needs review
+too, with its absence as the candidate, so the next `swap` neither re-adds
+it nor spreads the absence, and `prefs review` or `prefs adopt` can still set
+it later (the removal is not taken as the app removing the key). A key the
+app changed since the sync is left alone. The message and the `PREFS_UNDO`
+row say how many keys were restored and how many removed, by key id.
+`--whole-file` restores the prior copy, after a confirmation that
 says changes the app made since the sync will be lost. Both refuse while
 `<tag>` is running.
 
@@ -681,7 +689,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 | `prefs review` | Decide each key that differs (needs a terminal). Exit `0`, `1` left pending or declined, `2` refused. |
 | `prefs adopt <key-id> --from <tag>` | Make `<tag>`'s value the fleet value. Exit `0`, `1` a profile skipped, `2` refused. |
 | `prefs pin <tag> <key-id>\|--all`, `prefs unpin …` | Keep a key (or a whole profile) different on purpose. Exit `0`, `2` refused. |
-| `prefs undo <tag> [--whole-file]` | Reverse the last sync to `<tag>`. Exit `0`, `1` nothing to restore, `2` refused. |
+| `prefs undo <tag> [--whole-file]` | Reverse the last sync to `<tag>`, key by key: a key it changed goes back, a key it added is removed. Exit `0`, `1` nothing to restore, `2` refused. |
 | `quit [--all]` | Quit running Claude instances. `--all` quits every instance; bare `quit` quits only the current foreground instance. Graceful → SIGTERM → SIGKILL escalation. |
 | `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. Profile folders whose tag is not in `[accounts]` are marked `unconfigured` (never deleted), and the last block shows the installed app version, the staged one (or `none`, or `unknown`) and how long it has waited. |
 | `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |
