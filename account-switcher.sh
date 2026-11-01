@@ -599,8 +599,10 @@ is_tag_running() {
 # every running check would read "nothing running". So every command whose
 # safety rests on knowing whether a profile is running (swap, quit,
 # clone-prefs, signin, update and the writing prefs verbs) refuses, before it
-# captures, quits, opens or writes anything, when that binary isn't there,
-# naming the path it expected, through its own refusal and exit code. The
+# captures, quits, opens or writes any profile, when that binary isn't there,
+# naming the path it expected, through its own refusal and exit code. (For
+# swap, quit and clone-prefs, main may trim the switcher's own history log
+# first; that touches no profile, handoff or app state.) The
 # read-only reports (list, identity, status, prefs diff, prefs sync
 # --dry-run) and launch, which uses the matcher only to find the new window
 # for its report, print one warning line and carry on. version and help read
@@ -3749,8 +3751,9 @@ EOF
   validate_tag "$target_tag"
 
   # #9: its quit and its settings step rely on detection; refuse before the
-  # handoff capture, the quit or any write when the app isn't where it looks.
-  app_binary_present || die "$(app_binary_refusal "captured, quit, opened or written")"
+  # handoff capture, the quit or any profile write when the app isn't where
+  # it looks.
+  app_binary_present || die "$(app_binary_refusal "captured, quit, opened or written to any profile")"
 
   # #10: never while update holds its lock, and never a tag that is neither
   # configured nor on disk (--new allows it). Both run before the #6 check,
@@ -3974,7 +3977,7 @@ cmd_clone_prefs() {
   validate_tag "$target_tag"
 
   # #9: its running checks rely on detection.
-  app_binary_present || die "$(app_binary_refusal "written")"
+  app_binary_present || die "$(app_binary_refusal "written to any profile")"
 
   local source_udd
   source_udd=$(udd_for_tag "$source_tag")

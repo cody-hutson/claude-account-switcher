@@ -731,8 +731,8 @@ This script keeps its file operations tightly scoped. Specifically, it:
   `/Applications/Claude.app/Contents/MacOS/Claude`. When that file isn't
   there (Claude installed somewhere else), every check would read "nothing
   running", so each command whose safety rests on knowing which profiles
-  are running refuses before it captures, quits, opens or writes anything,
-  and names the path it expected: `swap`, `quit` and `clone-prefs` (exit
+  are running refuses before it captures, quits, opens or writes any
+  profile, and names the path it expected: `swap`, `quit` and `clone-prefs` (exit
   `1`), `signin`, `update` and every writing `prefs` verb (exit `2`). The
   read-only reports (`list`, `identity`, `status`, `prefs diff`, `prefs sync
   --dry-run`) and `launch`, which never relies on detection to avoid a
