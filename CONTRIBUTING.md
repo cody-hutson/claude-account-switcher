@@ -23,6 +23,8 @@ by invitation only.
   design — real account metadata lives only in your local runtime config.
 - **Keep links valid and the shell clean.** CI runs shellcheck, actionlint, and
   gitleaks; broken or unsafe changes fail the build.
+- **Every behaviour change ships a test.** Add or extend a `tests/t-NN-*.sh`
+  case and run `bash tests/run.sh` (see `tests/README.md`).
 
 ## Making a change
 

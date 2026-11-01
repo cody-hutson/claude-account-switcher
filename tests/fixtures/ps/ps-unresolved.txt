@@ -1,0 +1,6 @@
+  PID ARGS
+  506 __APP__/Contents/MacOS/Claude --user-data-dir=__HOME__/Library/Application Support/Claude
+  501 __APP__/Contents/MacOS/Claude
+  507 __APP__/Contents/MacOS/Claude --user-data-dir=__HOME__/Library/Application Support/Claude-Bad_Tag
+  508 __APP__/Contents/MacOS/Claude --user-data-dir __HOME__/Library/Application Support/Claude-tag-b
+  511 __APP__/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=utility

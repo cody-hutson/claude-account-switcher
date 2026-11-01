@@ -1,0 +1,44 @@
+# Tests CI: the T1 simulated suite (tests/run.sh) on a macOS runner, under
+# the system /bin/bash 3.2 the script is written for. Every case runs against
+# fakes under a scratch HOME; see tests/README.md.
+# Branch protection would require the job's `name:` as a status check, so
+# keep it in sync with any required-checks configuration.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  t1:
+    name: T1 simulated suite (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The job runs pull-request code; leave no job token in the
+          # checkout's git config for it to read.
+          persist-credentials: false
+      - name: Toolchain facts
+        run: |
+          /bin/bash --version
+          command -v bash || echo "bash: not on PATH"
+          bash --version || echo "bash: does not run"
+          sw_vers
+          uname -m
+          ls -l /usr/bin/jq || echo "/usr/bin/jq: absent"
+          /usr/bin/jq --version || echo "/usr/bin/jq: does not run"
+          command -v shellcheck || echo "shellcheck: not installed"
+      - name: Parse every script with /bin/bash -n
+        run: |
+          for f in account-switcher.sh install.sh tests/run.sh tests/lib.sh tests/fakes/*.sh tests/t-*.sh; do
+            /bin/bash -n "$f"
+          done
+      - name: Run the T1 suite
+        run: /bin/bash tests/run.sh

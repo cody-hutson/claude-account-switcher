@@ -1,0 +1,7 @@
+{
+  "bundleIdentifier": "fake",
+  "launchAfterInstallation": __LAI__,
+  "targetBundleURL": "fake",
+  "updateBundleURL": "fake",
+  "useUpdateBundleName": true
+}
