@@ -428,7 +428,10 @@ through the same path as `quit` (graceful, then `TERM`, then `KILL`, then a
 final check), never signalling the updater's helper, and waits up to
 `[update] install_timeout_s` (default 120) for the install. Afterwards it
 reopens every tag that was open and prints the installed version before
-and after. When the install request asked the updater to reopen the app
+and after. If the wait ends while the updater's log still shows an install
+running, `update` reopens nothing (starting the app then would start it
+while its bundle is being replaced) and prints, per tag, the command to run
+once the install finishes (`result=timeout`, exit `1`). When the install request asked the updater to reopen the app
 itself, the updater opens `primary`; `update` counts that window as
 primary's and never opens primary a second time. It refuses, closing
 nothing, when it can't name every open instance's tag, when an install is

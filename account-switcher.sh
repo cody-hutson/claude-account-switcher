@@ -123,6 +123,13 @@ _as_test_mode_interlock() {
     ""|0|1) ;;
     *) _as_test_refuse "AS_TEST_STDOUT_IS_TTY is not 0 or 1 (got '${AS_TEST_STDOUT_IS_TTY:-}')" ;;
   esac
+
+  # 10. The settings write's extra op (#11, F-06), when set, is one JSON
+  #     array (the op [path, value]).
+  case "${AS_TEST_PREFS_EXTRA_OP:-}" in
+    ""|"["*"]") ;;
+    *) _as_test_refuse "AS_TEST_PREFS_EXTRA_OP is not a JSON array (got '${AS_TEST_PREFS_EXTRA_OP:-}')" ;;
+  esac
 }
 
 AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKDIR MKTEMP MV OD OPEN OSASCRIPT PLISTBUDDY PLUTIL PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
@@ -130,14 +137,16 @@ AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_D
 # Test-only names, honoured only in test mode like every seam name:
 # AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal (signin #7, update
 # #10, prefs #11); AS_TEST_STDOUT_IS_TTY=1 makes stdout count as one
-# (identity --show-ids, #6); and AS_TEST_POLL_HOOK names a scratch script
+# (identity --show-ids, #6); AS_TEST_POLL_HOOK names a scratch script
 # signin and update run once per poll, so a case can change the scenario
-# between polls.
+# between polls; and AS_TEST_PREFS_EXTRA_OP is one more [path, value] op the
+# settings write applies, so a case can reach its "differs outside the
+# allowlisted keys" check, which nothing else can (#11).
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
   for _n in $AS_SEAM_BINS; do unset "AS_BIN_${_n}"; done
   for _n in $AS_SEAM_ROOTS; do unset "AS_${_n}"; done
-  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
+  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK AS_TEST_PREFS_EXTRA_OP
 fi
 : "${AS_BIN_AWK:=/usr/bin/awk}"
 : "${AS_BIN_BASENAME:=/usr/bin/basename}"
@@ -195,7 +204,8 @@ readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE 
 AS_TEST_STDIN_IS_TTY="${AS_TEST_STDIN_IS_TTY:-}"
 AS_TEST_STDOUT_IS_TTY="${AS_TEST_STDOUT_IS_TTY:-}"
 AS_TEST_POLL_HOOK="${AS_TEST_POLL_HOOK:-}"
-readonly AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
+AS_TEST_PREFS_EXTRA_OP="${AS_TEST_PREFS_EXTRA_OP:-}"
+readonly AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK AS_TEST_PREFS_EXTRA_OP
 
 # ---- End of test seam -----------------------------------------------------
 
@@ -2126,15 +2136,17 @@ unknown_tag_guard() {
 # ---- launch (additive; H-1) ----------------------------------------------
 
 # open_tag_instance <tag> <user-data-dir> <first_launch: true|false>
-# The open path launch and signin (#7) share: starts a new instance for the
-# tag (primary without the flag), records the tag in the statusline marker
-# and appends the LAUNCH row.
+# The open path launch, signin (#7) and update's reopen (#10) share: starts a
+# new instance for the tag (primary without the flag), records the tag in
+# the statusline marker and appends the LAUNCH row. Returns 1, writing
+# neither, when open fails: a caller in a condition (signin, update) runs
+# with errexit off, so the status must say so itself (F-05).
 open_tag_instance() {
   local tag="$1" udd="$2" first_launch="$3"
   if [[ "$tag" == "primary" ]] || [[ "$tag" == "default" ]]; then
-    "$AS_BIN_OPEN" -n -a "Claude"
+    "$AS_BIN_OPEN" -n -a "Claude" || return 1
   else
-    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="$udd"
+    "$AS_BIN_OPEN" -n -a "Claude" --args --user-data-dir="$udd" || return 1
   fi
 
   printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
@@ -2195,7 +2207,7 @@ cmd_launch() {
   local pre_pids
   pre_pids="$(get_claude_pids)"
 
-  open_tag_instance "$tag" "$udd" "$first_launch"
+  open_tag_instance "$tag" "$udd" "$first_launch" || die "Could not open the '${tag}' instance (open failed); nothing was launched."
 
   ok "Launched. Look for the new Claude window."
 
@@ -2829,6 +2841,19 @@ _prefs_sweep_tmp() {
   return 0
 }
 
+# _prefs_test_ops <ops-json>: prints the ops, with AS_TEST_PREFS_EXTRA_OP
+# appended in test mode only. Every op the plan emits is allowlisted, so this
+# test-only op is the one way a case can reach the "differs outside the
+# allowlisted keys" check below (F-06). Outside test mode the name is fixed
+# empty, so the ops pass unchanged.
+_prefs_test_ops() {
+  if [[ "${AS_TEST_MODE:-0}" == "1" && -n "$AS_TEST_PREFS_EXTRA_OP" ]]; then
+    printf '%s' "$1" | "$AS_BIN_JQ" -c --argjson x "$AS_TEST_PREFS_EXTRA_OP" '. + [$x]'
+    return
+  fi
+  printf '%s' "$1"
+}
+
 # _prefs_write <tag> <ops-json> <swap|strict> <replace|keep> [file-to-restore]
 # The write sequence for one profile (#11, step 4):
 #   1. build the new file in a mktemp file inside the profile folder, mode
@@ -2852,6 +2877,7 @@ _prefs_write() {
   if [[ -n "$restore" ]]; then
     "$AS_BIN_CAT" "$restore" > "$PR_TMP" 2>/dev/null || { _prefs_rm_tmp; return 2; }
   else
+    ops="$(_prefs_test_ops "$ops")" || { _prefs_rm_tmp; return 2; }
     # An op whose value is the absent marker removes the key (prefs undo of a
     # key the last sync added); allowlisted values are scalars, so the marker
     # can't be a value.
@@ -4257,7 +4283,11 @@ _update_reopen() {
       continue
     fi
     pre="$(get_claude_pids)"
-    open_tag_instance "$t" "$(udd_for_tag "$t")" false
+    if ! open_tag_instance "$t" "$(udd_for_tag "$t")" false; then
+      printf "  %s: could not be opened (open failed); run: account-switcher launch %s\n" "$t" "$t"
+      UPD_MISSING="${UPD_MISSING} ${t}"
+      continue
+    fi
     npid="$(wait_for_new_instance "$t" "$pre" "$NEW_INSTANCE_WAIT_S")"
     if [[ -n "$npid" ]]; then
       printf '  %s · PID %s\n' "$t" "$npid"

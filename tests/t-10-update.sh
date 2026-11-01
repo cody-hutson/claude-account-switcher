@@ -793,6 +793,152 @@ case_install_running_refuses() {
   result "an install is running when the log's last timestamped line is 'Beginning installation' (untimestamped lines after it skipped) -> refused, exit 2; a live helper process alone is not the test" $?
 }
 
+case_timeout_install_running() {
+  # The helper begins installing on poll 2 and has not finished when the wait
+  # ends: reopening now would start the app while its bundle is replaced.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  helper_hook begin
+  run_up "" update --yes
+  assert_rc 1 &&
+    assert_eq "$(n_calls sleep $'sleep\t1')" "10" "1 s waits (install_timeout_s = 10)" &&
+    assert_contains "$out" "No 'Installation completed successfully' within 10 s, and the updater's log shows an install still running:" &&
+    assert_contains "$out" "ShipIt[115:216] Beginning installation" &&
+    assert_contains "$out" "Not reopening while the app is being replaced." &&
+    assert_contains "$out" "  account-switcher launch primary"$'\n'"  account-switcher launch tag-a" &&
+    assert_never_called open &&
+    assert_contains "$out" "update before=${OLD_V} after=${OLD_V} result=timeout reopened=0/2 exit=1" &&
+    assert_contains "$(history_text)" "UPDATE result=timeout before=${OLD_V} after=${OLD_V} reopened=0/2" &&
+    assert_helper_untouched &&
+    assert_no_lock
+  result "the wait ends with the updater's log still showing an install running -> nothing reopened, a launch command per tag, result=timeout reopened=0/2, exit 1" $?
+}
+
+# An open fake that records the call and fails (exit 1), launching nothing.
+failing_open_fake() {
+  /bin/cat > "${AS_FAKES_DIR}/open" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+line="open"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+exit 1
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/open" || harness_error "cannot chmod the open fake"
+}
+
+case_reopen_open_fails() {
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  failing_open_fake
+  helper_hook install
+  run_up "" update --yes
+  assert_rc 3 &&
+    assert_eq "$(count_lines "$(calls_of open)")" "2" "open calls" &&
+    assert_contains "$out" "  primary: could not be opened (open failed); run: account-switcher launch primary" &&
+    assert_contains "$out" "  tag-a: could not be opened (open failed); run: account-switcher launch tag-a" &&
+    assert_contains "$err" "Not every tag reopened: primary tag-a." &&
+    assert_contains "$out" "update before=${OLD_V} after=${NEW_V} result=updated reopened=0/2 exit=3" &&
+    assert_not_contains "$(history_text)" "LAUNCH tag=" &&
+    assert_no_lock
+  result "update's reopen when open fails -> each tag counted as not reopened (no LAUNCH row), the summary line, exit 3 (not an errexit stop)" $?
+}
+
+case_quit_failed() {
+  # Neither instance quits: the graceful quit closes nothing and TERM and
+  # KILL leave both alive.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  unset AS_FAKE_QUIT
+  AS_FAKE_KILL_EFFECTIVE=0
+  export AS_FAKE_KILL_EFFECTIVE
+  helper_hook install
+  run_up "" update --yes
+  unset AS_FAKE_KILL_EFFECTIVE
+  assert_rc 1 &&
+    assert_called kill $'-TERM\t501' &&
+    assert_called kill $'-KILL\t502' &&
+    assert_contains "$err" "Could not close every instance (see above), so the updater can't install. Reopening what was closed." &&
+    { [[ ! -e "${AS_TEST_ROOT}/hook-polls.txt" ]] || { printf '    update waited for the install\n'; false; }; } &&
+    assert_contains "$out" "  primary: already running; not opened again" &&
+    assert_contains "$out" "  tag-a: already running; not opened again" &&
+    assert_never_called open &&
+    assert_contains "$out" "Installed version: ${OLD_V} before, ${OLD_V} after (nothing was installed)." &&
+    assert_contains "$out" "update before=${OLD_V} after=${OLD_V} result=quit-failed reopened=2/2 exit=1" &&
+    assert_contains "$(history_text)" "UPDATE result=quit-failed before=${OLD_V} after=${OLD_V} reopened=2/2" &&
+    assert_helper_untouched &&
+    assert_no_lock
+  result "an instance that won't quit -> the quit-failed path: no install wait, the still-running tags are not opened again, result=quit-failed, exit 1" $?
+}
+
+# An osascript fake that, on the quit script, sends TERM to the switcher
+# (switcher.pid) and then quits every app, as AS_FAKE_QUIT=graceful does.
+# TERM, not INT: the switcher runs in the background here, and bash starts a
+# background command with SIGINT ignored; INT and TERM share update's
+# handler.
+osascript_fake_interrupts() {
+  /bin/cat > "${AS_FAKES_DIR}/osascript" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+line="osascript"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+quit=0
+for arg; do case "$arg" in *" to quit") quit=1 ;; esac; done
+[[ $quit -eq 1 ]] || exit 0
+i=0
+while [[ ! -s "${AS_TEST_ROOT}/switcher.pid" && $i -lt 50 ]]; do /bin/sleep 0.1; i=$((i + 1)); done
+IFS= read -r pid < "${AS_TEST_ROOT}/switcher.pid"
+kill -TERM "$pid"
+: > "${AS_TEST_ROOT}/alive.txt"
+printf '%s' "$(< "$AS_FIXTURE_PS_AFTER_QUIT")" > "$AS_FIXTURE_PS"
+exit 0
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/osascript" || harness_error "cannot chmod the osascript fake"
+}
+
+case_interrupt_during_quit() {
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  osascript_fake_interrupts
+  helper_hook install
+  local o="${AS_TEST_ROOT}/.run-out" e="${AS_TEST_ROOT}/.run-err" pid
+  (
+    cd "$AS_TEST_ROOT" || exit 2
+    _child_env
+    exec /bin/bash "$SWITCHER" update --yes
+  ) > "$o" 2> "$e" < /dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "${AS_TEST_ROOT}/switcher.pid"
+  wait "$pid"
+  rc=$?
+  _read_run "$o" "$e"
+  assert_rc 130 &&
+    assert_contains "$err" "Interrupted." &&
+    assert_contains "$err" "Claude was closed for the update. Once the updater's log no longer ends with 'Beginning installation', reopen each tag:" &&
+    assert_contains "$err" "  account-switcher launch primary"$'\n'"  account-switcher launch tag-a" &&
+    { [[ ! -e "${AS_TEST_ROOT}/hook-polls.txt" ]] || { printf '    update waited for the install\n'; false; }; } &&
+    assert_never_called open &&
+    assert_not_contains "$out" "update before=" &&
+    assert_no_lock
+  result "a stop signal (TERM) during update's quit -> update's handler: what was closed and how to reopen it, the lock released, exit 130" $?
+}
+
+case_listed_pid_gone_refuses() {
+  # tag-a (PID 502) quits by itself after the list was printed: the open
+  # instances no longer match what the operator confirmed.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  local row
+  while IFS= read -r row || [[ -n "$row" ]]; do
+    [[ "$row" == "  502 "* ]] || printf '%s\n' "$row"
+  done < "$AS_FIXTURE_PS" > "${AS_TEST_ROOT}/ps-next.txt"
+  helper_hook install
+  run_up "" update --yes
+  assert_rc 2 &&
+    assert_contains "$err" "The open instances changed since the list (PID 502 is gone). Nothing was closed; run update again." &&
+    assert_never_called osascript &&
+    assert_never_called kill &&
+    assert_no_lock &&
+    assert_not_contains "$(history_text)" "QUIT_ALL"
+  result "update's set check, the other direction: a listed PID gone before the quit refuses, exit 2, nothing closed" $?
+}
+
 case_log_line_controls() {
   # The helper log's last line carries a title-setting OSC sequence, a colour
   # sequence and a C1 CSI (UTF-8 C2 9B): update prints the line with every C0
@@ -1013,7 +1159,12 @@ case_state_not_json
 case_lai_false_reopens_primary
 case_tag_not_reopened
 case_pids_changed_refuses
+case_listed_pid_gone_refuses
 case_unlisted_during_quit
+case_timeout_install_running
+case_reopen_open_fails
+case_quit_failed
+case_interrupt_during_quit
 case_install_running_refuses
 case_log_line_controls
 case_bad_arguments

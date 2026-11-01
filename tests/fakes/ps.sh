@@ -47,11 +47,15 @@ while IFS= read -r row || [[ -n "$row" ]]; do
     first=0
     [[ $no_header -eq 1 ]] && continue
   fi
+  # A failed write (a reader that closed the pipe early) ends the fake with a
+  # non-zero status, as a real ps would end, whether SIGPIPE is fatal or
+  # ignored here (F-07): a pipeline that closes early then fails under
+  # pipefail either way.
   if [[ "$cols" == "args" || "$cols" == "args=" ]]; then
     row="${row#"${row%%[! ]*}"}"
-    printf '%s\n' "${row#* }"
+    printf '%s\n' "${row#* }" || exit 1
   else
-    printf '%s\n' "$row"
+    printf '%s\n' "$row" || exit 1
   fi
 done < "$table"
 

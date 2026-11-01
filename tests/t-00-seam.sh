@@ -51,9 +51,12 @@ run_prod_driver() {
       ro=yes
       ( AS_TEST_STDOUT_IS_TTY=1 ) 2> /dev/null && ro=no
       ( AS_TEST_STDIN_IS_TTY=1 ) 2> /dev/null && ro=no
+      ( AS_TEST_PREFS_EXTRA_OP="[]" ) 2> /dev/null && ro=no
       if _stdout_tty; then tty=yes; else tty=no; fi
-      printf "stdin=[%s] stdout=[%s] hook=[%s] readonly=%s stdout_tty=%s\n" \
-        "$AS_TEST_STDIN_IS_TTY" "$AS_TEST_STDOUT_IS_TTY" "$AS_TEST_POLL_HOOK" "$ro" "$tty"' t00-driver "$lib"
+      ops="$(_prefs_test_ops "[]")"
+      printf "stdin=[%s] stdout=[%s] hook=[%s] extra_op=[%s] readonly=%s stdout_tty=%s ops=%s\n" \
+        "$AS_TEST_STDIN_IS_TTY" "$AS_TEST_STDOUT_IS_TTY" "$AS_TEST_POLL_HOOK" "$AS_TEST_PREFS_EXTRA_OP" \
+        "$ro" "$tty" "$ops"' t00-driver "$lib"
   ) > "${AS_TEST_ROOT}/.run-out" 2> "${AS_TEST_ROOT}/.run-err" < /dev/null
   rc=$?
   _read_run "${AS_TEST_ROOT}/.run-out" "${AS_TEST_ROOT}/.run-err"
@@ -70,18 +73,19 @@ case_prod_planted_bin_ignored() {
   local hook="${AS_TEST_ROOT}/planted-hook.sh"
   printf '#!/bin/bash\nexit 0\n' > "$hook"
   /bin/chmod 755 "$hook"
-  export AS_TEST_STDIN_IS_TTY=1 AS_TEST_STDOUT_IS_TTY=1 AS_TEST_POLL_HOOK="$hook"
+  export AS_TEST_STDIN_IS_TTY=1 AS_TEST_STDOUT_IS_TTY=1 AS_TEST_POLL_HOOK="$hook" \
+    AS_TEST_PREFS_EXTRA_OP='[["preferences","bypassPermissionsModeEnabled"],true]'
   run_switcher_prod help
   local help_rc="$rc" help_out="$out"
   run_prod_driver
-  unset AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
+  unset AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK AS_TEST_PREFS_EXTRA_OP
   assert_eq "$help_rc" "0" "help exit" &&
     assert_contains "$help_out" "USAGE:" &&
     assert_contains "$help_out" "STORE:        ${HOME}/.claude/account-switcher" &&
     assert_rc 0 &&
-    assert_eq "$out" "stdin=[] stdout=[] hook=[] readonly=yes stdout_tty=no" "the test-only names in production" &&
+    assert_eq "$out" "stdin=[] stdout=[] hook=[] extra_op=[] readonly=yes stdout_tty=no ops=[]" "the test-only names in production" &&
     assert_eq "$(< "${AS_TEST_ROOT}/calls.log")" "" "calls.log"
-  result "production: planted AS_BIN_CAT, AS_STORE and test-only names (AS_TEST_STDIN_IS_TTY, AS_TEST_STDOUT_IS_TTY, AS_TEST_POLL_HOOK) are ignored: help runs the real commands, each test-only name is empty and readonly, and stdout to a file is not a terminal" $?
+  result "production: planted AS_BIN_CAT, AS_STORE and test-only names (AS_TEST_STDIN_IS_TTY, AS_TEST_STDOUT_IS_TTY, AS_TEST_POLL_HOOK, AS_TEST_PREFS_EXTRA_OP) are ignored: help runs the real commands, each test-only name is empty and readonly, stdout to a file is not a terminal, and the settings write gets no extra op" $?
 }
 
 case_prod_version() {
@@ -266,6 +270,15 @@ case_stdout_override_value() {
   result "check 9: AS_TEST_STDOUT_IS_TTY other than 0 or 1 -> 78" $?
 }
 
+case_extra_op_value() {
+  new_case
+  export AS_TEST_PREFS_EXTRA_OP='preferences.bypassPermissionsModeEnabled=true'
+  run_switcher version
+  unset AS_TEST_PREFS_EXTRA_OP
+  refused "AS_TEST_PREFS_EXTRA_OP is not a JSON array (got 'preferences.bypassPermissionsModeEnabled=true')"
+  result "check 10: AS_TEST_PREFS_EXTRA_OP that is not a JSON array -> 78" $?
+}
+
 # ---- Positive case ------------------------------------------------------------
 
 case_positive() {
@@ -361,6 +374,7 @@ case_root_outside
 case_root_dotdot
 case_keychain_default
 case_stdout_override_value
+case_extra_op_value
 case_positive
 case_kill_stray
 case_security_guard

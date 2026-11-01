@@ -742,6 +742,84 @@ case_store_modes() {
   result "a fresh scratch HOME under umask 022: the store the switcher creates is mode 700, and the history log it creates is mode 600 (the sync state, 600)" $?
 }
 
+case_outside_allowlist_guard() {
+  local ok=0 p b
+  seeded
+  setg tag-a keep-awake false
+  p="$(/usr/bin/shasum < "$(pfile primary)")"
+  b="$(/usr/bin/shasum < "$(pfile tag-b)")"
+  # The test-only extra op (F-06) adds one write outside the allowlist, a
+  # security key, to every write; the plan alone never emits one.
+  AS_TEST_PREFS_EXTRA_OP='[["preferences","bypassPermissionsModeEnabled"],"injected"]'
+  export AS_TEST_PREFS_EXTRA_OP
+  run_p prefs sync
+  unset AS_TEST_PREFS_EXTRA_OP
+  [[ "$rc" == "1" ]] || { ok=1; printf '    sync rc=%s\n' "$rc"; }
+  [[ "$err" == *"'primary': the new settings file would differ outside the allowlisted keys; not written."* \
+     && "$err" == *"'tag-b': the new settings file would differ outside the allowlisted keys; not written."* ]] || { ok=1; printf '    no refusal line\n'; }
+  assert_unchanged "$(pfile primary)" "$p" || ok=1
+  assert_unchanged "$(pfile tag-b)" "$b" || ok=1
+  [[ ! -e "$(pfile primary).sync-prev" && ! -e "$(pfile tag-b).sync-prev" ]] || { ok=1; printf '    a prior copy was made\n'; }
+  # Control: the same sync without the extra op writes both.
+  run_p prefs sync
+  [[ "$rc" == "0" && "$(gv primary keep-awake)" == "false" && "$(gv tag-b keep-awake)" == "false" ]] || { ok=1; printf '    control sync rc=%s\n' "$rc"; }
+  assert_eq "$ok" "0" "outside-allowlist guard" && assert_no_ids
+  result "the settings write's outside-allowlist comparison: a write that would also change a key outside the 8 paths (the test-only extra op) is refused, the file byte-identical and no prior copy made; without it the same sync writes (control)" $?
+}
+
+# ps_fails_fake: a ps fake that prints the table, and exits 1 printing
+# nothing once the table holds a "#PS-FAILS" line (which the graceful quit
+# installs from the after-quit table).
+ps_fails_fake() {
+  /bin/cat > "${AS_FAKES_DIR}/ps" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+line="ps"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+fail=0
+while IFS= read -r row || [[ -n "$row" ]]; do
+  [[ "$row" == "#PS-FAILS" ]] && fail=1
+done < "$AS_FIXTURE_PS"
+if [[ $fail -eq 1 ]]; then printf 'ps (fake): table unreadable\n' >&2; exit 1; fi
+first=1
+while IFS= read -r row || [[ -n "$row" ]]; do
+  if [[ $first -eq 1 ]]; then first=0; continue; fi
+  printf '%s\n' "$row" || exit 1
+done < "$AS_FIXTURE_PS"
+exit 0
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/ps" || harness_error "cannot chmod the ps fake"
+}
+
+case_swap_table_unreadable() {
+  local ok=0 p b
+  # tag-a runs; once the swap's graceful quit has closed it, the process
+  # table can't be read.
+  seeded ps-one-tag.txt
+  setg tag-a keep-awake false
+  p="$(/usr/bin/shasum < "$(pfile primary)")"
+  b="$(/usr/bin/shasum < "$(pfile tag-b)")"
+  printf '  PID ARGS\n#PS-FAILS\n' > "$AS_FIXTURE_PS_AFTER_QUIT"
+  ps_fails_fake
+  export AS_FAKE_QUIT=graceful
+  # swap primary: the settings step itself (_prefs_prepare) can't read it.
+  run_p swap primary --no-handoff
+  [[ "$rc" == "0" && "$err$out" == *"Skipping the settings step: the process table could not be read, so the switcher cannot tell which profiles are running. The swap continues."* ]] || { ok=1; printf '    swap primary rc=%s\n' "$rc"; }
+  assert_called osascript "to quit" || ok=1
+  assert_called open $'open\t-n\t-a\tClaude' || ok=1
+  assert_unchanged "$(pfile primary)" "$p" || ok=1
+  # swap tag-b: clone-prefs' running check for the target can't read it.
+  : > "${AS_TEST_ROOT}/calls.log"
+  run_p swap tag-b --no-handoff
+  [[ "$rc" == "0" && "$err$out" == *"Cannot tell whether 'tag-b' is running"* \
+     && "$err$out" == *"The settings step did not finish (see above); the swap continues."* ]] || { ok=1; printf '    swap tag-b rc=%s\n' "$rc"; }
+  assert_called open "--user-data-dir=$(pdir tag-b)" || ok=1
+  assert_unchanged "$(pfile tag-b)" "$b" || ok=1
+  assert_eq "$ok" "0" "unreadable table at the settings step" && assert_no_ids
+  result "swap when the process table can't be read at its settings step: for primary the step is skipped with a warning (_prefs_prepare), for a tag clone-prefs' running check refuses; neither profile is written and the swap still launches" $?
+}
+
 case_half_written() {
   local ok=0
   seeded
@@ -937,6 +1015,8 @@ case_undo_removes_added
 case_whole_file_lists_cs
 case_mask_shapes
 case_store_modes
+case_outside_allowlist_guard
+case_swap_table_unreadable
 case_half_written
 case_visible_logged
 case_documented

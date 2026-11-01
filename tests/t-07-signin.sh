@@ -1027,6 +1027,33 @@ FAKE
   finish_case "16c. a command that fails after the target was opened (the poll's sleep exits 1) -> the final check runs, detail=aborted, exit 3, never 1" $?
 }
 
+# An open fake that records the call and fails (exit 1), launching nothing.
+failing_open_fake() {
+  /bin/cat > "${AS_FAKES_DIR}/open" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+line="open"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+exit 1
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/open" || harness_error "cannot chmod the open fake"
+}
+
+case_16e_open_fails() {
+  scenario
+  failing_open_fake
+  run_si /dev/null signin alpha --settle 0
+  assert_rc 2 &&
+    assert_called open "--user-data-dir=$(pdir alpha)" &&
+    assert_contains "$err" "Could not open the 'alpha' instance; nothing was signed in." &&
+    assert_not_contains "$err" "No new 'alpha' instance appeared" &&
+    assert_not_contains "$(history_text)" "LAUNCH" &&
+    { [[ ! -e "${AS_STORE}/.statusline-marker" ]] || { printf '    the tag marker was written\n'; false; }; } &&
+    assert_clean
+  finish_case "16e. open fails for the target -> signin's 'could not open' refusal, exit 2, with no LAUNCH row and no tag marker written (open_tag_instance returns open's failure)" $?
+}
+
 case_16d_interrupt_before_open() {
   scenario
   corrupt beta
@@ -1446,6 +1473,7 @@ case_16_refusals
 case_16b_failure_before_open
 case_16c_failure_after_open
 case_16d_interrupt_before_open
+case_16e_open_fails
 case_17_trace
 case_18_interrupt_after_landing
 case_18b_interrupt_quiet

@@ -135,9 +135,12 @@ readonly; `t-00-seam.sh` plants each in production and shows it is ignored):
 `AS_TEST_STDIN_IS_TTY=1` makes stdin count as a terminal (`signin`,
 `update`, `prefs`); `AS_TEST_STDOUT_IS_TTY=1` makes stdout count as one, for
 `identity --show-ids`, which is terminal-only (the interlock refuses any
-value but `0` or `1`); and `AS_TEST_POLL_HOOK` names an executable under
-`AS_TEST_ROOT` (the interlock checks) that `signin` and `update` run once per
-poll, before the poll's reads, with the poll number. `t-07-signin.sh` uses the hook to change the
+value but `0` or `1`); `AS_TEST_PREFS_EXTRA_OP` is one more `[path, value]`
+op (a JSON array; the interlock checks) that the settings write applies, the
+only way a case can reach its "differs outside the allowlisted keys" check;
+and `AS_TEST_POLL_HOOK` names an executable under `AS_TEST_ROOT` (the
+interlock checks) that `signin` and `update` run once per poll, before the
+poll's reads, with the poll number. `t-07-signin.sh` uses the hook to change the
 scenario between polls, so a case whose timer is `read -t` (a terminal) can
 stage changes mid-wait as well as one whose timer is the `sleep` fake;
 `t-10-update.sh` uses it to play the updater's helper during the install
