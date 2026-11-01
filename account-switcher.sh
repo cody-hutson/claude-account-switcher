@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | signin | identity | clone-prefs | quit | update | list | status | config | add-account | version | help
+# Subcommands: swap | launch | signin | identity | clone-prefs | prefs | quit | update | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript + lsappinfo. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -194,7 +194,7 @@ readonly AS_TEST_STDIN_IS_TTY AS_TEST_POLL_HOOK
 # Bump on every change to this script. `install.sh --check` reads this line
 # from both the repo copy and the installed copy (without running either), so
 # keep it a single `readonly VERSION="..."` assignment.
-readonly VERSION="11.0.0-dev"
+readonly VERSION="11.0.0"
 
 readonly STORE="${AS_STORE}"
 readonly CLAUDE_JSON="${AS_CLAUDE_JSON}"
@@ -447,9 +447,17 @@ _resolve_by_open_files() {
 # table means no instance is running. Returns 2, printing nothing, when the
 # process table could not be read.
 claude_instances() {
-  local raw st=0 pid kind method flagless=0 argv_primary=0
+  local raw st=0
   raw="$(_claude_main_rows)" || st=$?
   [[ $st -eq 0 ]] || return 2
+  _claude_instances_from "$raw"
+}
+
+# _claude_instances_from <raw rows>: the second half of claude_instances, for
+# a caller that also needs the raw rows (the settings sync's running check,
+# #11, counts the raw FLAGLESS rows from the same read).
+_claude_instances_from() {
+  local raw="$1" pid kind method flagless=0 argv_primary=0
   while IFS=$'\t' read -r pid kind method; do
     case "$kind" in
       FLAGLESS) flagless=$((flagless + 1)) ;;
@@ -1484,6 +1492,11 @@ readonly APP_INFO_PLIST="${AS_APP_BUNDLE}/Contents/Info.plist"
 readonly UPDATE_STATE="${STORE}/update-state.json"
 readonly UPDATE_LOCK="${STORE}/.update.lock"
 readonly UPDATE_LOCK_STALE_S=600
+# Both locks (this one and the settings-sync lock of #11) go stale after 10
+# minutes.
+readonly LOCK_STALE_S=$UPDATE_LOCK_STALE_S
+readonly PREFS_STATE="${STORE}/prefs-sync.json"
+readonly PREFS_LOCK="${STORE}/.prefs-sync.lock"
 readonly UPDATE_WARN_HOURS_DEFAULT=24
 readonly UPDATE_TIMEOUT_DEFAULT=120
 readonly AS_VERSION_RE='^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$'
@@ -1505,7 +1518,10 @@ UPD_FLAG="unknown"
 UPD_LOG_LAST=""
 UPD_LOG_SEED=""
 UPD_LOG_DONE=0
-UPD_LOCK_OWNED=0
+LOCK_OWNED=""
+LOCK_STALE=1
+LOCK_AGE=""
+LOCK_PID=""
 
 # _plist_version <Info.plist>: prints its CFBundleShortVersionString and
 # returns 0, or prints nothing and returns 1 (absent, unreadable, no such
@@ -1795,7 +1811,10 @@ update_wait_warning() {
 # before it closes anything and releases it last (also from its EXIT trap);
 # launch, swap and signin refuse while it exists, so the switcher never
 # starts the app while its bundle may be being replaced. (Opening Claude from
-# the Dock is not stopped.)
+# the Dock is not stopped.) The settings-sync lock (#11, PREFS_LOCK) is the
+# same kind of directory, taken by every command that writes a profile's
+# settings or the sync state. The helpers below take the lock's path, so the
+# two locks are one implementation and behave alike.
 #
 # A lock older than 10 minutes is reported as stale, with its remedy, and
 # still refuses. The switcher never removes a lock it did not take: age
@@ -1804,62 +1823,98 @@ update_wait_warning() {
 # the lock exists to prevent. The operator checks, then removes it with
 # trash.
 
-# Returns 0 and sets UPD_LOCK_STALE (1 or 0), UPD_LOCK_AGE (text) and
-# UPD_LOCK_PID when the lock exists; returns 1 otherwise. Builtins only
+# _lock_held <dir>: returns 0 and sets LOCK_STALE (1 or 0), LOCK_AGE (text)
+# and LOCK_PID when the lock exists; returns 1 otherwise. Builtins only
 # until a lock is found.
-_update_lock_held() {
-  local line="" ep="" now="" age="" re='^pid=([0-9]+) started_epoch=([0-9]+) '
-  UPD_LOCK_STALE=1
-  UPD_LOCK_AGE="of unknown age"
-  UPD_LOCK_PID="unknown"
-  [[ -d "$UPDATE_LOCK" ]] || return 1
-  if [[ -f "${UPDATE_LOCK}/owner" && -r "${UPDATE_LOCK}/owner" ]]; then
-    { IFS= read -r line || :; } < "${UPDATE_LOCK}/owner"
+_lock_held() {
+  local dir="$1" line="" ep="" now="" age="" re='^pid=([0-9]+) started_epoch=([0-9]+) '
+  LOCK_STALE=1
+  LOCK_AGE="of unknown age"
+  LOCK_PID="unknown"
+  [[ -d "$dir" ]] || return 1
+  if [[ -f "${dir}/owner" && -r "${dir}/owner" ]]; then
+    { IFS= read -r line || :; } < "${dir}/owner"
   fi
   if [[ "${line} " =~ $re ]]; then
-    UPD_LOCK_PID="${BASH_REMATCH[1]}"
+    LOCK_PID="${BASH_REMATCH[1]}"
     ep="${BASH_REMATCH[2]}"
   fi
   now="$("$AS_BIN_DATE" +%s 2>/dev/null)" || now=""
   if [[ -n "$ep" && "$now" =~ ^[0-9]+$ ]]; then
     age=$((now - ep))
     if [[ $age -lt 0 ]]; then age=0; fi
-    UPD_LOCK_AGE="$(_fmt_duration "$age") old"
-    if [[ $age -le $UPDATE_LOCK_STALE_S ]]; then UPD_LOCK_STALE=0; fi
+    LOCK_AGE="$(_fmt_duration "$age") old"
+    if [[ $age -le $LOCK_STALE_S ]]; then LOCK_STALE=0; fi
   fi
   return 0
 }
 
-# _update_lock_refusal <doing>: the refusal text for a held lock (call it
-# after _update_lock_held returned 0); <doing> is e.g. "launching".
-_update_lock_refusal() {
-  if [[ "$UPD_LOCK_STALE" == "0" ]]; then
+# _lock_refusal <dir> <doing>: the refusal text for a held lock (call it
+# after _lock_held returned 0); <doing> is e.g. "launching". The update lock
+# is named by its path, as slice 7 prints it; the settings-sync lock by its
+# path under ~, because settings output never prints an absolute path.
+_lock_refusal() {
+  local dir="$1" shown
+  if [[ "$dir" == "$PREFS_LOCK" ]]; then
+    shown="$(_tilde_path "$dir")"
+    if [[ "$LOCK_STALE" == "0" ]]; then
+      printf "A settings sync is running (the lock %s is %s, taken by PID %s). Not %s while it may be writing a profile's settings; wait for it to finish, then run the command again." \
+        "$shown" "$LOCK_AGE" "$LOCK_PID" "$2"
+    else
+      printf "The settings-sync lock %s is %s (taken by PID %s), past the 10-minute limit, so it is probably left from a sync that stopped. Not %s. The switcher never removes a lock it did not take. If no swap, clone-prefs or prefs command is running, remove it: trash %s" \
+        "$shown" "$LOCK_AGE" "$LOCK_PID" "$2" "$shown"
+    fi
+    return 0
+  fi
+  if [[ "$LOCK_STALE" == "0" ]]; then
     printf 'An update is running (the lock %s is %s, taken by PID %s). Not %s while the app bundle may be being replaced; wait for account-switcher update to finish.' \
-      "$UPDATE_LOCK" "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$1"
+      "$dir" "$LOCK_AGE" "$LOCK_PID" "$2"
   else
     printf "The update lock %s is %s (taken by PID %s), past the 10-minute limit, so it is probably left from an update that stopped. Not %s. The switcher never removes a lock it did not take. If no update is running (the updater's log does not end with 'Beginning installation'; account-switcher list shows the versions), remove it: trash %s" \
-      "$UPDATE_LOCK" "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$1" "$UPDATE_LOCK"
+      "$dir" "$LOCK_AGE" "$LOCK_PID" "$2" "$dir"
   fi
 }
 
-# Takes the lock for this run, or returns 1 when it exists.
-_update_lock_take() {
-  "$AS_BIN_MKDIR" -m 700 "$UPDATE_LOCK" 2>/dev/null || return 1
-  UPD_LOCK_OWNED=1
+# _lock_take <dir>: takes the lock for this run, or returns 1 when it exists
+# (or cannot be made). A run holds at most one lock at a time.
+_lock_take() {
+  "$AS_BIN_MKDIR" -m 700 "$1" 2>/dev/null || return 1
+  LOCK_OWNED="$1"
   printf 'pid=%s started_epoch=%s started_utc=%s\n' "$$" "$("$AS_BIN_DATE" +%s)" \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" > "${UPDATE_LOCK}/owner" || :
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" > "${1}/owner" || :
   return 0
 }
 
 # Releases the lock, only when this run took it.
-_update_lock_release() {
-  [[ "$UPD_LOCK_OWNED" == "1" ]] || return 0
-  UPD_LOCK_OWNED=0
-  "$AS_BIN_RM" -f "${UPDATE_LOCK}/owner" 2>/dev/null || :
-  if ! "$AS_BIN_RM" -d "$UPDATE_LOCK" 2>/dev/null; then
-    warn "Could not remove the update lock ${UPDATE_LOCK}; remove it with: trash ${UPDATE_LOCK}"
+_lock_release() {
+  local dir="$LOCK_OWNED"
+  [[ -n "$dir" ]] || return 0
+  LOCK_OWNED=""
+  "$AS_BIN_RM" -f "${dir}/owner" 2>/dev/null || :
+  if ! "$AS_BIN_RM" -d "$dir" 2>/dev/null; then
+    if [[ "$dir" == "$PREFS_LOCK" ]]; then
+      warn "Could not remove the settings-sync lock $(_tilde_path "$dir"); remove it with: trash $(_tilde_path "$dir")"
+    else
+      warn "Could not remove the update lock ${dir}; remove it with: trash ${dir}"
+    fi
   fi
   return 0
+}
+
+# The update lock's names for the helpers above.
+_update_lock_held() { _lock_held "$UPDATE_LOCK"; }
+_update_lock_refusal() { _lock_refusal "$UPDATE_LOCK" "$1"; }
+_update_lock_take() { _lock_take "$UPDATE_LOCK"; }
+_update_lock_release() { _lock_release; }
+
+# _tilde_path <path>: the path with a leading $HOME written as ~.
+_tilde_path() {
+  # A literal ~ is the point here (display text), so SC2088 does not apply.
+  # shellcheck disable=SC2088
+  case "$1" in
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
 # ---- The unknown-tag guard (#10) ------------------------------------------
@@ -2080,10 +2135,10 @@ cmd_list_instances() {
       ;;
   esac
   if _update_lock_held; then
-    if [[ "$UPD_LOCK_STALE" == "0" ]]; then
-      printf '  update:    running (lock %s, taken by PID %s)\n' "$UPD_LOCK_AGE" "$UPD_LOCK_PID"
+    if [[ "$LOCK_STALE" == "0" ]]; then
+      printf '  update:    running (lock %s, taken by PID %s)\n' "$LOCK_AGE" "$LOCK_PID"
     else
-      printf '  update:    stale lock (%s, taken by PID %s): %s\n' "$UPD_LOCK_AGE" "$UPD_LOCK_PID" "$UPDATE_LOCK"
+      printf '  update:    stale lock (%s, taken by PID %s): %s\n' "$LOCK_AGE" "$LOCK_PID" "$UPDATE_LOCK"
       printf '             If no update is running, remove it: trash %s\n' "$UPDATE_LOCK"
     fi
   fi
@@ -2097,13 +2152,1273 @@ cmd_list_instances() {
   printf '\n'
 }
 
-# ---- swap (3-step: clone-prefs → quit → launch; H-1, M-15) ---------------
+# ---- Settings sync between profiles (#11) ---------------------------------
+#
+# Each profile keeps its own claude_desktop_config.json. The switcher keeps a
+# short allowlist of global UI preferences (class G, PREFS_ALLOW) consistent
+# across the participating profiles, one key at a time, and never writes
+# anything else in the file. A value is chosen per key by change memory (the
+# value the switcher last saw in each profile, kept in PREFS_STATE), latest
+# wins (a change seen in one profile becomes the fleet value) and defaults
+# from primary (proposed in review when a key has no history and the profiles
+# disagree). Two different changes first seen in the same run have no known
+# order, so the key goes to review instead. The rules engine is one jq
+# program, PREFS_PLAN_JQ; bash 3.2 has no associative arrays, so no per-key
+# logic lives in bash. Keys are addressed by path arrays passed with
+# --argjson and read with getpath/setpath, never by a dotted jq path: many
+# names under epitaxyPrefs are flat names that contain dots.
+#
+# Commands: swap (its target, after every instance has quit), clone-prefs
+# (its target), and `prefs` (diff, sync, review, adopt, pin, unpin, undo).
+# launch never reads or writes a settings file. Nothing deletes: no command
+# removes a settings file, a key in one, or a prior copy. Output names tags,
+# key ids, allowlisted values (booleans and short strings) and counts, never
+# an account, org, session or project id, a path or an email.
+#
+# Participating profiles: primary plus every [accounts] tag whose profile
+# folder exists (default is primary). A profile is running when a row of
+# claude_instances resolves to it. Every write re-checks that just before its
+# rename. Every command but swap writes nothing, and says why, when more than
+# one main process has no --user-data-dir (the raw FLAGLESS class), when a
+# row reads unknown, or when the process table cannot be read; swap runs its
+# settings step after every instance has quit, so only the per-write re-check
+# applies to it, and it skips the step with a warning when the table cannot
+# be read.
+
+readonly PREFS_FILE="claude_desktop_config.json"
+readonly PREFS_TMP_PREFIX=".as-prefs-tmp."
+
+# Class G, the allowlist: the only paths the switcher ever writes. Each path
+# is an array of literal key names.
+readonly PREFS_ALLOW='[
+  {"id":"sidebar-mode","path":["preferences","sidebarMode"],"type":"string"},
+  {"id":"keep-awake","path":["preferences","keepAwakeEnabled"],"type":"boolean"},
+  {"id":"preferred-browser","path":["preferences","coworkPreferredBrowser"],"type":"string"},
+  {"id":"new-session-worktree","path":["preferences","epitaxyPrefs","cc-landing-worktree-enabled"],"type":"boolean"},
+  {"id":"transcript-links-in-preview","path":["preferences","epitaxyPrefs","epitaxy-transcript-links-in-preview"],"type":"boolean"},
+  {"id":"preferred-editor","path":["preferences","epitaxyPrefs","claude-code-preferred-editor"],"type":"string"},
+  {"id":"projects-library-layout","path":["preferences","epitaxyPrefs","projects.library.layout"],"type":"string"},
+  {"id":"projects-library-small-icons","path":["preferences","epitaxyPrefs","projects.library.smallIcons"],"type":"boolean"}
+]'
+
+# The exact-name classes, per family level: "top" (a top-level key),
+# "pref" (a child of preferences) and "epx" (a child of
+# preferences.epitaxyPrefs). G names come from PREFS_ALLOW. C capability
+# toggles, S security or policy, L profile-local, and A the account-keyed
+# maps; A and L also match by shape (PREFS_DEFS classify), and anything left
+# is U, unclassified, which is never written.
+readonly PREFS_CLASSES='{
+  "top": {"coworkUserFilesPath":"L"},
+  "pref": {
+    "chromeExtensionEnabled":"C","coworkBrowserToolsEnabled":"C","coworkWebSearchEnabled":"C",
+    "bypassPermissionsModeEnabled":"S","allowAllBrowserActions":"S","localAgentModeTrustedFolders":"S",
+    "launchPreviewAllowedOrigins":"S","ccRemoteControlDefaultEnabled":"S","remoteControlPinnedFolders":"S",
+    "remoteControlExcludedFolders":"S","ccdScheduledTasksEnabled":"S","coworkScheduledTasksEnabled":"S",
+    "coworkHipaaRestricted":"S","orgWorkAcrossAppsDisabled":"S",
+    "chromeExtension":"L","remoteToolsDeviceName":"L","coworkLegacyRootGrantsPruned":"L",
+    "launchChromeImportPrompt":"L","launchPreviewPersistedWorkspaces":"L",
+    "launchPreviewSessionScopedSessions":"L","remoteSessionFolderGrants":"L",
+    "bypassPermissionsGateByAccount":"A","coworkModelAutoFallbackByAccount":"A"},
+  "epx": {
+    "cc-landing-draft-permission-mode":"S",
+    "ccd-sessions-filter":"L","closedWidgetTools":"L","code-sessions-status-filter":"L",
+    "desktop-frame.paneStore.v1":"L","dframe-local-slice":"L","epitaxy-files-tree-width":"L",
+    "epitaxy-serene-whistle-decided":"L","epitaxy-split-suggestion":"L",
+    "epitaxy-transcript-links-chooser-seen":"L","projects.library.guidanceDismissed":"L",
+    "projects.overviewColumnFlex":"L","projects.retiredAntPicksCleared":"L","starred-cowork-spaces":"L",
+    "starred-local-code-sessions":"L","starred-local-routines":"L","starred-session-groups":"L",
+    "dframe-code-sections":"A","dframe-group-scopes":"A"}
+}'
+
+# Shared jq definitions. ABS marks a key a profile does not hold; allowlisted
+# values are always scalars, so the marker cannot collide with a value.
+readonly PREFS_DEFS='
+def ABS: {"absent": true};
+def isabs: type == "object" and .absent == true;
+def among($a): . as $x | any($a[]; . == $x);
+def haspath($p):
+  if ($p | length) == 0 then true
+  elif type == "object" and has($p[0]) then (.[$p[0]] | haspath($p[1:]))
+  else false end;
+def parentok($p): (try getpath($p[:-1]) catch null) | type == "object";
+def val($p): if haspath($p) then getpath($p) else ABS end;
+def allsame: (map(.cur | tojson) | unique | length) == 1;
+def UUID: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+def mask: gsub(UUID; "<id>") | gsub("session_[A-Za-z0-9_-]+"; "<session-id>")
+  | gsub("[^ \"<>]+@[^ \"<>]+"; "<email>") | gsub("[0-9a-fA-F-]{12,}"; "<id>") | gsub("/[^ \"<>]*"; "<path>");
+def show:
+  if isabs then "absent"
+  elif type == "boolean" or type == "number" or type == "null" then tojson
+  elif type == "array" or type == "object" then "\(length) \(if length == 1 then "entry" else "entries" end)"
+  elif (length <= 40) and test("^[A-Za-z0-9 ._:+-]*$") and (mask == .) then tojson
+  else "<masked>" end;
+'
+
+# The rules engine. Input: the readable profiles' files (in $m.readable
+# order) and $m: allow, state, readable, named (the profiles this command may
+# write), running, now, and optionally pins (in place of the state's),
+# decisions ({key-id: {value, by, from}}: review and adopt) and only_decided
+# (leave every other key untouched). Output: one plan entry per key with its
+# status, fleet value, writes (tags), held (tags named but not written, and
+# why), kept (pinned tags), and the per-profile records.
+#   status: type (a value's type differs in some profile: left alone),
+#   unset (no profile holds it), init (no history, all agree), review
+#   (pending), agreed (pending, but every unpinned profile agrees again),
+#   steady (no profile changed it), latest (changes, all to one value),
+#   decided (set by review or adopt), untouched.
+readonly PREFS_PLAN_JQ='
+[inputs] as $docs
+| ($m.state.keys // {}) as $keys
+| ($m.pins // $m.state.pins // {}) as $pins
+| [range(0; $m.readable | length) as $i | {tag: $m.readable[$i], doc: $docs[$i]}] as $profs
+| { now: $m.now,
+    keys: [ $m.allow[] as $k
+      | ($keys[$k.id] // null) as $e
+      | (($m.decisions // {})[$k.id] // null) as $dec
+      | if ($m.only_decided == true) and $dec == null then
+          {id: $k.id, path: $k.path, status: "untouched", entry: $e, recs: [], writes: [], held: [], kept: []}
+        else
+          [ $profs[] as $p
+            | ($p.doc | val($k.path)) as $cur
+            | (($e.seen // {}) | has($p.tag)) as $sh
+            | (if $sh then $e.seen[$p.tag] else null end) as $sv
+            | ($sh and ($sv | type) == "object") as $sabs
+            | {tag: $p.tag, cur: $cur, absent: ($cur | isabs),
+               pinned: (($pins[$p.tag] // []) | any(.[]; . == $k.id or . == "*")),
+               parentok: ($p.doc | parentok($k.path)),
+               typeok: (($cur | isabs) or (($cur | type) == $k.type)),
+               changed: (if ($sh | not) then false elif ($cur | isabs) then false
+                         elif $sabs then true else $cur != $sv end),
+               removed: (($cur | isabs) and $sh and (($sabs | not) or ($sv.removed == true)))}
+          ] as $recs
+          | ($recs | map(select(.pinned | not))) as $U
+          | ($e != null and ($e | has("fleet"))) as $hasfleet
+          | ($e.pending // null) as $pend
+          | (if any($recs[]; .typeok | not) then {status: "type"}
+             elif $dec != null then {status: "decided", fleet: $dec.value, by: $dec.by, from: $dec.from}
+             elif $pend != null then
+               (if ($U | length) > 0 and all($U[]; .absent | not) and ($U | allsame)
+                then {status: "agreed", fleet: $U[0].cur, by: (if $hasfleet then "latest" else "init" end)}
+                else {status: "review", reason: $pend.reason} end)
+             elif ($hasfleet | not) then
+               ($U | map(select(.absent | not))) as $present
+               | if ($U | length) > 0 and ($present | length) == ($U | length) and ($U | allsame)
+                 then {status: "init", fleet: $U[0].cur, by: "init"}
+                 elif ($present | length) == 0 then {status: "unset"}
+                 else {status: "review", reason: "init"} end
+             else
+               ($U | map(select(.changed))) as $C
+               | if ($C | length) == 0 then {status: "steady", fleet: $e.fleet}
+                 elif ($C | allsame) then {status: "latest", fleet: $C[0].cur, by: "latest", from: ($C | map(.tag) | join(","))}
+                 else {status: "review", reason: "conflict"} end
+             end) as $r
+          | (($r.status | among(["type", "review", "unset"])) | not) as $settled
+          | (if $settled then [$U[] | select((.removed | not) and (.cur != $r.fleet))] else [] end) as $targets
+          | [$targets[] | select((.tag | among($m.named)) and ((.tag | among($m.running)) | not) and .parentok) | .tag] as $writes
+          | [$targets[] | select(.tag | among($m.named)) | select((.tag | among($writes)) | not)
+             | {tag, why: (if (.tag | among($m.running)) then "running" else "no-parent" end)}] as $held
+          | (if $settled then [$recs[] | select(.pinned and (.tag | among($m.named)) and (.cur != $r.fleet)) | .tag] else [] end) as $kept
+          | ($recs | map(select(.tag == "primary" and (.absent | not))) | .[0].cur) as $prim
+          | {id: $k.id, path: $k.path, type: $k.type, status: $r.status, entry: $e,
+             fleet: (if $settled then $r.fleet else $e.fleet end),
+             hasfleet: ($settled or $hasfleet),
+             decided: (if ($r.status | among(["init", "agreed", "latest", "decided"])) then
+                         {at: $m.now, by: $r.by} + (if $r.from then {from: $r.from} else {} end)
+                       elif $settled then $e.decided else null end),
+             pending: (if $r.status == "review" then
+                         {since: ($pend.since // $m.now), reason: ($pend.reason // $r.reason),
+                          candidates: ($U | map({(.tag): .cur}) | add // {})}
+                       else null end),
+             proposed: (if ($r.status == "review") and ($hasfleet | not) then $prim else null end),
+             from: $r.from, recs: $recs, writes: $writes, held: $held, kept: $kept,
+             pinchanged: (($r.status == "steady") and any($recs[]; .pinned and .changed))}
+        end ] }
+'
+
+# The new sync state from a plan and the profiles actually written ($m.plan,
+# $m.written, $m.readable, $m.state, optionally $m.pins). A settled key
+# records each readable profile's value as it now is; a pending key keeps its
+# last-seen values, so the competing changes stay visible. A removed key is
+# recorded {"absent": true, "removed": true}, so it is never re-added; one a
+# profile never had, {"absent": true}. The undo record of each written
+# profile is replaced by this write's before/after values.
+readonly PREFS_COMMIT_JQ='
+$m.plan as $p
+| ($m.state // {}) as $st
+| $m.written as $w
+| $m.readable as $rd
+| {schema: 1,
+   keys: (reduce $p.keys[] as $k (($st.keys // {});
+     if ($k.status | among(["untouched", "type", "unset"])) then .
+     elif $k.status == "review" then .[$k.id] = (($k.entry // {}) + {pending: $k.pending})
+     else
+       [$k.writes[] | select(among($w))] as $done
+       | .[$k.id] = {fleet: $k.fleet, decided: $k.decided, pending: null,
+           seen: ((($k.entry.seen // {}) | with_entries(select((.key | among($rd)) | not)))
+                  + ([$k.recs[] | {(.tag): (if (.tag | among($done)) then $k.fleet
+                                            elif .absent then (if .removed then {absent: true, removed: true} else ABS end)
+                                            else .cur end)}] | add // {}))}
+     end)),
+   pins: ($m.pins // $st.pins // {}),
+   undo: (($st.undo // {}) + ([$w[] as $t
+           | {($t): {at: $p.now, changes: ([$p.keys[] | . as $k | select($k.writes | any(.[]; . == $t))
+               | {($k.id): {before: ($k.recs[] | select(.tag == $t) | .cur), after: $k.fleet}}] | add // {})}}]
+         | add // {}))}
+'
+
+# The class report for prefs diff: C and S families that differ, per-profile
+# counts of account-keyed (A) and local (L) entries, and U families by masked
+# name. $m: classes, allow, tags (in file order), extra (tags that do not
+# participate, read for --all), all.
+readonly PREFS_REPORT_JQ='
+[inputs] as $docs
+| ($m.classes | .pref += ([$m.allow[] | select(.path | length == 2) | {(.path[1]): "G"}] | add)
+               | .epx += ([$m.allow[] | select(.path | length == 3) | {(.path[2]): "G"}] | add)) as $X
+| def acct_ids($k): [$k | scan(UUID)][0:1];
+  def classify($lvl; $name; $v):
+    ($X[$lvl][$name] // null) as $x
+    | if $x == "A" then {class: "A", fam: $name,
+          n: (if ($v | type) == "object" then ($v | length) else 1 end),
+          ids: (if ($v | type) == "object" then [$v | keys[] | acct_ids(.)[]] else [] end)}
+      elif $x != null then {class: $x, fam: $name, n: 1, ids: []}
+      elif ($name | test("^" + UUID + "$")) then {class: "A", fam: "<account-id>", n: 1, ids: [$name]}
+      elif ($name | test("\\." + UUID + "$")) then
+        {class: "A", fam: ((($name | sub("\\." + UUID + "$"; "")) | mask) + ".<account-id>"), n: 1,
+         ids: [$name | scan(UUID)][-1:]}
+      elif ($v | type) == "object" and ($v | length) > 0
+           and all($v | keys[]; test("^" + UUID + "(/" + UUID + ")?$")) then
+        {class: "A", fam: ($name | mask), n: ($v | length), ids: [$v | keys[] | acct_ids(.)[]]}
+      elif ($name | test(UUID)) or ($name | test("session_|local_|/|remote:"))
+           or ($name | test("^projects\\.[^.]+\\.overviewPaneOpen$")) then
+        {class: "L", fam: ($name | mask), n: 1, ids: []}
+      else {class: "U", fam: ($name | mask), n: 1, ids: []} end;
+  def families:
+    . as $d
+    | [ ($d | to_entries[] | select(.key != "preferences") | classify("top"; .key; .value) + {k: "top/\(.key)", v: .value}),
+        (if ($d.preferences | type) == "object" then
+           ($d.preferences | to_entries[] | select(.key != "epitaxyPrefs") | classify("pref"; .key; .value) + {k: "pref/\(.key)", v: .value}),
+           (if ($d.preferences.epitaxyPrefs | type) == "object" then
+              ($d.preferences.epitaxyPrefs | to_entries[] | classify("epx"; .key; .value) + {k: "epx/\(.key)", v: .value})
+            else empty end)
+         elif $d | has("preferences") then {class: "U", fam: "preferences", n: 1, ids: [], k: "top/preferences", v: null}
+         else empty end) ];
+  [range(0; $m.tags | length) as $i | {tag: $m.tags[$i], extra: ($m.tags[$i] | among($m.extra)), fams: ($docs[$i] | families)}] as $P
+| ([$P[] | select(.extra | not)]) as $Pp
+| (if $m.all then $P else $Pp end) as $Ps
+| [ ($Pp | [.[].fams[] | select(.class == "C" or .class == "S") | {k, class, fam}] | unique_by(.k))[] as $f
+    | [$Pp[] | . as $p | {tag: $p.tag, v: ([$p.fams[] | select(.k == $f.k) | .v] | if length == 0 then ABS else .[0] end)}] as $vals
+    | select($m.all or (($vals | map(.v | tojson) | unique | length) > 1))
+    | "  \($f.fam) (\($f.class)): " + ([$vals[] | "\(.tag)=\(.v | show)"] | join(", ")) ] as $cs
+| [ $Ps[] | . as $p
+    | ([$p.fams[] | select(.class == "A")]) as $a
+    | "  \($p.tag)\(if $p.extra then " (not synced)" else "" end): \([$a[].n] | add // 0) account-keyed entries for \([$a[].ids[]] | unique | length) account(s), \([$p.fams[] | select(.class == "L")] | length) local entries" ] as $counts
+| [ ($Ps | [.[] | . as $p | $p.fams[] | select(.class == "U") | {fam, tag: $p.tag}] | group_by(.fam))[]
+    | "  \(.[0].fam) (in \(map(.tag) | unique | join(", ")))" ] as $us
+| {cs: $cs, counts: $counts, us: $us}
+'
+
+# The synced-key lines of prefs diff, and whether everything is in sync, from
+# a plan made for every participating profile with nothing running.
+readonly PREFS_TABLE_JQ='
+.keys | [ .[] as $k
+  | ([$k.writes[], ($k.held[] | .tag)]) as $behind
+  | ($k.entry != null and ($k.entry | has("fleet"))) as $hf
+  | ($k.status == "unset" or $k.status == "init" or ($k.status == "steady" and ($behind | length) == 0)) as $ok
+  | (if $k.status == "type" then "type differs in a profile: left alone"
+     elif $k.status == "review" then "needs review"
+       + (if $hf then "" elif $k.proposed != null then " (proposed: primary'"'"'s \($k.proposed | show))"
+          else " (no default: primary has no value)" end)
+     elif $k.status == "unset" then "not set in any profile"
+     elif $k.status == "init" then "in sync (recorded at the next sync)"
+     elif $k.status == "agreed" then "in sync again (needs review until the next sync)"
+     elif $k.status == "latest" then "changed in \($k.from)"
+     elif ($behind | length) > 0 then "behind in \($behind | join(", "))"
+     elif $k.pinchanged then "in sync (a pinned profile differs)"
+     else "in sync" end) as $st
+  | {id: $k.id, ok: $ok,
+     line: ("  \($k.id): \($st); fleet=\(if $hf then ($k.entry.fleet | show) else "none" end); "
+       + ([$k.recs[] | . as $r | "\(.tag)=\(.cur | show)"
+           + ([(if $r.changed then "changed" else empty end),
+               (if ($r.tag | among($behind)) then "behind" else empty end),
+               (if $r.pinned then "pinned" else empty end),
+               (if $r.removed then "removed by the app" else empty end)]
+              | if length > 0 then " (" + join(", ") + ")" else "" end)] | join(", ")))} ]
+| {ok: all(.[]; .ok), lines: map(.line), byid: (map({(.id): .line}) | add // {})}
+'
+
+# Run state of a settings step (globals, because bash 3.2 has no other way to
+# return several values).
+PRS_STATE="ok"
+PRS_RUNNING=""
+PRS_WHY=""
+PR_STATE_JSON='{}'
+PR_READABLE=""
+PR_BAD=""
+PR_FILES=()
+PR_PLAN=""
+PR_TMP=""
+PR_TMP2=""
+PR_HOLD=""
+PR_REVIEW=0
+PR_SKIPPED=0
+
+# _prefs_words <word> ...: a JSON array of the words, which are tags or key
+# ids ([a-z0-9-] only), so no escaping is needed.
+_prefs_words() {
+  local w out=""
+  for w in "$@"; do
+    [[ -n "$w" ]] || continue
+    out="${out:+${out},}\"${w}\""
+  done
+  printf '[%s]' "$out"
+}
+
+# _prefs_now: the current UTC time.
+_prefs_now() { "$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# _prefs_scan: reads the process table once (_claude_main_rows) and resolves
+# it (_claude_instances_from), the one matcher every running check uses.
+# Sets PRS_STATE (ok | unreadable | flagless | unknown), PRS_RUNNING (the
+# profiles running, space-separated, with spaces around) and PRS_WHY.
+_prefs_scan() {
+  local raw="" st=0 rows="" pid kind method n=0 unknown=0
+  PRS_STATE="ok"
+  PRS_RUNNING=" "
+  PRS_WHY=""
+  raw="$(_claude_main_rows)" || st=$?
+  if [[ $st -ne 0 ]]; then
+    PRS_STATE="unreadable"
+    PRS_WHY="the process table could not be read, so the switcher cannot tell which profiles are running"
+    return 0
+  fi
+  while IFS=$'\t' read -r pid kind method; do
+    if [[ "$kind" == "FLAGLESS" ]]; then n=$((n + 1)); fi
+  done <<< "$raw"
+  rows="$(_claude_instances_from "$raw")" || rows=""
+  while IFS=$'\t' read -r pid kind method; do
+    [[ -n "$pid" ]] || continue
+    if [[ "$kind" == "unknown" ]]; then
+      unknown=1
+    else
+      PRS_RUNNING="${PRS_RUNNING}${kind} "
+    fi
+  done <<< "$rows"
+  if [[ $n -gt 1 ]]; then
+    PRS_STATE="flagless"
+    PRS_WHY="${n} Claude instances are running without --user-data-dir, so one of them could be any profile (see 'account-switcher list')"
+  elif [[ $unknown -eq 1 ]]; then
+    PRS_STATE="unknown"
+    PRS_WHY="a running Claude instance's profile is unknown, so it could be any profile (see 'account-switcher list')"
+  fi
+  return 0
+}
+
+# _prefs_running <tag>: 0 when the last scan saw <tag> running.
+_prefs_running() {
+  case "$PRS_RUNNING" in *" ${1} "*) return 0 ;; esac
+  return 1
+}
+
+# _prefs_participants: primary (when its folder exists), then every
+# [accounts] tag whose profile folder exists; default is primary.
+_prefs_participants() {
+  local t seen=" " tags=""
+  if [[ -d "$(udd_for_tag primary)" ]]; then
+    printf 'primary\n'
+    seen=" primary "
+  fi
+  tags="$(accounts_tags)" || tags=""
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    if [[ "$t" == "default" ]]; then t="primary"; fi
+    case "$seen" in *" ${t} "*) continue ;; esac
+    [[ "$t" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || continue
+    [[ -d "$(udd_for_tag "$t")" ]] || continue
+    printf '%s\n' "$t"
+    seen="${seen}${t} "
+  done <<< "$tags"
+  return 0
+}
+
+# _prefs_extra_tags <participants>: every other Claude-<tag> profile folder
+# (read by `prefs diff --all` only, never written).
+_prefs_extra_tags() {
+  local d t
+  for d in "${AS_PROFILE_ROOT}"/Claude-*; do
+    [[ -d "$d" ]] || continue
+    t="${d##*/Claude-}"
+    [[ "$t" =~ ^[a-z0-9][a-z0-9-]{0,31}$ && "$t" != "primary" && "$t" != "default" ]] || continue
+    case " ${1//$'\n'/ } " in *" ${t} "*) continue ;; esac
+    printf '%s\n' "$t"
+  done
+  return 0
+}
+
+# _prefs_state_load: sets PR_STATE_JSON from PREFS_STATE ({} when absent);
+# returns 1 when the file exists but is not a sync state.
+_prefs_state_load() {
+  PR_STATE_JSON='{}'
+  [[ -e "$PREFS_STATE" ]] || return 0
+  PR_STATE_JSON="$("$AS_BIN_JQ" -c 'if type == "object" and .schema == 1 then . else error("shape") end' \
+    "$PREFS_STATE" 2>/dev/null)" || { PR_STATE_JSON='{}'; return 1; }
+  return 0
+}
+
+# The refusal for a sync state that cannot be read.
+_prefs_state_bad() {
+  printf "The sync state %s is not a sync state the switcher can read. Nothing was written. Move it aside (the next sync then treats every disagreement as needing review): trash %s" \
+    "$(_tilde_path "$PREFS_STATE")" "$(_tilde_path "$PREFS_STATE")"
+}
+
+# _prefs_read <tag> ...: validates each profile's settings file (one JSON
+# object, read twice at most, a second apart: the app rewrites the file
+# while it runs). Sets PR_READABLE (tags, one per line), PR_FILES (their
+# files, same order) and PR_BAD ("tag<TAB>no-file|invalid" lines), and warns
+# for each invalid one. jq reads each file in place; nothing copies it.
+_prefs_read() {
+  local t f try ok
+  PR_READABLE=""
+  PR_BAD=""
+  PR_FILES=()
+  for t in "$@"; do
+    f="$(udd_for_tag "$t")/${PREFS_FILE}"
+    if [[ ! -f "$f" ]]; then
+      PR_BAD="${PR_BAD}${t}"$'\t'"no-file"$'\n'
+      continue
+    fi
+    ok=0
+    try=1
+    while [[ $try -le 2 ]]; do
+      if "$AS_BIN_JQ" -e 'type == "object"' "$f" >/dev/null 2>&1; then ok=1; break; fi
+      if [[ $try -eq 1 ]]; then "$AS_BIN_SLEEP" 1; fi
+      try=$((try + 1))
+    done
+    if [[ $ok -eq 1 ]]; then
+      PR_READABLE="${PR_READABLE}${t}"$'\n'
+      PR_FILES+=("$f")
+    else
+      PR_BAD="${PR_BAD}${t}"$'\t'"invalid"$'\n'
+      warn "'${t}': its settings file is not valid JSON (read twice, a second apart); skipped for this run."
+    fi
+  done
+  return 0
+}
+
+# _prefs_plan <named tags> <running tags> [decisions-json] [only-decided]
+# [pins-json]: runs PREFS_PLAN_JQ over the files _prefs_read accepted; sets
+# PR_PLAN. Returns 1 when jq fails twice (a file changed under it).
+_prefs_plan() {
+  local named="$1" running="$2" dec="${3:-}" only="${4:-false}" pins="${5:-}" meta try=1
+  local readable
+  # The lists hold tags only, so word splitting is the point.
+  # shellcheck disable=SC2086
+  readable="$(_prefs_words $PR_READABLE)"
+  [[ -n "$dec" ]] || dec='{}'
+  meta="$("$AS_BIN_JQ" -cn --argjson allow "$PREFS_ALLOW" --argjson state "$PR_STATE_JSON" \
+    --argjson readable "$readable" --argjson named "$named" --argjson running "$running" \
+    --argjson dec "$dec" --arg now "$(_prefs_now)" --arg only "$only" --arg pins "$pins" \
+    '{allow: $allow, state: $state, readable: $readable, named: $named, running: $running,
+      now: $now, decisions: $dec, only_decided: ($only == "true")}
+     + (if $pins == "" then {} else {pins: ($pins | fromjson)} end)')" || return 1
+  while [[ $try -le 2 ]]; do
+    if PR_PLAN="$("$AS_BIN_JQ" -c -n --argjson m "$meta" "${PREFS_DEFS} ${PREFS_PLAN_JQ}" \
+        ${PR_FILES[@]+"${PR_FILES[@]}"} < /dev/null 2>/dev/null)"; then
+      return 0
+    fi
+    if [[ $try -eq 1 ]]; then "$AS_BIN_SLEEP" 1; fi
+    try=$((try + 1))
+  done
+  PR_PLAN=""
+  return 1
+}
+
+# _prefs_ops <tag>: the [path, value] pairs PR_PLAN writes into <tag>.
+_prefs_ops() {
+  printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -c --arg t "$1" '[.keys[] | select(.writes | any(.[]; . == $t)) | [.path, .fleet]]'
+}
+
+# Removes this run's temporary files in a profile folder or the store.
+_prefs_rm_tmp() {
+  local f
+  for f in "$PR_TMP" "$PR_TMP2"; do
+    if [[ -n "$f" && -e "$f" ]]; then "$AS_BIN_RM" -f "$f" 2>/dev/null || :; fi
+  done
+  PR_TMP=""
+  PR_TMP2=""
+  return 0
+}
+
+# _prefs_sweep_tmp <tag> ...: removes temporary files an interrupted run
+# left in these profile folders (only this switcher's own prefix).
+_prefs_sweep_tmp() {
+  local t f
+  for t in "$@"; do
+    for f in "$(udd_for_tag "$t")/${PREFS_TMP_PREFIX}"*; do
+      if [[ -f "$f" ]]; then "$AS_BIN_RM" -f "$f" 2>/dev/null || :; fi
+    done
+  done
+  return 0
+}
+
+# _prefs_write <tag> <ops-json> <swap|strict> <replace|keep> [file-to-restore]
+# The write sequence for one profile (#11, step 4):
+#   1. build the new file in a mktemp file inside the profile folder, mode
+#      600 (from the current file with the ops applied, or a copy of the
+#      prior copy for `undo --whole-file`);
+#   2. confirm it equals the current file once the allowlisted paths are
+#      removed from both (skipped for --whole-file, which replaces the file);
+#   3. re-check that the profile is not running (strict: also that no
+#      running instance could be any profile);
+#   4. copy the current file to claude_desktop_config.json.sync-prev, mode
+#      600 (replace; `undo` keeps the prior copy);
+#   5. rename the new file into place.
+# Returns 0 written, 1 held back by the re-check (PR_HOLD says why), 2 failed.
+_prefs_write() {
+  local tag="$1" ops="$2" mode="$3" prev="$4" restore="${5:-}" udd f same=""
+  PR_HOLD=""
+  udd="$(udd_for_tag "$tag")"
+  f="${udd}/${PREFS_FILE}"
+  PR_TMP="$("$AS_BIN_MKTEMP" "${udd}/${PREFS_TMP_PREFIX}XXXXXX")" || { PR_TMP=""; return 2; }
+  "$AS_BIN_CHMOD" 600 "$PR_TMP" || { _prefs_rm_tmp; return 2; }
+  if [[ -n "$restore" ]]; then
+    "$AS_BIN_CAT" "$restore" > "$PR_TMP" 2>/dev/null || { _prefs_rm_tmp; return 2; }
+  else
+    if ! "$AS_BIN_JQ" --argjson ops "$ops" 'reduce $ops[] as $o (.; setpath($o[0]; $o[1]))' \
+        "$f" > "$PR_TMP" 2>/dev/null; then
+      _prefs_rm_tmp
+      return 2
+    fi
+    same="$("$AS_BIN_JQ" -n --argjson allow "$PREFS_ALLOW" \
+      '[$allow[].path] as $p | (input | delpaths($p)) == (input | delpaths($p))' "$f" "$PR_TMP" 2>/dev/null)" || same=""
+    if [[ "$same" != "true" ]]; then
+      warn "'${tag}': the new settings file would differ outside the allowlisted keys; not written."
+      _prefs_rm_tmp
+      return 2
+    fi
+  fi
+  _prefs_scan
+  if [[ "$PRS_STATE" == "unreadable" ]] || [[ "$mode" == "strict" && "$PRS_STATE" != "ok" ]]; then
+    PR_HOLD="$PRS_WHY"
+    _prefs_rm_tmp
+    return 1
+  fi
+  if _prefs_running "$tag"; then
+    PR_HOLD="running"
+    _prefs_rm_tmp
+    return 1
+  fi
+  if [[ "$prev" == "replace" ]]; then
+    PR_TMP2="$("$AS_BIN_MKTEMP" "${udd}/${PREFS_TMP_PREFIX}XXXXXX")" || { PR_TMP2=""; _prefs_rm_tmp; return 2; }
+    if ! "$AS_BIN_CP" "$f" "$PR_TMP2" || ! "$AS_BIN_CHMOD" 600 "$PR_TMP2" \
+        || ! "$AS_BIN_MV" -f "$PR_TMP2" "${f}.sync-prev"; then
+      _prefs_rm_tmp
+      return 2
+    fi
+    PR_TMP2=""
+  fi
+  "$AS_BIN_MV" -f "$PR_TMP" "$f" || { _prefs_rm_tmp; return 2; }
+  PR_TMP=""
+  return 0
+}
+
+# _prefs_state_write <json>: writes the sync state through a temporary file
+# in the store, mode 600, then a rename.
+_prefs_state_write() {
+  if [[ ! -d "$STORE" ]]; then "$AS_BIN_MKDIR" -p "$STORE" || return 1; fi
+  PR_TMP="$("$AS_BIN_MKTEMP" "${STORE}/.prefs-sync.json.XXXXXX")" || { PR_TMP=""; return 1; }
+  "$AS_BIN_CHMOD" 600 "$PR_TMP" || { _prefs_rm_tmp; return 1; }
+  printf '%s\n' "$1" | "$AS_BIN_JQ" . > "$PR_TMP" || { _prefs_rm_tmp; return 1; }
+  "$AS_BIN_MV" -f "$PR_TMP" "$PREFS_STATE" || { _prefs_rm_tmp; return 1; }
+  PR_TMP=""
+  return 0
+}
+
+# _prefs_commit <written tags> [pins-json]: the new state (PREFS_COMMIT_JQ)
+# from PR_PLAN, written when it differs from the one loaded.
+_prefs_commit() {
+  local written new
+  # shellcheck disable=SC2086
+  written="$(_prefs_words $1)"
+  # shellcheck disable=SC2086
+  new="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -c --argjson state "$PR_STATE_JSON" --argjson w "$written" \
+    --argjson rd "$(_prefs_words $PR_READABLE)" --arg pins "${2:-}" \
+    "${PREFS_DEFS} . as \$plan | {plan: \$plan, state: \$state, written: \$w, readable: \$rd}
+      + (if \$pins == \"\" then {} else {pins: (\$pins | fromjson)} end) | . as \$m | ${PREFS_COMMIT_JQ}")" || return 1
+  if [[ "$new" == "$PR_STATE_JSON" ]]; then return 0; fi
+  _prefs_state_write "$new" || return 1
+  PR_STATE_JSON="$new"
+  return 0
+}
+
+# _prefs_lock <doing>: takes the settings-sync lock, or prints the refusal
+# (the same rule and message shape as the update lock) and returns 1.
+_prefs_lock() {
+  if [[ ! -d "$STORE" ]]; then "$AS_BIN_MKDIR" -p "$STORE" 2>/dev/null || :; fi
+  if _lock_held "$PREFS_LOCK"; then
+    printf '\033[31mERROR:\033[0m %s\n' "$(_lock_refusal "$PREFS_LOCK" "$1")" >&2
+    return 1
+  fi
+  if ! _lock_take "$PREFS_LOCK"; then
+    printf '\033[31mERROR:\033[0m %s\n' "Another settings sync took the lock $(_tilde_path "$PREFS_LOCK") just now. Not ${1}." >&2
+    return 1
+  fi
+  return 0
+}
+
+# _prefs_tally <cmd> <target> <written tags> <not-written tags> <named tags>:
+# prints the summary line and, except for a dry run, appends the PREFS_SYNC
+# row (key ids and counts, never values). <target> is a tag or "all". Sets
+# PR_REVIEW and PR_SKIPPED.
+#   applied  key writes made          kept     keys a pin kept different
+#   skipped  key writes held back (running, a type that differs, no object
+#            to hold the key) plus named profiles whose file can't be read
+#   review   keys that need review
+_prefs_tally() {
+  local cmd="$1" target="$2" label t line ids applied kept review skipped unreadable=0 bad_t why
+  label="$target"
+  if [[ "$target" == "all" ]]; then label="every profile"; fi
+  # shellcheck disable=SC2086
+  line="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r --argjson w "$(_prefs_words $3)" --argjson nw "$(_prefs_words $4)" \
+    "${PREFS_DEFS}"'
+    [.keys[] | . as $k | $k.writes[] | select(among($w)) | $k.id] as $done
+    | [.keys[] | select(.id | among($done))] as $ids
+    | [.keys[] | select((.kept | length) > 0 or .pinchanged)] as $kept
+    | [.keys[] | select(.status == "review")] as $rev
+    | (([.keys[] | select(.status == "type")] | length)
+       + ([.keys[].held[]] | length)
+       + ([.keys[] | .writes[] | select(among($nw))] | length)) as $skip
+    | [$ids[] | select(.from != null and (.status == "latest" or .status == "decided")) | "\(.id):\(.from | gsub(","; "+"))"] as $src
+    | [$ids[] | if .from != null and (.status == "latest" or .status == "decided")
+                then "\(.id) from \(.from | gsub(","; " and "))" else .id end] as $shown
+    | "\($done | length)|\($ids | map(.id) | join(","))|\($kept | length)|\($rev | length)|\($skip)|\($src | join(","))|\($shown | join(", "))"')" || line=""
+  local src shown
+  IFS='|' read -r applied ids kept review skipped src shown <<< "$line"
+  [[ -n "$applied" ]] || { applied=0; ids=""; kept=0; review=0; skipped=0; src=""; shown=""; }
+  local nm=" ${5:-} "
+  nm="${nm//$'\n'/ }"
+  while IFS=$'\t' read -r bad_t why; do
+    [[ -n "$bad_t" ]] || continue
+    case "$nm" in *" ${bad_t} "*) unreadable=$((unreadable + 1)) ;; esac
+  done <<< "$PR_BAD"
+  skipped=$((skipped + unreadable))
+  PR_REVIEW="$review"
+  PR_SKIPPED="$skipped"
+  local hint=""
+  if [[ "$review" -gt 0 ]]; then hint=": run 'account-switcher prefs review'"; fi
+  printf '%s: %s %s to %s%s, %s kept (pinned), %s skipped, %s needs review%s\n' \
+    "$([[ "$cmd" == "dry-run" ]] && printf 'settings (dry run)' || printf 'settings')" \
+    "$applied" "$([[ "$cmd" == "dry-run" ]] && printf 'would apply' || printf 'applied')" \
+    "$label" "${shown:+ (${shown})}" "$kept" "$skipped" "$review" "$hint" >&2
+  if [[ "$cmd" != "dry-run" ]]; then
+    printf '[%s] PREFS_SYNC cmd=%s target=%s applied=%s keys=%s kept=%s review=%s skipped=%s from=%s\n' \
+      "$(_prefs_now)" "$cmd" "$target" "$applied" "${ids:-none}" "$kept" "$review" "$skipped" "${src:-none}" >> "$SWAP_LOG"
+  fi
+  return 0
+}
+
+# _prefs_prepare <swap|strict> [read-only]: loads the sync state, scans the
+# process table and reads every participating profile (sets PR_PARTS).
+# Returns 2, having said why, when the state can't be read or the running
+# check stops the run (strict: any reason; swap: an unreadable table only).
+# A writing run first removes temporary files an interrupted run left; a
+# read-only one leaves them.
+_prefs_prepare() {
+  local mode="$1" ro="${2:-}"
+  if ! _prefs_state_load; then
+    printf '\033[31mERROR:\033[0m %s\n' "$(_prefs_state_bad)" >&2
+    return 2
+  fi
+  PR_PARTS="$(_prefs_participants)"
+  _prefs_scan
+  if [[ "$PRS_STATE" == "unreadable" ]] || [[ "$mode" == "strict" && "$PRS_STATE" != "ok" ]]; then
+    if [[ "$mode" == "swap" ]]; then
+      warn "Skipping the settings step: ${PRS_WHY}. The swap continues."
+    else
+      printf "\033[31mERROR:\033[0m Not writing any profile's settings: %s.\n" "$PRS_WHY" >&2
+    fi
+    return 2
+  fi
+  if [[ "$ro" != "read-only" ]]; then
+    # shellcheck disable=SC2086
+    _prefs_sweep_tmp $PR_PARTS
+  fi
+  # shellcheck disable=SC2086
+  _prefs_read $PR_PARTS
+  return 0
+}
+
+# _prefs_apply <swap|strict> <replace|keep> <tag> ...: writes PR_PLAN's ops
+# into each named profile, in order (sets PR_WRITTEN and PR_NOTWRITTEN). A
+# strict re-check that fails stops every later write.
+_prefs_apply() {
+  local mode="$1" prev="$2" t ops wrc
+  shift 2
+  PR_WRITTEN=""
+  PR_NOTWRITTEN=""
+  for t in "$@"; do
+    case "$PR_BAD" in
+      "${t}"$'\t'"no-file"*|*$'\n'"${t}"$'\t'"no-file"*)
+        info "Skipped '${t}': it has no settings file yet (the app creates it)."
+        continue ;;
+      "${t}"$'\t'*|*$'\n'"${t}"$'\t'*) continue ;;
+    esac
+    ops="$(_prefs_ops "$t")" || ops="[]"
+    [[ "$ops" != "[]" ]] || continue
+    wrc=0
+    _prefs_write "$t" "$ops" "$mode" "$prev" || wrc=$?
+    if [[ $wrc -eq 0 ]]; then
+      PR_WRITTEN="${PR_WRITTEN} ${t}"
+    else
+      PR_NOTWRITTEN="${PR_NOTWRITTEN} ${t}"
+      if [[ "$PR_HOLD" == "running" ]]; then
+        info "Skipped '${t}': it is running; its settings are written at its next sync."
+      elif [[ -n "$PR_HOLD" ]]; then
+        warn "Skipped '${t}' and every profile after it: ${PR_HOLD}."
+        break
+      else
+        warn "Skipped '${t}': its settings file could not be written."
+      fi
+    fi
+  done
+  _prefs_held_notes
+  return 0
+}
+
+# _prefs_detail <tag> ...: one line per profile PR_PLAN writes, naming the
+# keys and the allowlisted values (booleans and short strings).
+_prefs_detail() {
+  # shellcheck disable=SC2086
+  printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r --argjson t "$(_prefs_words "$@")" "${PREFS_DEFS}"'
+    . as $p | $t[] as $tag
+    | [$p.keys[] | select(.writes | any(.[]; . == $tag)) | "\(.id)=\(.fleet | show)"] as $w
+    | select($w | length > 0) | "  \($tag): \($w | join(", "))"' >&2 || :
+}
+
+# prefs_step <cmd> <swap|strict> <target> <tag> ...: one key-level settings
+# sync that may write only the named tags (#11's write sequence): lock, read
+# and validate every participating file, plan, write each named profile,
+# write the sync state, append the PREFS_SYNC row, release the lock. <target>
+# is the tag, or "all". Prints the summary line. Never exits, so swap goes on
+# to launch whatever it returns:
+#   0  done; nothing needs review and nothing was skipped
+#   1  done; a key needs review, or a write was skipped
+#   2  refused or failed before any profile was written
+prefs_step() {
+  local cmd="$1" mode="$2" target="$3" rc=0
+  shift 3
+  if ! _prefs_lock "writing any profile's settings"; then
+    if [[ "$mode" == "swap" ]]; then warn "Skipping the settings step; the swap continues."; fi
+    return 2
+  fi
+  _prefs_step_body "$cmd" "$mode" "$target" "$@" || rc=$?
+  _prefs_rm_tmp
+  _lock_release
+  return "$rc"
+}
+
+_prefs_step_body() {
+  local cmd="$1" mode="$2" target="$3"
+  shift 3
+  _prefs_prepare "$mode" || return 2
+  local t
+  for t in "$@"; do
+    case " ${PR_PARTS//$'\n'/ } " in
+      *" ${t} "*) ;;
+      *) info "'${t}' does not take part in the settings sync (not in [accounts]); its settings are left as they are." ;;
+    esac
+  done
+  # shellcheck disable=SC2086
+  if ! _prefs_plan "$(_prefs_words "$@")" "$(_prefs_words $PRS_RUNNING)"; then
+    warn "The settings files changed while they were being read; nothing was written. Run it again."
+    return 2
+  fi
+  _prefs_apply "$mode" replace "$@"
+  if [[ "$cmd" == "sync" ]]; then
+    # shellcheck disable=SC2086
+    _prefs_detail $PR_WRITTEN
+  fi
+  if ! _prefs_commit "$PR_WRITTEN"; then
+    warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the profiles written keep their new values."
+  fi
+  _prefs_tally "$cmd" "$target" "$PR_WRITTEN" "$PR_NOTWRITTEN" "$*"
+  if [[ "$PR_REVIEW" -gt 0 || "$PR_SKIPPED" -gt 0 ]]; then return 1; fi
+  return 0
+}
+
+
+# Says which named profiles the plan held back, and why.
+_prefs_held_notes() {
+  local t why
+  while IFS=$'\t' read -r t why; do
+    [[ -n "$t" ]] || continue
+    case "$why" in
+      running) info "Skipped '${t}': it is running; its settings are written at its next sync." ;;
+      *) info "Skipped '${t}' for a key: its settings file has no object to hold it yet (the app adds it)." ;;
+    esac
+  done < <(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r '[.keys[].held[] | "\(.tag)\t\(.why)"] | unique[]' 2>/dev/null)
+  return 0
+}
+
+# ---- prefs (#11) ------------------------------------------------------------
+#
+# Exit codes (also in help and the README):
+#   diff         0 in sync and nothing pending, 1 otherwise, 2 error
+#   sync         0 done, nothing pending or skipped; 1 done, but a key needs
+#                review or a write was skipped; 2 refused, nothing written
+#   sync --dry-run  0 nothing to write and nothing pending; 1 something to
+#                write or pending; 2 refused
+#   review       0 applied, nothing left pending; 1 something left pending,
+#                or the plan was declined; 2 refused
+#   adopt        0 set and written everywhere it applies; 1 set, but a
+#                profile was skipped; 2 refused
+#   pin, unpin   0 done; 2 refused
+#   undo         0 restored; 1 nothing to restore; 2 refused
+
+_prefs_usage() {
+  "$AS_BIN_CAT" <<EOF >&2
+Usage: account-switcher prefs <verb> [...]
+  diff [--all]                  every difference between the profiles' settings (read-only)
+  sync [<tag>] [--dry-run]      sync the allowlisted keys into <tag>, or every profile not running
+  review                        walk the keys that differ and decide (needs a terminal)
+  adopt <key-id> --from <tag>   make <tag>'s value the value for every profile
+  pin <tag> <key-id>|--all      keep a key (or the whole profile) different in <tag> on purpose
+  unpin <tag> <key-id>|--all    reverse a pin
+  undo <tag> [--whole-file]     reverse the last sync to <tag>
+Key ids: $(_prefs_key_ids)
+EOF
+}
+
+# Prints the allowlist's key ids, comma-separated.
+_prefs_key_ids() {
+  printf '%s' "$PREFS_ALLOW" | "$AS_BIN_JQ" -r '[.[].id] | join(", ")'
+}
+
+# A refusal: one error line, exit 2.
+_prefs_refuse() {
+  printf '\033[31mERROR:\033[0m %s\n' "$*" >&2
+  exit 2
+}
+
+# The EXIT trap of the writing verbs: removes this run's temporary files and
+# releases the lock this run took.
+_prefs_on_exit() {
+  local rc=$?
+  set +e
+  _prefs_rm_tmp
+  _lock_release
+  exit "$rc"
+}
+
+# _prefs_key <key-id>: prints the allowlist entry, or refuses.
+_prefs_key() {
+  local k=""
+  [[ "${1:-}" =~ ^[a-z0-9-]{1,40}$ ]] || _prefs_refuse "Unknown key id '${1:-}'. Key ids: $(_prefs_key_ids)."
+  k="$(printf '%s' "$PREFS_ALLOW" | "$AS_BIN_JQ" -c --arg id "$1" '.[] | select(.id == $id)')" || k=""
+  [[ -n "$k" ]] || _prefs_refuse "Unknown key id '${1}'. Key ids: $(_prefs_key_ids)."
+  printf '%s' "$k"
+}
+
+# _prefs_tag <tag>: prints the participating tag (default is primary), or
+# refuses.
+_prefs_tag() {
+  local t="${1:-}" parts
+  [[ "$t" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || _prefs_refuse "Tag must match [a-z0-9-]{1,32} (got: '${t}')."
+  if [[ "$t" == "default" ]]; then t="primary"; fi
+  parts="$(_prefs_participants)"
+  case " ${parts//$'\n'/ } " in
+    *" ${t} "*) printf '%s' "$t" ;;
+    *) _prefs_refuse "'${t}' is not a participating profile (primary, plus every [accounts] tag whose profile folder exists): ${parts//$'\n'/, }." ;;
+  esac
+}
+
+# Starts a writing verb: rotates the history log, sets the EXIT trap and
+# takes the lock.
+_prefs_begin() {
+  rotate_swap_log_if_needed
+  trap _prefs_on_exit EXIT
+  _prefs_lock "$1" || exit 2
+}
+
+# ---- prefs diff ---------------------------------------------------------------
+
+_prefs_diff() {
+  local all=false a table cs ok=0 t why extra="" p_readable p_bad
+  local -a p_files
+  for a in "$@"; do
+    case "$a" in
+      --all) all=true ;;
+      *) _prefs_usage; _prefs_refuse "prefs diff takes only --all (got: '${a}')." ;;
+    esac
+  done
+  _prefs_state_load || _prefs_refuse "$(_prefs_state_bad)"
+  PR_PARTS="$(_prefs_participants)"
+  [[ -n "$PR_PARTS" ]] || _prefs_refuse "No participating profile folder exists (primary, plus every [accounts] tag whose profile folder exists)."
+  # shellcheck disable=SC2086
+  _prefs_read $PR_PARTS
+  # shellcheck disable=SC2086
+  _prefs_plan "$(_prefs_words $PR_PARTS)" "[]" || _prefs_refuse "The settings files changed while they were being read. Run it again."
+  table="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -c "${PREFS_DEFS} ${PREFS_TABLE_JQ}")" || _prefs_refuse "Could not build the report."
+  p_readable="$PR_READABLE"
+  p_bad="$PR_BAD"
+  p_files=(${PR_FILES[@]+"${PR_FILES[@]}"})
+  if [[ "$all" == "true" ]]; then
+    # Tags only, so word splitting is the point.
+    # shellcheck disable=SC2046
+    _prefs_read $(_prefs_extra_tags "$PR_PARTS")
+    extra="$PR_READABLE"
+    p_files+=(${PR_FILES[@]+"${PR_FILES[@]}"})
+  fi
+  # shellcheck disable=SC2086
+  cs="$("$AS_BIN_JQ" -c -n --argjson m "$("$AS_BIN_JQ" -cn --argjson classes "$PREFS_CLASSES" \
+      --argjson allow "$PREFS_ALLOW" --argjson tags "$(_prefs_words $p_readable $extra)" \
+      --argjson extra "$(_prefs_words $extra)" --arg all "$all" \
+      '{classes: $classes, allow: $allow, tags: $tags, extra: $extra, all: ($all == "true")}')" \
+      "${PREFS_DEFS} ${PREFS_REPORT_JQ}" ${p_files[@]+"${p_files[@]}"} < /dev/null 2>/dev/null)" \
+    || _prefs_refuse "Could not build the report (a settings file changed while it was read). Run it again."
+  printf 'Settings in %s across %s\n' "$PREFS_FILE" "$(printf '%s' "${PR_PARTS//$'\n'/, }")"
+  while IFS=$'\t' read -r t why; do
+    [[ -n "$t" ]] || continue
+    ok=1
+    case "$why" in
+      no-file) printf '  %s: no settings file yet; not compared\n' "$t" ;;
+      *) printf '  %s: not valid JSON (read twice, a second apart); not compared\n' "$t" ;;
+    esac
+  done <<< "$p_bad"
+  printf '\nSynced settings (the allowlist): status; fleet value; each profile\n'
+  printf '%s' "$table" | "$AS_BIN_JQ" -r '.lines[]'
+  printf '\nCapability (C) and security (S) settings that differ (never synced; change them in the app)\n'
+  printf '%s' "$cs" | "$AS_BIN_JQ" -r 'if (.cs | length) == 0 then "  none" else .cs[] end'
+  printf '\nAccount-keyed (A) and profile-local (L) entries (never synced)\n'
+  printf '%s' "$cs" | "$AS_BIN_JQ" -r '.counts[]'
+  printf '\nUnclassified (U) settings, by masked name (never synced unless added to the allowlist)\n'
+  printf '%s' "$cs" | "$AS_BIN_JQ" -r 'if (.us | length) == 0 then "  none" else .us[] end'
+  if [[ "$(printf '%s' "$table" | "$AS_BIN_JQ" -r '.ok')" != "true" ]]; then ok=1; fi
+  if [[ $ok -eq 0 ]]; then
+    printf '\nResult: in sync; nothing pending.\n'
+    exit 0
+  fi
+  printf "\nResult: not in sync, or something is pending. Decide with 'account-switcher prefs review' (terminal), or run 'account-switcher prefs sync'.\n"
+  exit 1
+}
+
+# ---- prefs sync ---------------------------------------------------------------
+
+_prefs_sync_cmd() {
+  local tag="" dry=false a rc=0 target="all" named
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=true ;;
+      -*) _prefs_usage; _prefs_refuse "Unknown flag for prefs sync: ${a}" ;;
+      *)
+        [[ -z "$tag" ]] || { _prefs_usage; _prefs_refuse "prefs sync takes one tag at most."; }
+        tag="$a" ;;
+    esac
+  done
+  if [[ -n "$tag" ]]; then
+    tag="$(_prefs_tag "$tag")"
+    target="$tag"
+  fi
+  if [[ "$dry" == "true" ]]; then
+    # Read-only: no lock, no log rotation, no state write, no log row.
+    _prefs_prepare strict read-only || exit 2
+    named="$tag"
+    [[ -n "$named" ]] || named="$PR_PARTS"
+    # shellcheck disable=SC2086
+    _prefs_plan "$(_prefs_words $named)" "$(_prefs_words $PRS_RUNNING)" || _prefs_refuse "The settings files changed while they were being read. Run it again."
+    # shellcheck disable=SC2086
+    _prefs_detail $named
+    _prefs_held_notes
+    # shellcheck disable=SC2086
+    _prefs_tally dry-run "$target" "$named" "" "$named"
+    if [[ "$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r '[.keys[].writes[]] | length')" != "0" \
+          || "$PR_REVIEW" -gt 0 || "$PR_SKIPPED" -gt 0 ]]; then
+      exit 1
+    fi
+    exit 0
+  fi
+  rotate_swap_log_if_needed
+  trap _prefs_on_exit EXIT
+  if [[ -n "$tag" ]]; then
+    prefs_step sync strict "$target" "$tag" || rc=$?
+  else
+    # shellcheck disable=SC2046
+    prefs_step sync strict all $(_prefs_participants) || rc=$?
+  fi
+  exit "$rc"
+}
+
+# ---- prefs adopt ----------------------------------------------------------------
+
+_prefs_adopt() {
+  local id="${1:-}" k tag v dec rc=0
+  [[ $# -eq 3 && "${2:-}" == "--from" ]] || { _prefs_usage; _prefs_refuse "Usage: account-switcher prefs adopt <key-id> --from <tag>"; }
+  k="$(_prefs_key "$id")"
+  tag="$(_prefs_tag "$3")"
+  _prefs_begin "adopting a value"
+  _prefs_prepare strict || exit 2
+  case "$PR_BAD" in
+    "${tag}"$'\t'*|*$'\n'"${tag}"$'\t'*) _prefs_refuse "'${tag}' has no settings file that can be read; nothing was adopted." ;;
+  esac
+  v="$("$AS_BIN_JQ" -c --argjson k "$k" "${PREFS_DEFS}"'
+    val($k.path) | if isabs or (type != $k.type) then error("no") else . end' "$(udd_for_tag "$tag")/${PREFS_FILE}" 2>/dev/null)" \
+    || _prefs_refuse "'${tag}' holds no ${id} value of the allowlisted type to adopt; nothing was changed."
+  dec="$("$AS_BIN_JQ" -cn --arg id "$id" --argjson v "$v" --arg t "$tag" '{($id): {value: $v, by: "adopt", from: $t}}')"
+  # shellcheck disable=SC2086
+  _prefs_plan "$(_prefs_words $PR_PARTS)" "$(_prefs_words $PRS_RUNNING)" "$dec" true \
+    || _prefs_refuse "The settings files changed while they were being read; nothing was written. Run it again."
+  # shellcheck disable=SC2086
+  _prefs_apply strict replace $PR_PARTS
+  # shellcheck disable=SC2086
+  _prefs_detail $PR_WRITTEN
+  _prefs_commit "$PR_WRITTEN" || warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written."
+  _prefs_tally adopt all "$PR_WRITTEN" "$PR_NOTWRITTEN" "$PR_PARTS"
+  info "${id} is now $(printf '%s' "$v" | "$AS_BIN_JQ" -r "${PREFS_DEFS} show") for every profile (from '${tag}')."
+  if [[ "$PR_SKIPPED" -gt 0 ]]; then rc=1; fi
+  exit "$rc"
+}
+
+# ---- prefs pin / unpin ------------------------------------------------------------
+
+_prefs_pin() {
+  local verb="$1" tag what id="" pins n
+  shift
+  [[ $# -eq 2 ]] || { _prefs_usage; _prefs_refuse "Usage: account-switcher prefs ${verb} <tag> <key-id>|--all"; }
+  tag="$(_prefs_tag "$1")"
+  what="$2"
+  if [[ "$what" == "--all" ]]; then id="*"; else _prefs_key "$what" > /dev/null; id="$what"; fi
+  _prefs_begin "changing pins"
+  _prefs_state_load || _prefs_refuse "$(_prefs_state_bad)"
+  pins="$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --arg t "$tag" --arg id "$id" --arg verb "$verb" '
+    (.pins // {})
+    | if $verb == "pin" then .[$t] = ((.[$t] // []) + [$id] | unique)
+      elif $id == "*" then del(.[$t])
+      else .[$t] = ((.[$t] // []) - [$id]) end
+    | with_entries(select((.value | length) > 0))')"
+  n="$(printf '%s' "$pins" | "$AS_BIN_JQ" -r --arg t "$tag" '(.[$t] // []) | length')"
+  _prefs_state_write "$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --argjson pins "$pins" \
+    '{schema: 1, keys: (.keys // {}), pins: $pins, undo: (.undo // {})}')" \
+    || _prefs_refuse "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the pins are unchanged."
+  printf '[%s] PREFS_PIN cmd=%s target=%s keys=%s pins=%s\n' "$(_prefs_now)" "$verb" "$tag" \
+    "$([[ "$id" == "*" ]] && printf 'all' || printf '%s' "$id")" "$n" >> "$SWAP_LOG"
+  if [[ "$verb" == "pin" && "$id" == "*" ]]; then
+    ok "Pinned all of '${tag}': no command writes any synced key there, and its changes don't spread. Reverse with: account-switcher prefs unpin ${tag} --all"
+  elif [[ "$verb" == "pin" ]]; then
+    ok "Pinned ${id} in '${tag}': no command writes it there, and a change there doesn't spread. Reverse with: account-switcher prefs unpin ${tag} ${id}"
+  elif [[ "$id" == "*" ]]; then
+    ok "Removed every pin of '${tag}'."
+  else
+    ok "Unpinned ${id} in '${tag}'.$(printf '%s' "$pins" | "$AS_BIN_JQ" -r --arg t "$tag" 'if ((.[$t] // []) | index("*")) != null then " It is still pinned as a whole (--all)." else "" end')"
+  fi
+  exit 0
+}
+
+# ---- prefs undo ----------------------------------------------------------------
+
+_prefs_undo() {
+  local tag="" whole=false a rec f prev res ops ids n wrc none='{}'
+  for a in "$@"; do
+    case "$a" in
+      --whole-file) whole=true ;;
+      -*) _prefs_usage; _prefs_refuse "Unknown flag for prefs undo: ${a}" ;;
+      *) [[ -z "$tag" ]] || { _prefs_usage; _prefs_refuse "prefs undo takes one tag."; }; tag="$a" ;;
+    esac
+  done
+  [[ -n "$tag" ]] || { _prefs_usage; _prefs_refuse "Usage: account-switcher prefs undo <tag> [--whole-file]"; }
+  tag="$(_prefs_tag "$tag")"
+  f="$(udd_for_tag "$tag")/${PREFS_FILE}"
+  _prefs_begin "undoing a sync"
+  _prefs_prepare strict || exit 2
+  if _prefs_running "$tag"; then _prefs_refuse "'${tag}' is running; quit it, then run prefs undo again. Nothing was changed."; fi
+  rec="$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --arg t "$tag" '.undo[$t] // empty')" || rec=""
+  if [[ "$whole" == "true" ]]; then
+    prev="${f}.sync-prev"
+    [[ -f "$prev" ]] || _prefs_refuse "'${tag}' has no prior copy to restore (one is made before each sync writes the profile). Nothing was changed."
+    "$AS_BIN_JQ" -e 'type == "object"' "$prev" > /dev/null 2>&1 || _prefs_refuse "The prior copy in '${tag}' is not valid JSON; nothing was changed."
+    _signin_tty || _prefs_refuse "prefs undo --whole-file needs a terminal to confirm. Nothing was changed."
+    printf "This replaces the whole settings file of '%s' with the copy from before the last sync. Changes the app made to it since then will be lost.\n" "$tag"
+    _signin_ask "Restore the prior copy of '${tag}'?" || { printf 'Not restoring; nothing was changed.\n'; exit 2; }
+    wrc=0
+    _prefs_write "$tag" "[]" strict keep "$prev" || wrc=$?
+    [[ $wrc -eq 0 ]] || _prefs_refuse "'${tag}' was not restored: ${PR_HOLD:-its settings file could not be written}."
+    ids="$(printf '%s' "${rec:-$none}" | "$AS_BIN_JQ" -r '[(.changes // {}) | keys[]] | join(",")')"
+  else
+    if [[ -z "$rec" ]]; then
+      info "Nothing to undo for '${tag}': the sync state has no record of a sync that wrote it."
+      exit 1
+    fi
+    case "$PR_BAD" in
+      "${tag}"$'\t'*|*$'\n'"${tag}"$'\t'*) _prefs_refuse "'${tag}' has no settings file that can be read; nothing was changed." ;;
+    esac
+    res="$("$AS_BIN_JQ" -c --argjson rec "$rec" --argjson allow "$PREFS_ALLOW" "${PREFS_DEFS}"'
+      . as $d
+      | [ $rec.changes | to_entries[] | .key as $id | .value as $c
+          | ([$allow[] | select(.id == $id)][0]) as $k
+          | select($k != null)
+          | ($d | val($k.path)) as $cur
+          | if $cur == $c.after and ($c.before | isabs | not) and ($d | parentok($k.path))
+            then {id: $id, ok: true, op: [$k.path, $c.before], v: ($c.before | show)}
+            elif $cur == $c.after then {id: $id, ok: false, why: "it was added by that sync, and the switcher never removes a key"}
+            else {id: $id, ok: false, why: "it changed since that sync"} end ]' "$f")" \
+      || _prefs_refuse "'${tag}''s settings file could not be read; nothing was changed."
+    ops="$(printf '%s' "$res" | "$AS_BIN_JQ" -c '[.[] | select(.ok) | .op]')"
+    ids="$(printf '%s' "$res" | "$AS_BIN_JQ" -r '[.[] | select(.ok) | .id] | join(",")')"
+    printf '%s' "$res" | "$AS_BIN_JQ" -r --arg t "$tag" '.[] | select(.ok | not) | "  Left \(.id) in \($t): \(.why)."' >&2
+    if [[ "$ops" == "[]" ]]; then
+      info "Nothing to undo for '${tag}': no key still holds the value the last sync wrote."
+      exit 1
+    fi
+    wrc=0
+    _prefs_write "$tag" "$ops" strict keep || wrc=$?
+    [[ $wrc -eq 0 ]] || _prefs_refuse "'${tag}' was not changed: ${PR_HOLD:-its settings file could not be written}."
+    printf '%s' "$res" | "$AS_BIN_JQ" -r --arg t "$tag" '.[] | select(.ok) | "  Restored \(.id) in \($t) to \(.v)."' >&2
+  fi
+  # Undone keys need review, so the next sync neither re-applies them nor
+  # spreads the restored values as a new change; the undo record is cleared.
+  _prefs_state_write "$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --arg t "$tag" --arg ids "$ids" --arg now "$(_prefs_now)" \
+    --argjson rec "${rec:-$none}" '
+    ($ids | split(",") | map(select(. != ""))) as $u
+    | .schema = 1
+    | .keys = (reduce $u[] as $id ((.keys // {});
+        .[$id] = ((.[$id] // {}) + {pending: {since: $now, reason: "undo",
+                   candidates: {($t): ($rec.changes[$id].before // {absent: true})}}})))
+    | .undo = ((.undo // {}) | del(.[$t]))')" \
+    || warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the restored keys are not marked needs review."
+  n=0
+  if [[ -n "$ids" ]]; then n=$(( $(printf '%s' "$ids" | "$AS_BIN_TR" ',' '\n' | "$AS_BIN_WC" -l) + 1 )); fi
+  printf '[%s] PREFS_UNDO cmd=undo target=%s mode=%s undone=%s keys=%s\n' "$(_prefs_now)" "$tag" \
+    "$([[ "$whole" == "true" ]] && printf 'whole-file' || printf 'keys')" "$n" "${ids:-none}" >> "$SWAP_LOG"
+  if [[ "$whole" == "true" ]]; then ok "Restored the prior copy of '${tag}'; the copy is kept."; fi
+  if [[ -n "$ids" ]]; then
+    info "Marked needs review: ${ids//,/, }. Decide with 'account-switcher prefs review' or 'prefs adopt'."
+  fi
+  exit 0
+}
+
+# ---- prefs review ----------------------------------------------------------------
+
+# _prefs_cur <key-id> <tag>: the profile's value of the key in PR_PLAN, as
+# JSON, when it holds one of the allowlisted type; nothing otherwise.
+_prefs_cur() {
+  printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -c --arg id "$1" --arg t "$2" \
+    '.keys[] | select(.id == $id) | .recs[] | select(.tag == $t and (.absent | not) and .typeok) | .cur' 2>/dev/null
+}
+
+_prefs_review() {
+  local ids id table line choice t v dec='{}' pins pins0 plan_ids n_pending n_open
+  [[ $# -eq 0 ]] || { _prefs_usage; _prefs_refuse "prefs review takes no arguments."; }
+  _signin_tty || _prefs_refuse "prefs review needs a terminal. Without one, use: prefs diff, prefs sync [<tag>] [--dry-run], prefs adopt <key-id> --from <tag>, prefs pin|unpin <tag> <key-id>|--all, prefs undo <tag>."
+  _prefs_begin "reviewing settings"
+  _prefs_prepare strict || exit 2
+  # shellcheck disable=SC2086
+  _prefs_plan "$(_prefs_words $PR_PARTS)" "$(_prefs_words $PRS_RUNNING)" \
+    || _prefs_refuse "The settings files changed while they were being read. Run it again."
+  table="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -c "${PREFS_DEFS} ${PREFS_TABLE_JQ}")"
+  ids="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r '.keys[]
+    | select(.status == "review" or ((.writes | length) + (.held | length)) > 0
+             or ((.status | IN("type", "unset", "untouched") | not) and any(.recs[]; .pinned)))
+    | .id')"
+  if [[ -z "$ids" ]]; then
+    printf 'Nothing to review: every synced key is in sync, nothing is pending and nothing is pinned.\n'
+    exit 0
+  fi
+  n_open="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r '[.keys[] | select(.status == "review" or ((.writes | length) + (.held | length)) > 0)] | length')"
+  pins0="$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c '.pins // {}')"
+  pins="$pins0"
+  printf 'prefs review: for each key, choose a value for every profile, pin it in one profile, or skip it.\n'
+  for id in $ids; do
+    line="$(printf '%s' "$table" | "$AS_BIN_JQ" -r --arg id "$id" '.byid[$id]')"
+    printf '\n%s\n' "${line#  }"
+    v="$(_prefs_cur "$id" primary)" || v=""
+    if [[ -n "$v" ]]; then
+      printf "  1) use primary's value (%s)\n" "$(printf '%s' "$v" | "$AS_BIN_JQ" -r "${PREFS_DEFS} show")"
+    else
+      printf "  1) use primary's value (primary has none)\n"
+    fi
+    printf "  2) use another profile's value\n  3) keep it different in one profile (pin)\n  4) skip (leave it as it is)\n"
+    printf 'Choice [%s]: ' "$([[ -n "$v" ]] && printf '1' || printf '4')"
+    choice=""
+    IFS= read -r choice || choice=""
+    [[ -n "$choice" ]] || { if [[ -n "$v" ]]; then choice=1; else choice=4; fi; }
+    t=""
+    case "$choice" in
+      1) t="primary" ;;
+      2|3)
+        printf 'Which profile (%s)? ' "${PR_PARTS//$'\n'/, }"
+        IFS= read -r t || t=""
+        if [[ "$t" == "default" ]]; then t="primary"; fi
+        case " ${PR_PARTS//$'\n'/ } " in *" ${t} "*) ;; *) printf '  Not a participating profile; skipped.\n'; continue ;; esac
+        ;;
+      *) printf '  Skipped.\n'; continue ;;
+    esac
+    if [[ "$choice" == "3" ]]; then
+      pins="$(printf '%s' "$pins" | "$AS_BIN_JQ" -c --arg t "$t" --arg id "$id" '.[$t] = ((.[$t] // []) + [$id] | unique)')"
+      printf "  %s keeps its own value in '%s' (pinned).\n" "$id" "$t"
+      continue
+    fi
+    v="$(_prefs_cur "$id" "$t")" || v=""
+    if [[ -z "$v" ]]; then printf "  '%s' holds no value for %s; skipped.\n" "$t" "$id"; continue; fi
+    dec="$(printf '%s' "$dec" | "$AS_BIN_JQ" -c --arg id "$id" --argjson v "$v" --arg t "$t" '.[$id] = {value: $v, by: "review", from: $t}')"
+    printf "  %s = %s (from '%s') for every profile not pinned.\n" "$id" "$(printf '%s' "$v" | "$AS_BIN_JQ" -r "${PREFS_DEFS} show")" "$t"
+  done
+  if [[ "$dec" == "{}" && "$pins" == "$pins0" ]]; then
+    printf '\nNothing decided; nothing was written.\n'
+    if [[ "$n_open" != "0" ]]; then exit 1; fi
+    exit 0
+  fi
+  # shellcheck disable=SC2086
+  _prefs_plan "$(_prefs_words $PR_PARTS)" "$(_prefs_words $PRS_RUNNING)" "$dec" true "$pins" \
+    || _prefs_refuse "The settings files changed while they were being read; nothing was written. Run it again."
+  printf '\nPlanned writes:\n'
+  plan_ids="$(printf '%s' "$PR_PLAN" | "$AS_BIN_JQ" -r '[.keys[].writes[]] | length')"
+  if [[ "$plan_ids" == "0" ]]; then printf '  none\n'; fi
+  # shellcheck disable=SC2086
+  _prefs_detail $PR_PARTS 2>&1
+  _prefs_held_notes 2>&1
+  if [[ "$pins" != "$pins0" ]]; then
+    printf 'Pins after this review: %s\n' "$(printf '%s' "$pins" | "$AS_BIN_JQ" -r 'to_entries | map("\(.key): \(.value | join(", "))") | join("; ") | if . == "" then "none" else . end')"
+  fi
+  if ! _signin_ask "Apply these changes?"; then
+    printf 'Not applied; nothing was written.\n'
+    exit 1
+  fi
+  # shellcheck disable=SC2086
+  _prefs_apply strict replace $PR_PARTS
+  _prefs_commit "$PR_WRITTEN" "$pins" || warn "The sync state $(_tilde_path "$PREFS_STATE") could not be written."
+  _prefs_tally review all "$PR_WRITTEN" "$PR_NOTWRITTEN" "$PR_PARTS"
+  n_pending="$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -r '[(.keys // {})[] | select(.pending != null)] | length')"
+  if [[ "$n_pending" != "0" || "$PR_SKIPPED" -gt 0 ]]; then exit 1; fi
+  exit 0
+}
+
+cmd_prefs() {
+  local verb="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$verb" in
+    diff)   _prefs_diff "$@" ;;
+    sync)   _prefs_sync_cmd "$@" ;;
+    review) _prefs_review "$@" ;;
+    adopt)  _prefs_adopt "$@" ;;
+    pin|unpin) _prefs_pin "$verb" "$@" ;;
+    undo)   _prefs_undo "$@" ;;
+    help|-h|--help) _prefs_usage; exit 0 ;;
+    "") _prefs_usage; exit 2 ;;
+    *) _prefs_usage; _prefs_refuse "Unknown prefs verb: ${verb}" ;;
+  esac
+}
+
+# ---- swap (3-step: quit → settings step → launch; H-1, M-15, #11) ---------
 
 # Script-level state used by the M-15 cleanup trap.
 __SWAP_IN_PROGRESS="false"
 __SWAP_TARGET_TAG=""
+# "swap" while swap runs clone-prefs for its settings step (#11): clone-prefs
+# then runs that step under swap's running rule and logs it as cmd=swap.
+__PREFS_CALLER=""
 
 _swap_cleanup_on_interrupt() {
+  # The settings step's temporary files and lock, if it was interrupted.
+  _prefs_rm_tmp
+  _lock_release
   if [[ "$__SWAP_IN_PROGRESS" == "true" ]]; then
     warn "Swap interrupted before completion. Partial state may exist:"
     warn "  - Mac app may have been quit but not relaunched"
@@ -2229,33 +3544,43 @@ EOF
     printf '\n'
   fi
 
-  # ---- Step 1: Auto-mirror prefs primary → target ------------------------
-  # Skip if target IS primary (nothing to mirror to) or --no-mirror was set.
-  # Direction is one-way primary → target: primary is the curator of CONFIG
-  # items (Mac app prefs, Extensions, MCP connectors, git-worktrees).
-  if [[ "$is_primary" == "false" ]] && [[ "$skip_mirror" == "false" ]]; then
+  # ---- Step 1: Quit current Mac app instance(s) --------------------------
+  quit_all_claude
+
+  # ---- Step 2: The settings step (#11) -----------------------------------
+  # After every instance has quit (which flushes each profile's settings
+  # file and means the target is not running) and before the target
+  # launches. It updates the allowlisted settings keys in the target only,
+  # which may be primary, from every participating profile (prefs_step). For
+  # a target other than primary, clone-prefs runs it, then copies primary's
+  # extension folders and git-worktrees.json as before. --no-mirror skips
+  # it. Whatever it returns, the swap goes on to launch: a refusal or a
+  # failure here is a warning, never the end of a swap that has already
+  # quit everything.
+  if [[ "$skip_mirror" == "false" ]]; then
     local primary_udd
     primary_udd=$(udd_for_tag "primary")
-    if [[ -d "$primary_udd" ]] && [[ -d "$target_udd" ]]; then
-      # clone-prefs refuses when it cannot tell whether the target is
-      # running (is_tag_running = 2). swap does not stop for that: it quits
-      # every instance next, so it skips the mirror, says why, and goes on.
-      local mirror_rs=0
-      is_tag_running "$target_tag" || mirror_rs=$?
-      if [[ $mirror_rs -eq 2 ]]; then
-        warn "Skipping auto-mirror: cannot tell whether '${target_tag}' is running (an instance's tag is unknown; see 'account-switcher list'). The swap continues."
-      else
-        info "Auto-mirroring primary's user-facing prefs → ${target_tag}..."
-        cmd_clone_prefs "primary" "$target_tag" 2>&1 | "$AS_BIN_SED" 's/^/    /'
-        printf '\n'
+    if [[ ! -d "$target_udd" ]]; then
+      info "Skipping the settings step (target dir doesn't exist yet; first launch will create it)"
+    elif [[ "$is_primary" == "true" ]] || [[ ! -d "$primary_udd" ]]; then
+      prefs_step swap swap "$(identity_key "$target_tag")" "$(identity_key "$target_tag")" || :
+    else
+      info "Settings step and primary's user-facing prefs → ${target_tag}..."
+      # A background job, waited for at once: clone-prefs keeps set -e (an
+      # `if` or `||` around the pipeline would switch it off inside, and its
+      # snapshot rollback depends on it), while its status reaches the swap
+      # through wait instead of ending it.
+      local clone_rc=0
+      __PREFS_CALLER="swap"
+      ( cmd_clone_prefs "primary" "$target_tag" 2>&1 | "$AS_BIN_SED" 's/^/    /' ) &
+      wait "$!" || clone_rc=$?
+      __PREFS_CALLER=""
+      if [[ $clone_rc -ne 0 ]]; then
+        warn "The settings step did not finish (see above); the swap continues."
       fi
-    elif [[ ! -d "$target_udd" ]]; then
-      info "Skipping auto-mirror (target dir doesn't exist yet; first launch will create it)"
+      printf '\n'
     fi
   fi
-
-  # ---- Step 2: Quit current Mac app instance(s) --------------------------
-  quit_all_claude
 
   # ---- Step 3: Launch target Mac app instance ---------------------------
   info "Launching '${target_tag}' Mac app instance..."
@@ -2318,11 +3643,16 @@ __CLONE_PREFS_TARGET_UDD=""
 __CLONE_PREFS_SNAPSHOTTED=()
 
 _clone_prefs_restore_on_failure() {
+  # The settings step's temporary files and lock, if it was interrupted.
+  _prefs_rm_tmp
+  _lock_release
   # Restore each snapshotted item back to target_udd, then remove snapshot dir.
   if [[ "$__CLONE_PREFS_SUCCEEDED" != "true" ]] && [[ -d "$__CLONE_PREFS_SNAPSHOT_DIR" ]]; then
     warn "Restoring '${__CLONE_PREFS_TARGET_UDD}' from clone-prefs snapshot due to interruption/failure..."
     local item
-    for item in "${__CLONE_PREFS_SNAPSHOTTED[@]}"; do
+    # The list can be empty (the target held none of the items), which bash
+    # 3.2 under set -u treats as unbound unless guarded like this.
+    for item in ${__CLONE_PREFS_SNAPSHOTTED[@]+"${__CLONE_PREFS_SNAPSHOTTED[@]}"}; do
       if [[ -e "${__CLONE_PREFS_SNAPSHOT_DIR}/${item}" ]]; then
         "$AS_BIN_RM" -rf "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
         "$AS_BIN_MV" "${__CLONE_PREFS_SNAPSHOT_DIR}/${item}" "${__CLONE_PREFS_TARGET_UDD}/${item}" 2>/dev/null || true
@@ -2387,17 +3717,35 @@ cmd_clone_prefs() {
     die "Cannot tell whether '${target_tag}' is running: a running Claude instance's tag is unknown, or the process list could not be read (see 'account-switcher list'). Refusing to write into a profile that may be open. Quit the instance shown as unknown (or run 'account-switcher quit --all') and retry."
   fi
 
+  # #11: like every command but swap, clone-prefs writes nothing when more
+  # than one instance runs without --user-data-dir (one could be any
+  # profile). swap runs this after every instance has quit, so the rule is
+  # swap's own there.
+  local prefs_mode="strict"
+  if [[ "$__PREFS_CALLER" == "swap" ]]; then prefs_mode="swap"; fi
+  if [[ "$prefs_mode" == "strict" ]]; then
+    _prefs_scan
+    if [[ "$PRS_STATE" != "ok" ]]; then
+      die "Not cloning into '${target_tag}': ${PRS_WHY}. Nothing was written."
+    fi
+  fi
+
   info "Cloning user-facing prefs: ${source_tag} → ${target_tag}"
   info "  source: ${source_udd}"
   info "  target: ${target_udd}"
 
-  # M-10: Pre-clone scan source claude_desktop_config.json for sensitive keys.
-  # If Anthropic ever stores OAuth/device/secret material in this file in a
-  # future Mac-app version, refuse to mirror it across accounts.
-  if [[ -f "${source_udd}/claude_desktop_config.json" ]]; then
-    if "$AS_BIN_GREP" -qiE '"(oauth|tokenCache|accessToken|refreshToken|clientSecret|authToken|sessionToken|deviceId|deviceToken|bearerToken)"' "${source_udd}/claude_desktop_config.json" 2>/dev/null; then
-      die "Source claude_desktop_config.json contains sensitive-looking keys (oauth/tokenCache/accessToken/etc.). Refusing to mirror credentials across accounts (M-10). Manual review required."
-    fi
+  # #11: settings are no longer copied as a whole file. The key-level step
+  # updates only the allowlisted keys in the target, from every
+  # participating profile (src is not used for them), so the M-10 scan of
+  # the source's claude_desktop_config.json, which guarded the whole-file
+  # copy, guards nothing and is gone. A refusal here (the settings-sync lock
+  # is held, the sync state can't be read) ends clone-prefs before anything
+  # is written; under swap it is a warning and the copy below goes on.
+  local prefs_rc=0
+  prefs_step "$([[ "$prefs_mode" == "swap" ]] && printf 'swap' || printf 'clone-prefs')" \
+    "$prefs_mode" "$(identity_key "$target_tag")" "$(identity_key "$target_tag")" || prefs_rc=$?
+  if [[ $prefs_rc -eq 2 && "$prefs_mode" == "strict" ]]; then
+    die "Not cloning into '${target_tag}': the settings step refused (see above). Nothing was written."
   fi
 
   # Invariant: never more than one backup retained at a time. Sweep any orphan
@@ -2421,7 +3769,7 @@ cmd_clone_prefs() {
   # empty __CLONE_PREFS_SNAPSHOTTED correctly (for-loop no-op).
   trap _clone_prefs_restore_on_failure INT TERM EXIT
 
-  local items_to_clone=("claude_desktop_config.json" "Claude Extensions" "Claude Extensions Settings" "git-worktrees.json")
+  local items_to_clone=("Claude Extensions" "Claude Extensions Settings" "git-worktrees.json")
   local item
   for item in "${items_to_clone[@]}"; do
     if [[ -e "${target_udd}/${item}" ]]; then
@@ -2446,13 +3794,7 @@ cmd_clone_prefs() {
   local mirrored=()
   local skipped=()
 
-  # 1. claude_desktop_config.json
-  if [[ -f "${source_udd}/claude_desktop_config.json" ]]; then
-    "$AS_BIN_CP" "${source_udd}/claude_desktop_config.json" "${target_udd}/claude_desktop_config.json"
-    mirrored+=("claude_desktop_config.json")
-  else
-    skipped+=("claude_desktop_config.json (source missing)")
-  fi
+  # 1. claude_desktop_config.json: the settings step above (#11).
 
   # 2. Claude Extensions/ (rsync without --delete; target was moved to snapshot,
   #    so no stale entries to delete).
@@ -2502,20 +3844,20 @@ cmd_clone_prefs() {
   trap - INT TERM EXIT
 
   local m
-  for m in "${mirrored[@]}"; do
+  for m in ${mirrored[@]+"${mirrored[@]}"}; do
     ok "Mirrored: ${m}"
   done
 
   printf '[%s] CLONE_PREFS source=%s target=%s mirrored=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$source_tag" "$target_tag" \
-    "$(IFS=,; echo "${mirrored[*]}")" \
+    "$(IFS=,; echo "${mirrored[*]+"${mirrored[*]}"}")" \
     >> "$SWAP_LOG"
 
   printf '\n'
   if [[ ${#mirrored[@]} -eq 0 ]]; then
-    warn "Nothing was mirrored. Source dir may be missing the expected files."
-    [[ ${#skipped[@]} -gt 0 ]] && warn "Skipped: ${skipped[*]}"
-    return 1
+    # The settings step above ran; only the copies had nothing to copy.
+    info "Nothing else to mirror: '${source_tag}' has no Claude Extensions/, Claude Extensions Settings/ or git-worktrees.json."
+    return 0
   fi
 
   ok "Cloned ${#mirrored[@]} item(s) from '${source_tag}' to '${target_tag}'"
@@ -2597,7 +3939,7 @@ _update_on_exit() {
   local rc=$?
   set +e
   trap '' INT TERM
-  if [[ "$UPD_LOCK_OWNED" == "1" ]]; then
+  if [[ -n "$LOCK_OWNED" ]]; then
     _update_lock_release
     update_observe
   fi
@@ -4303,9 +5645,15 @@ USAGE:
 SUBCOMMANDS (Mac desktop app management):
 
   swap <tag> [flags]     SEAMLESS swap. 3-step flow:
-                           1. Auto-clone-prefs primary→tgt (if tgt is non-primary)
-                           2. Quit current Claude instance(s)
+                           1. Quit current Claude instance(s)
                               (graceful 15s → SIGTERM → SIGKILL via PID list)
+                           2. The settings step (see prefs): update the
+                              synced settings keys in <tag> only, which may
+                              be primary, from every profile; for a tag
+                              other than primary, also clone-prefs'
+                              extension and worktree copy from primary.
+                              Prints one line: applied, kept, skipped,
+                              needs review.
                            3. Launch target instance and bring its window to
                               the front
                          Result: identity display + Mac-app billing align with tgt.
@@ -4314,7 +5662,7 @@ SUBCOMMANDS (Mac desktop app management):
                          MISMATCH it refuses before quitting or writing
                          anything. Ends with the same line as launch.
                          Flags:
-                           --no-mirror       skip step 1
+                           --no-mirror       skip step 2
                            --force           swap even on a MISMATCH
                            --new             allow a tag that is not in
                                              [accounts] and has no folder
@@ -4385,18 +5733,62 @@ SUBCOMMANDS (Mac desktop app management):
                          unless --force.
 
   clone-prefs [src tgt]  Mirror Mac-app user-facing prefs from src to tgt.
-                         Default: clone-prefs primary backup. Mirrors:
-                           - claude_desktop_config.json (sidebar mode,
-                             trusted folders, permissions, web search)
-                             Pre-scanned for sensitive keys; refuses if any
-                             oauth/token-shaped key present (M-10).
+                         Default: clone-prefs primary backup.
+                           - Settings: the key-level step for tgt (see
+                             prefs; src is not used for settings). The
+                             whole claude_desktop_config.json is no longer
+                             copied.
                            - Claude Extensions/ (installed Anthropic exts)
                            - Claude Extensions Settings/
                            - git-worktrees.json (MERGED with target's existing)
-                         Snapshot-rollback semantics: target snapshotted before
-                         apply; restored on failure (M-7).
+                         Snapshot-rollback semantics for those three: target
+                         snapshotted before apply; restored on failure (M-7).
                          Refuses if target instance is running (re-checked
                          after snapshot, before apply, M-11).
+
+  prefs <verb>           Keep 8 global UI settings (the allowlist) the same
+                         in every profile, one key at a time: primary plus
+                         each [accounts] tag whose profile folder exists. A
+                         change in any profile spreads (latest wins); when
+                         the order of two changes can't be known, or a key
+                         has no history and the profiles disagree, the key
+                         needs review (primary's value is proposed). Nothing
+                         else in the file is ever written, and nothing is
+                         deleted. Runs at swap and on request, never at
+                         launch. Running profiles are never written.
+                           diff [--all]       every difference, with no ids
+                                              or paths (read-only). Exit 0
+                                              in sync, 1 not, 2 error
+                           sync [<tag>] [--dry-run]
+                                              update <tag>, or every profile
+                                              not running. Exit 0 done, 1
+                                              done but a key needs review or
+                                              a write was skipped, 2 refused
+                                              (--dry-run: 1 = something to
+                                              write or pending)
+                           review             decide each differing key: use
+                                              primary's or a profile's value,
+                                              pin it, or skip; one confirm
+                                              at the end. Needs a terminal.
+                                              Exit 0 applied, 1 left pending
+                                              or declined, 2 refused
+                           adopt <key-id> --from <tag>
+                                              make <tag>'s value the fleet
+                                              value. Exit 0, 1 a profile
+                                              skipped, 2 refused
+                           pin <tag> <key-id>|--all
+                           unpin <tag> <key-id>|--all
+                                              keep a key (or the whole
+                                              profile) different on purpose.
+                                              Exit 0, 2 refused
+                           undo <tag> [--whole-file]
+                                              reverse the last sync to <tag>,
+                                              key by key (--whole-file:
+                                              restore the prior copy, after a
+                                              confirmation). Exit 0 restored,
+                                              1 nothing to restore, 2 refused
+                         Without a terminal, use diff, sync, adopt, pin,
+                         unpin and undo.
 
   quit [--all]           Quit all running Claude instances:
                            - osascript graceful quit
@@ -4555,6 +5947,19 @@ main() {
       done
       shift
       cmd_update "$@"
+      return 0
+      ;;
+    prefs)
+      # prefs (#11) also gives exit 1 a meaning of its own (not in sync), so
+      # it checks its arguments here and refuses a bad one with 2. It is
+      # dispatched before the log rotation below: diff and sync --dry-run
+      # write nothing at all, and the writing verbs rotate the log themselves.
+      local _p
+      for _p; do
+        if ! ( validate_argv_safe "$_p" ); then exit 2; fi
+      done
+      shift
+      cmd_prefs "$@"
       return 0
       ;;
   esac

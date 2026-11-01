@@ -133,8 +133,12 @@ account-switcher signin backup
 # List configured tags + running instances
 account-switcher list
 
-# SEAMLESS swap: clone prefs from current → target, quit current, launch target
+# SEAMLESS swap: quit current, sync the shared settings into target, launch target
 account-switcher swap backup
+
+# See how the profiles' settings differ (read-only), then decide at a terminal
+account-switcher prefs diff
+account-switcher prefs review
 
 # ADDITIVE launch: spawn target without quitting others (side-by-side mode)
 account-switcher launch backup
@@ -151,7 +155,7 @@ account-switcher quit --all
 account-switcher update
 ```
 
-## How `swap` works internally (4 steps)
+## How `swap` works internally (5 steps)
 
 **Step 0 — Pre-flight validation.** Validates the target tag against
 `^[a-z0-9-]{1,32}$`; refuses to proceed when the target user-data-dir is
@@ -159,14 +163,7 @@ the same as the current. Runs the account check (see § Checking each tag's
 account) before anything else, so a refused swap has quit, captured and
 written nothing. Captures the active PID list at function entry.
 
-**Step 1 — clone-prefs (idempotent prefs mirror).** Mirrors Mac-app
-user-facing prefs from `~/Library/Application Support/Claude` (current) to
-`~/Library/Application Support/Claude-<tag>` (target). Snapshot-rollback
-semantics: ≤1 backup retained per target. Prefs include theme, window
-state, sidebar layout — NOT OAuth state (per-user-data-dir Electron
-safeStorage is isolated by design).
-
-**Step 2 — handoff capture.** Writes a privacy-safe `SWAP_HANDOFF.md`
+**Step 1 — handoff capture.** Writes a privacy-safe `SWAP_HANDOFF.md`
 (metadata + pointers only — no chat text, no file contents, no tokens) so the
 next session in either account can resume coherently. By default it lands in
 `~/.claude/account-switcher/`; point `[swap_handoff].workspace_dir` elsewhere
@@ -175,13 +172,34 @@ is a git repo) it summarizes recent commits + uncommitted files; when
 `[swap_handoff].gh_repo` is set it also captures recent issue + PR activity.
 All of this is optional — skip it per-swap with `--no-handoff`.
 
-**Step 3 — quit + relaunch.** Quits all running Claude instances (graceful
-→ SIGTERM → SIGKILL via the tracked PID list), then launches the target via
-`open -n -a Claude.app --args --user-data-dir "~/Library/Application
-Support/Claude-<tag>"`. The Electron parent process loads from the tagged
-user-data-dir; its OAuth state is isolated from every other tagged dir.
-Then it brings the new window to the front and prints the closing line
-described in the next section.
+**Step 2 — quit.** Quits all running Claude instances (graceful → SIGTERM →
+SIGKILL via the tracked PID list). Quitting also makes each instance write
+its settings file, and means the target is not running for the next step.
+
+**Step 3 — the settings step.** After every instance has quit and before
+the target launches, swap updates the 8 synced settings keys (see
+§ Settings sync between profiles) in the target only, which may be
+`primary`, from every participating profile, and prints one line:
+
+```
+settings: 2 applied to backup (new-session-worktree from primary, transcript-links-in-preview from primary), 1 kept (pinned), 0 skipped, 1 needs review: run 'account-switcher prefs review'
+```
+
+For a target other than `primary`, the step runs through `clone-prefs
+primary <tag>`, which then copies `Claude Extensions/`, `Claude Extensions
+Settings/` and the `git-worktrees.json` merge from primary as before
+(snapshot-rollback semantics: ≤1 backup retained per target). Nothing else in
+the settings file is written, and OAuth state is never touched
+(per-user-data-dir Electron safeStorage is isolated by design).
+`--no-mirror` skips the step. Whatever it reports (a key that needs review,
+a held lock, a settings file that isn't valid JSON), the swap goes on to
+launch.
+
+**Step 4 — relaunch.** Launches the target via `open -n -a Claude.app --args
+--user-data-dir "~/Library/Application Support/Claude-<tag>"`. The Electron
+parent process loads from the tagged user-data-dir; its OAuth state is
+isolated from every other tagged dir. Then it brings the new window to the
+front and prints the closing line described in the next section.
 
 ## The window in front after `launch` and `swap`
 
@@ -452,6 +470,133 @@ profile is visible. The switcher never deletes one; register it with
 `add-account`, or trash the folder yourself once you are sure nothing in it
 is needed.
 
+## Settings sync between profiles (`prefs`)
+
+Each profile keeps its own `claude_desktop_config.json`. The switcher keeps a
+short allowlist of global UI preferences the same in every participating
+profile, one key at a time, and never writes anything else in the file.
+**Participating profiles** are `primary` plus every tag in `[accounts]` whose
+profile folder exists (`default` is `primary`). It runs at `swap` (for the
+target) and on request, never at `launch`.
+
+**Key classes.** A family is a top-level key, a direct child of
+`preferences`, or a direct child of `preferences.epitaxyPrefs`; many of the
+last are flat names that contain dots (`projects.library.layout`), which the
+switcher always treats as one literal key name.
+
+| Class | What | Synced? |
+|---|---|---|
+| **G** | global UI preference: the 8 keys below | **Yes**, the only keys ever written |
+| **C** | capability toggle (Chrome extension, browser tools, web search) | No; `prefs diff` shows where it differs |
+| **S** | security or policy (bypass-permissions mode, trusted folders, remote control, scheduled tasks, the draft permission mode) | No; `prefs diff` shows where it differs |
+| **A** | account-keyed (a name ending in an account id, or a map keyed by account or account/org) | No; `prefs diff` counts the entries and accounts |
+| **L** | profile-local (device pairing, layout, a name holding a session, project or path) | No; `prefs diff` counts them |
+| **U** | unclassified (a key a later app version added) | No; `prefs diff` lists it by masked name. It syncs only once it joins the allowlist |
+
+The class G allowlist, by key id: `sidebar-mode`, `keep-awake`,
+`preferred-browser` (under `preferences`), and `new-session-worktree`,
+`transcript-links-in-preview`, `preferred-editor`,
+`projects-library-layout`, `projects-library-small-icons` (under
+`preferences.epitaxyPrefs`). A key whose JSON type differs from the
+allowlist's in any profile is left alone for that run.
+
+**How a value is chosen.** The switcher remembers, per key, the value it
+last saw in each profile and the agreed *fleet value*, in
+`~/.claude/account-switcher/prefs-sync.json` (mode 600; allowlisted values
+only). A profile *changed* a key when its value differs from the one last
+seen; a profile that differs from the fleet value without having changed is
+*behind*.
+
+| Situation | Result |
+|---|---|
+| No history; every profile holds the key with the same value | initialized; nothing written |
+| No history; the profiles disagree, or some lack the key | **needs review**, with `primary`'s value proposed (no default when `primary` lacks it) |
+| No profile changed it | behind profiles get the fleet value |
+| Profiles changed it, all to one value | that value wins (latest wins) and goes to the others |
+| Profiles changed it to different values | **needs review**: the order of two changes seen in one run is unknown |
+| Only a pinned profile changed it | kept (pinned); it doesn't spread |
+| The app removed it from a profile | not re-added there; the removal doesn't spread |
+
+A key that needs review stays that way, and nothing is written for it, until
+`prefs review` or `prefs adopt` settles it, or every unpinned profile holds
+the same value again. A running profile is never written; it catches up at
+its next sync. Deleting `prefs-sync.json` resets the change memory: the next
+run sends every disagreement to review, never to a whole-file copy.
+
+**What each command touches.**
+
+| Command | Profile settings files | Prior copy | Sync state | History log |
+|---|---|---|---|---|
+| `launch <tag>` | not read, not written | not touched | not touched | `LAUNCH` row |
+| `swap <tag>` | after every instance quit, before the launch: reads every profile, updates `<tag>` (may be `primary`); `--no-mirror` skips it | replaced in `<tag>` | read and updated | `PREFS_SYNC` row (and `CLONE_PREFS` for a tag other than primary) |
+| `clone-prefs [src] <tgt>` | reads every profile, updates `<tgt>`; `src` drives only the extension and worktree copy | replaced in `<tgt>` | read and updated | `PREFS_SYNC` and `CLONE_PREFS` rows |
+| `prefs diff [--all]` | read only | not touched | read only | none |
+| `prefs sync [<tag>] [--dry-run]` | reads every profile, updates `<tag>` or every profile not running | replaced in each profile written | updated (not with `--dry-run`) | `PREFS_SYNC` (not with `--dry-run`) |
+| `prefs review` | after the final confirmation, updates the profiles not running | replaced in each profile written | fleet values, pins, pending keys | `PREFS_SYNC` |
+| `prefs adopt <key-id> --from <tag>` | updates that key in every unpinned profile not running | replaced in each profile written | fleet value set, pending cleared | `PREFS_SYNC` |
+| `prefs pin`, `prefs unpin` | not touched | not touched | pins | `PREFS_PIN` |
+| `prefs undo <tag> [--whole-file]` | updates `<tag>` | read for `--whole-file`, and kept | undone keys need review; undo record cleared | `PREFS_UNDO` |
+| `quit`, `list`, `status`, `config`, `add-account`, `help` | not touched | not touched | not touched | as before |
+
+**Nothing deletes.** No command removes a profile's settings file, a key in
+it, or a prior copy. Before a write, the switcher replaces
+`claude_desktop_config.json.sync-prev` in that profile's own folder with the
+current file (mode 600): exactly one per profile, and no copy of a profile's
+settings outside its folder. Every write builds the new file inside the
+profile folder, checks that it equals the old one once the 8 allowlisted
+paths are removed from both, re-checks that the profile isn't running, and
+renames it into place, all under the lock `~/.claude/account-switcher/.prefs-sync.lock`
+(stale after 10 minutes, reported and never removed, like `update`'s).
+
+**Running checks.** A profile is running when an instance's row in `list`
+resolves to it (a process without `--user-data-dir` is `primary`). Every
+command except `swap` writes nothing, and says why, when more than one
+instance runs without `--user-data-dir`, when an instance reads `unknown`
+(it could be any profile), or when the process list can't be read. `swap`
+runs its settings step after quitting every instance, so only the re-check
+before each write applies; when the process list can't be read then, it
+skips the step with a warning and still launches.
+
+**See the differences.** `prefs diff` lists, for each synced key, its
+status, the fleet value and each profile's value, marked *changed*,
+*behind*, *pinned* or *removed by the app*; then the C and S settings that
+differ (booleans as they are, lists as entry counts); the number of
+account-keyed entries per profile, for how many accounts, and of local
+entries; and U settings by masked name. It never prints an account, org,
+session or project id, a path or an email. `--all` adds profile folders that
+don't participate (run it after each app update and classify any U family).
+Exit `0` in sync with nothing pending, `1` otherwise, `2` on error.
+
+**Decide.** `prefs review` (it needs a terminal) walks every key that needs
+review, is behind, or is pinned somewhere, shows each profile's value and
+offers: use `primary`'s value (the default when there's no fleet value and
+`primary` has one), use another profile's value, keep the key different in
+one profile (a pin), or skip. At the end it shows the planned writes per
+profile and asks once. Without a terminal, use `prefs adopt <key-id> --from
+<tag>` (it always sets the fleet value), `prefs pin <tag> <key-id>` (or
+`--all` for the whole profile) and `prefs unpin`.
+
+**Undo.** `prefs undo <tag>` works key by key from the record of the last
+sync that wrote `<tag>`: each key that still holds the synced value goes back
+to its previous value, everything else in the file stays as it is now, and
+the undone keys need review, so the next `swap` neither re-applies them nor
+spreads the restored values. A key that sync added is left, since nothing
+deletes. `--whole-file` restores the prior copy, after a confirmation that
+says changes the app made since the sync will be lost. Both refuse while
+`<tag>` is running.
+
+**Exit codes.** `prefs sync`: `0` done with nothing pending or skipped, `1`
+done but a key needs review or a write was skipped, `2` refused (nothing
+written); with `--dry-run`, `1` means something would be written or is
+pending. `prefs review`: `0` applied with nothing left pending, `1` something
+left pending or the plan declined, `2` refused. `prefs adopt`: `0`, `1` a
+profile was skipped, `2` refused. `prefs pin` and `unpin`: `0`, `2` refused.
+`prefs undo`: `0` restored, `1` nothing to restore, `2` refused.
+
+**Still to confirm on a live machine** (the issue's open assumptions): that
+the app reads the file at startup and doesn't restore these keys from
+another store, and that they behave the same on every account.
+
 ## What's shared automatically across accounts
 
 | Surface | Path | Why shared |
@@ -469,6 +614,7 @@ is needed.
 |---|---|---|
 | OAuth tokens | Inside `--user-data-dir`'s Electron `safeStorage` | Billing identity isolation |
 | Mac app preferences | `~/Library/Application Support/Claude-<tag>/Preferences` | Per-app-instance UI state |
+| Desktop settings (`claude_desktop_config.json`) | In each profile folder | Account-keyed, security, capability and local entries stay per profile; only the 8 class G keys are kept the same, by `swap` and `prefs` (see § Settings sync between profiles) |
 | Cloud chat sidebar | Server-side per Anthropic | Anthropic owns the cloud sidebar source |
 | Subscription state | Server-side per Anthropic | Bound to OAuth identity |
 
@@ -515,13 +661,19 @@ non-ASCII characters are rejected (prevents shell injection in the
 
 | Subcommand | Action |
 |---|---|
-| `swap <tag> [flags]` | Quit current + launch target. Flags: `--no-mirror` (skip clone-prefs), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`), `--new` (allow a tag that is not in `[accounts]` and has no folder). Ends with the same closing line as `launch`. |
+| `swap <tag> [flags]` | Quit current, run the settings step for the target (see § Settings sync between profiles), launch target. Flags: `--no-mirror` (skip the settings step), `--no-handoff` (skip SWAP_HANDOFF.md capture), `--note "<text>"` (context for the handoff, max 240 chars), `--force` (swap even when the account check reads `MISMATCH`), `--new` (allow a tag that is not in `[accounts]` and has no folder). Ends with the same closing line as `launch`. |
 | `launch <tag> [--force] [--new]` | ADDITIVE launch. Spawns target without quitting others; use for side-by-side mode. Refuses on an account-check `MISMATCH` unless `--force`, a tag neither configured nor on disk unless `--new` (see § New tags), and while `update` runs. Brings the new window to the front and ends with `tag=<tag> pid=<pid> front=yes\|no account=<label\|unrecognized\|unknown> status=<match\|MISMATCH\|unknown>`; see § The window in front. |
 | `update [--yes]` | Install the waiting app update: list the instances it will close, ask (`--yes` skips), close them through the quit path, wait for the install, reopen the same tags, print the version before and after. Exit `0` installed or nothing staged, `1` version unchanged, `2` refused, `3` a tag did not reopen. See § App updates. |
 | `signin <tag> [--quit-others] [--yes] [--timeout <s>] [--settle <s>] [--new]` (or `login`) | Sign one tag in. Other instances stay open by default; afterwards it checks that no other profile's account changed (a change is detected after the fact, not prevented), and reports `match`, `MISMATCH` or `unknown` for the tag. `--quit-others` signs in with nothing else open. Exit `0`/`1`/`3` for the tag, `2` refused, `4` another profile changed. See § Signing in a tag. |
 | `identity [<tag> \| --all] [--show-ids]` | Read-only account check: one row per tag in `[accounts]` with its expected account (label), the account its profile records, and `match`, `MISMATCH` or `unknown`. Exit `0` no MISMATCH, `1` a MISMATCH, `2` cannot run. See § Checking each tag's account. |
 | `identity pin <tag> [--yes] [--force]` | Pin the account the tag's profile holds now as its expected account, in `[identity]` of config.toml. Refuses an account already pinned to another tag unless `--force`. |
-| `clone-prefs [src] [tgt]` | Mirror Mac-app prefs src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
+| `clone-prefs [src] [tgt]` | The key-level settings step for tgt (the whole settings file is no longer copied), then mirror `Claude Extensions/`, `Claude Extensions Settings/` and `git-worktrees.json` src → tgt with snapshot-rollback. Defaults to `primary → <last-target>` when invoked without args. |
+| `prefs diff [--all]` | Read-only: every difference between the profiles' settings, with no ids or paths. Exit `0` in sync, `1` not, `2` error. |
+| `prefs sync [<tag>] [--dry-run]` | Sync the 8 allowlisted keys into `<tag>`, or every profile not running. Exit `0`, `1` a key needs review or a write was skipped, `2` refused. |
+| `prefs review` | Decide each key that differs (needs a terminal). Exit `0`, `1` left pending or declined, `2` refused. |
+| `prefs adopt <key-id> --from <tag>` | Make `<tag>`'s value the fleet value. Exit `0`, `1` a profile skipped, `2` refused. |
+| `prefs pin <tag> <key-id>\|--all`, `prefs unpin …` | Keep a key (or a whole profile) different on purpose. Exit `0`, `2` refused. |
+| `prefs undo <tag> [--whole-file]` | Reverse the last sync to `<tag>`. Exit `0`, `1` nothing to restore, `2` refused. |
 | `quit [--all]` | Quit running Claude instances. `--all` quits every instance; bare `quit` quits only the current foreground instance. Graceful → SIGTERM → SIGKILL escalation. |
 | `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. Profile folders whose tag is not in `[accounts]` are marked `unconfigured` (never deleted), and the last block shows the installed app version, the staged one (or `none`, or `unknown`) and how long it has waited. |
 | `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |

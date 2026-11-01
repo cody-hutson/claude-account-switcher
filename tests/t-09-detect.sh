@@ -290,31 +290,35 @@ case_clone_primary_running() {
 
 case_clone_primary_other_tags() {
   # Only tag-a and tag-b run (and a non-Claude process naming primary's
-  # folder). The running check passes, so the next guard (M-10, a
-  # sensitive-looking key in the source) is what stops it.
+  # folder). The running check passes. The next guard was M-10 (a
+  # sensitive-looking key in the source); #11 replaced the whole-file copy
+  # it guarded with the key-level step, which never copies such a key.
   scenario ps-tags-only.txt
   clone_files
   printf '{"oauth":"fake"}\n' > "${AS_PROFILE_ROOT}/Claude-tag-a/claude_desktop_config.json"
   local before
   before="$(tree_digest "${AS_PROFILE_ROOT}/Claude")"
   run_switcher clone-prefs tag-a primary
-  assert_rc 1 &&
+  assert_rc 0 &&
     assert_not_contains "$err" "currently running" &&
     assert_not_contains "$err" "Cannot tell" &&
-    assert_contains "$err" "sensitive-looking keys" &&
+    assert_not_contains "$(< "${AS_PROFILE_ROOT}/Claude/claude_desktop_config.json")" "oauth" &&
     assert_tree_unchanged "${AS_PROFILE_ROOT}/Claude" "$before"
-  result "clone-prefs <src> primary: with only other tags running it passes the running check to the next guard" $?
+  result "clone-prefs <src> primary: with only other tags running it passes the running check, and the source's token-shaped key never reaches primary (#11: key-level step, no M-10 scan)" $?
 }
 
 case_clone_primary_writes() {
   scenario ps-tags-only.txt
   clone_files
   run_switcher clone-prefs tag-a primary
+  # #11: the settings step is key-level and these files hold no allowlisted
+  # key, so primary's file stays as it is; the step and #11's running rule
+  # read the table too.
   assert_rc 0 &&
-    assert_contains "$err" "Cloned 1 item(s) from 'tag-a' to 'primary'" &&
-    assert_eq "$(< "${AS_PROFILE_ROOT}/Claude/claude_desktop_config.json")" '{"sidebarMode":"source"}' "target config" &&
-    assert_eq "$(count_lines "$(calls_of ps)")" "2" "process-table reads (pre-snapshot check and pre-apply re-check)"
-  result "clone-prefs <src> primary: proceeds and writes when primary is not running; both checks read the table" $?
+    assert_contains "$err" "settings: 0 applied to primary" &&
+    assert_eq "$(< "${AS_PROFILE_ROOT}/Claude/claude_desktop_config.json")" '{"sidebarMode":"target"}' "target config" &&
+    assert_eq "$(count_lines "$(calls_of ps)")" "4" "process-table reads (pre-snapshot check, the running rule, the settings step, pre-apply re-check)"
+  result "clone-prefs <src> primary: proceeds when primary is not running (#11: no allowlisted key, so the file is left as it is); every check reads the table" $?
 }
 
 case_clone_primary_undetermined() {
@@ -357,7 +361,7 @@ case_clone_tag_prefix() {
   rc_run="$rc"
   err_run="$err"
   ok_run=0
-  [[ "$rc_run" == "0" && "$err_run" == *"Cloned 1 item(s) from 'primary' to 'tag-a'"* ]] || ok_run=1
+  [[ "$rc_run" == "0" && "$err_run" == *"settings: 0 applied to tag-a"* ]] || ok_run=1
   # Control: tag-a itself runs: it refuses.
   scenario ps-three.txt
   printf '{"sidebarMode":"source"}\n' > "${AS_PROFILE_ROOT}/Claude/claude_desktop_config.json"
@@ -376,12 +380,14 @@ case_swap_mirror_undetermined() {
   clone_files
   export AS_FAKE_QUIT=graceful
   run_switcher swap tag-a --no-handoff
+  # #11: the settings step runs after the quit, when nothing is running, so
+  # an undetermined target before the quit no longer skips it.
   assert_rc 0 &&
-    assert_contains "$err" "Skipping auto-mirror: cannot tell whether 'tag-a' is running" &&
-    assert_never_called mktemp &&
+    assert_contains "$out" "settings: 0 applied to tag-a" &&
+    assert_call_order osascript mktemp &&
     assert_called osascript $'-e\ttell application "Claude" to quit' &&
     assert_called open "--user-data-dir=${AS_PROFILE_ROOT}/Claude-tag-a"
-  result "swap: an undetermined target skips the mirror with a reason, then quits and launches" $?
+  result "swap: an undetermined target before the quit no longer skips the settings step (#11: it runs after the quit), then launches" $?
 }
 
 # ---- quit ------------------------------------------------------------------
