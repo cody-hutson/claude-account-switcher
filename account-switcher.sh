@@ -869,7 +869,8 @@ identity_current_text() {
 # identity_gate <tag> <force: true|false> <launch|swap>
 # The #6 check launch and swap run before they open, quit or capture
 # anything. It only reads. On MISMATCH without --force it refuses (exit 1)
-# with the recovery steps, and nothing has been opened, quit or written.
+# with the recovery steps, and nothing has been opened or quit and no
+# profile written (main may have trimmed the switcher's own history log).
 # Otherwise it prints one status line and appends one IDENTITY row (tag and
 # status word only) to the history log. It never quits an instance.
 identity_gate() {
@@ -6052,12 +6053,13 @@ SUBCOMMANDS (Mac desktop app management):
                          Workspace (~/.claude/) stays bidirectional.
                          Runs the account check (see identity) before it
                          opens or quits anything: on a MISMATCH it refuses
-                         before quitting or writing anything. Ends with the
-                         same line as launch. Exit 0 swapped; 1 refused (a
-                         MISMATCH, a tag that is not configured, update
-                         running, the app not where detection looks), an
-                         instance would not quit, or open failed (every
-                         instance was quit; run launch <tag>).
+                         before it quits anything or writes any profile.
+                         Ends with the same line as launch. Exit 0
+                         swapped; 1 refused (a MISMATCH, a tag that is not
+                         configured, update running, the app not where
+                         detection looks), an instance would not quit, or
+                         open failed (every instance was quit; run launch
+                         <tag>).
                          Flags:
                            --no-mirror       skip step 2
                            --force           swap even on a MISMATCH

@@ -161,8 +161,9 @@ account-switcher update
 **Step 0 — Pre-flight validation.** Validates the target tag against
 `^[a-z0-9-]{1,32}$`; refuses to proceed when the target user-data-dir is
 the same as the current. Runs the account check (see § Checking each tag's
-account) before anything else, so a refused swap has quit, captured and
-written nothing. Captures the active PID list at function entry.
+account) before it quits or captures anything or writes any profile, so a
+refused swap has quit and captured nothing and written no profile.
+Captures the active PID list at function entry.
 
 **Step 1 — handoff capture.** Writes a privacy-safe `SWAP_HANDOFF.md`
 (metadata + pointers only — no chat text, no file contents, no tokens) so the
@@ -355,9 +356,9 @@ they open, quit or capture anything:
 
 - `match` prints the tag's label and carries on.
 - `unknown` carries on and prints a one-line hint naming `identity pin`.
-- `MISMATCH` refuses: nothing is opened, quit or written, and every running
-  instance is left alone. `--force` launches or swaps anyway and still
-  prints the warning.
+- `MISMATCH` refuses: nothing is opened or quit, no profile is written,
+  and every running instance is left alone. `--force` launches or swaps
+  anyway and still prints the warning.
 
 **Recovering from a mismatch.**
 
