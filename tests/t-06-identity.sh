@@ -468,7 +468,12 @@ case_show_ids() {
   run_switcher identity --all
   keep_run
   local plain_out="$out" plain_err="$err"
+  # --show-ids is terminal-only (S-02); the override makes the case's
+  # redirected stdout count as one.
+  AS_TEST_STDOUT_IS_TTY=1
+  export AS_TEST_STDOUT_IS_TTY
   run_switcher identity --all --show-ids
+  unset AS_TEST_STDOUT_IS_TTY
   keep_run
   assert_no_id_text "$plain_out" "stdout without --show-ids" &&
     assert_no_id_text "$plain_err" "stderr without --show-ids" &&
@@ -481,6 +486,82 @@ case_show_ids() {
     assert_no_id_text "$(history_text)" "the history log" &&
     assert_no_leaks show-ids
   result "--show-ids prints the pinned and recorded ids on stdout only; without it no id is printed" $?
+}
+
+case_show_ids_needs_terminal() {
+  scenario
+  write_config "tag-a=${ID_A}" "tag-b=${ID_B}"
+  record tag-a "$ID_A"
+  record tag-b "$ID_X"
+  # stdout is a file here, as in the slash command's transcript.
+  run_switcher identity --all --show-ids
+  keep_run
+  local file_rc="$rc" file_out="$out" file_err="$err"
+  # The override set to 0 reads as "not a terminal" too.
+  AS_TEST_STDOUT_IS_TTY=0
+  export AS_TEST_STDOUT_IS_TTY
+  run_switcher identity tag-a --show-ids
+  unset AS_TEST_STDOUT_IS_TTY
+  keep_run
+  assert_eq "$file_rc" "2" "exit with stdout not a terminal" &&
+    assert_eq "$file_out" "" "stdout" &&
+    assert_contains "$file_err" "identity --show-ids prints whole account ids, so it runs only with its output on a terminal" &&
+    assert_no_id_text "$file_err" "stderr" &&
+    assert_rc 2 &&
+    assert_eq "$out" "" "stdout (override 0)" &&
+    assert_no_leaks
+  result "--show-ids with stdout not a terminal (a file, or the override 0) -> refused, exit 2, nothing printed, no id anywhere" $?
+}
+
+# run_traced <trace file> <arg> ...: the switcher under /bin/bash -x, each
+# trace line prefixed with its function; the trace goes to <trace file>,
+# under the case root, where the leak scan reads it.
+run_traced() {
+  local tr="$1" o="${AS_TEST_ROOT}/.run-out"
+  shift
+  (
+    cd "$AS_TEST_ROOT" || exit 2
+    _child_env
+    # shellcheck disable=SC2016
+    PS4='+${FUNCNAME[0]:-main}: '
+    export PS4
+    exec /bin/bash -x "$SWITCHER" "$@"
+  ) > "$o" 2> "$tr" < /dev/null
+  rc=$?
+  out="$(< "$o")"
+  err="$(< "$tr")"
+}
+
+case_trace_identity_status() {
+  local t_id="${AS_TEST_ROOT:-}" id_rc id_out st_rc
+  scenario
+  write_config "tag-a=${ID_A}" "tag-b=${ID_B}"
+  record tag-a "$ID_A"
+  record tag-b "$ID_B"
+  # status reads the keychain item into a shell variable; a placeholder in it
+  # would show in a trace of that assignment.
+  AS_FIXTURE_KEYCHAIN_JSON='{"claudeAiOauth":{"accessToken":"'"${TOKEN_MARK}"'-3","subscriptionType":"fake","rateLimitTier":"fake"}}'
+  export AS_FIXTURE_KEYCHAIN_JSON
+  t_id="${AS_TEST_ROOT}/trace-identity.txt"
+  run_traced "$t_id" identity --all
+  id_rc="$rc" id_out="$out"
+  keep_run
+  run_traced "${AS_TEST_ROOT}/trace-status.txt" status
+  st_rc="$rc"
+  keep_run
+  local hex64='[0-9a-fA-F]{64}' both
+  both="$(< "$t_id")"$'\n'"$(< "${AS_TEST_ROOT}/trace-status.txt")"
+  assert_eq "$id_rc" "0" "identity exit" &&
+    assert_contains "$id_out" "tag-a" &&
+    assert_eq "$st_rc" "0" "status exit" &&
+    assert_contains "$out" "subscription: fake" &&
+    { [[ "$both" == *"+_as_test_mode_interlock: "* ]] || { printf '    the traces show nothing, so bash -x was not on\n'; false; }; } &&
+    assert_not_contains "$both" "profile_account_uuid: " &&
+    assert_not_contains "$both" "cmd_status: " &&
+    { [[ ! "$both" =~ $hex64 ]] || { printf '    a trace holds a 64-hex run\n'; false; }; } &&
+    assert_no_id_text "$both" "the traces" &&
+    assert_no_leaks
+  result "identity and status under bash -x: no uuid-shaped string, 64-hex run or placeholder token appears in the output or the trace, which stops right after the seam block (control: the leak scan finds both in the control fixture)" $?
 }
 
 case_identity_read_only() {
@@ -849,6 +930,8 @@ case_torn_read_retry
 case_status_contract
 case_identity_exit_codes
 case_show_ids
+case_show_ids_needs_terminal
+case_trace_identity_status
 case_identity_read_only
 case_launch_mismatch_refuses
 case_launch_unrecognized_refuses

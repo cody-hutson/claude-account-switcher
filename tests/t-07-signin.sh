@@ -332,14 +332,14 @@ raw_hits() {
 
 # is_exempt <kind> <file>: the fixture config.json files and the control
 # fixture are exempt; config.toml for ids only (its [identity] table is
-# where pins live, by design); a trace a case names in T7_TRACE for ids and
-# hex only (xtrace shows digests and the target's own id, by design).
+# where pins live, by design). A trace (case 17) is not exempt: the script
+# turns tracing off right after its seam block (S-01), so a trace must hold
+# no id, digest or placeholder either.
 is_exempt() {
   case "$2" in
     "${AS_PROFILE_ROOT}/Claude/config.json"|"${AS_PROFILE_ROOT}/Claude-"*/config.json|"${AS_TEST_ROOT}/control/"*) return 0 ;;
   esac
   if [[ "$1" == "ids" && "$2" == "${AS_STORE}/config.toml" ]]; then return 0; fi
-  if [[ "$1" != "token" && -n "${T7_TRACE:-}" && "$2" == "$T7_TRACE" ]]; then return 0; fi
   return 1
 }
 
@@ -1051,9 +1051,9 @@ FAKE
 # ---- Case 17: the trace ----------------------------------------------------------
 
 # run_trace: case 1 under /bin/bash -x, each trace line prefixed with the
-# function it ran in. The trace goes to T7_TRACE (exempt from the id and hex
-# scans: xtrace shows digests and the target's own id through #6's read, by
-# design); stdout goes to the transcript as usual.
+# function it ran in. The trace goes to T7_TRACE, under the case root, which
+# the scans read like every other file; stdout goes to the transcript as
+# usual.
 run_trace() {
   local o="${AS_TEST_ROOT}/.run-out"
   T7_TRACE="${AS_TEST_ROOT}/trace.txt"
@@ -1075,22 +1075,22 @@ case_17_trace() {
   scenario
   step 2 'set_key alpha 2'
   run_trace
-  local l body n=0 jq_lines=0 bad="" trace
+  local trace planted="${AS_TEST_ROOT}/control/planted-trace.txt"
   trace="$(< "$T7_TRACE")"
-  while IFS= read -r l || [[ -n "$l" ]]; do
-    body="${l#"${l%%[!+]*}"}"
-    [[ "$body" == "snapshot_read: "* ]] || continue
-    n=$((n + 1))
-    [[ "$body" == *"input | if type"* ]] && jq_lines=$((jq_lines + 1))
-    if [[ "$body" =~ $UUID_ERE || "$body" == *"$TOKEN_MARK"* ]]; then bad="${bad}"$'\n'"      ${body:0:80}"; fi
-  done < "$T7_TRACE"
+  # The control arm: one planted trace line of each kind (the shapes a trace
+  # showed before the guard), in the exempt control folder. The same scans
+  # must find each, so a clean result below is not a scan that matches
+  # nothing.
+  printf '+profile_account_uuid: v=%s\n+_snap_add: d=%064d\n+cmd_status: kc=%s\n' "$ID_A" 0 "$TOKEN_MARK" > "$planted"
   assert_rc 0 &&
-    { [[ $n -gt 0 && $jq_lines -gt 0 ]] || { printf '    no traced line inside snapshot_read (%s, jq %s)\n' "$n" "$jq_lines"; false; }; } &&
-    assert_eq "${bad}" "" "snapshot_read trace lines holding an id or a placeholder" &&
-    { [[ "$trace" == *"$ID_A"* ]] || { printf "    control: the target's own id (read by #6) is not in the trace, so the scan proves nothing\n"; false; }; } &&
-    assert_not_contains "$trace" "$TOKEN_MARK" &&
+    { [[ -n "$(raw_hits ids "$planted")" && -n "$(raw_hits hex "$planted")" && -n "$(raw_hits token "$planted")" ]] \
+        || { printf '    control: a scan missed a planted id, 64-hex run or placeholder\n'; false; }; } &&
+    { [[ "$trace" == *"+_as_test_mode_interlock: "* ]] || { printf '    the trace shows nothing, so bash -x was not on\n'; false; }; } &&
+    assert_not_contains "$trace" "snapshot_read: " &&
+    assert_not_contains "$trace" "profile_account_uuid: " &&
+    assert_eq "$(raw_hits ids "$T7_TRACE")$(raw_hits hex "$T7_TRACE")$(raw_hits token "$T7_TRACE")" "" "trace files holding an id, a 64-hex run or a placeholder" &&
     assert_clean
-  finish_case "17. case 1 under bash -x: no traced line inside snapshot_read holds any profile's id or a placeholder (control: the target's id, read by #6, is in the trace)" $?
+  finish_case "17. case 1 under bash -x: no uuid-shaped string, 64-hex run or placeholder token appears anywhere in the output or the trace, which stops right after the seam block (control: the same scans find each kind in a planted trace line)" $?
 }
 
 # ---- Case 18: interrupt -------------------------------------------------------------

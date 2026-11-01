@@ -116,19 +116,28 @@ _as_test_mode_interlock() {
     _as_test_under "${AS_TEST_POLL_HOOK:-}" "$root" || _as_test_refuse "AS_TEST_POLL_HOOK is not under AS_TEST_ROOT (got '${AS_TEST_POLL_HOOK:-}')"
     [[ -f "${AS_TEST_POLL_HOOK:-}" && -x "${AS_TEST_POLL_HOOK:-}" ]] || _as_test_refuse "AS_TEST_POLL_HOOK is not an executable file (got '${AS_TEST_POLL_HOOK:-}')"
   fi
+
+  # 9. The stdout-is-a-terminal override `identity --show-ids` reads (#6),
+  #    when set, is 0 or 1.
+  case "${AS_TEST_STDOUT_IS_TTY:-}" in
+    ""|0|1) ;;
+    *) _as_test_refuse "AS_TEST_STDOUT_IS_TTY is not 0 or 1 (got '${AS_TEST_STDOUT_IS_TTY:-}')" ;;
+  esac
 }
 
 AS_SEAM_BINS="AWK BASENAME CAT CHMOD COMMAND CP CUT DATE DU GIT GREP HEAD INSTALL JQ KILL LSAPPINFO LSOF MKDIR MKTEMP MV OD OPEN OSASCRIPT PLISTBUDDY PLUTIL PS PYTHON3 RM RSYNC SECURITY SED SHASUM SLEEP TAIL TR WC"
 AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_DIR"
-# Two test-only names for signin (#7) and update (#10), honoured only in test
-# mode like every seam name: AS_TEST_STDIN_IS_TTY=1 makes stdin count as a
-# terminal, and AS_TEST_POLL_HOOK names a scratch script signin and update
-# run once per poll, so a case can change the scenario between polls.
+# Test-only names, honoured only in test mode like every seam name:
+# AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal (signin #7, update
+# #10, prefs #11); AS_TEST_STDOUT_IS_TTY=1 makes stdout count as one
+# (identity --show-ids, #6); and AS_TEST_POLL_HOOK names a scratch script
+# signin and update run once per poll, so a case can change the scenario
+# between polls.
 if [[ "${AS_TEST_MODE:-0}" != "1" ]]; then
   # Production: the environment is ignored.
   for _n in $AS_SEAM_BINS; do unset "AS_BIN_${_n}"; done
   for _n in $AS_SEAM_ROOTS; do unset "AS_${_n}"; done
-  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC AS_TEST_STDIN_IS_TTY AS_TEST_POLL_HOOK
+  unset _n AS_TEST_ROOT AS_FAKES_DIR AS_KEYCHAIN_SVC AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
 fi
 : "${AS_BIN_AWK:=/usr/bin/awk}"
 : "${AS_BIN_BASENAME:=/usr/bin/basename}"
@@ -184,10 +193,19 @@ readonly AS_BIN_AWK AS_BIN_BASENAME AS_BIN_CAT AS_BIN_CHMOD AS_BIN_COMMAND \
 readonly AS_STORE AS_CLAUDE_JSON AS_PROFILE_ROOT AS_APP_BUNDLE AS_UPDATER_CACHE \
   AS_APP_LOG_DIR AS_KEYCHAIN_SVC
 AS_TEST_STDIN_IS_TTY="${AS_TEST_STDIN_IS_TTY:-}"
+AS_TEST_STDOUT_IS_TTY="${AS_TEST_STDOUT_IS_TTY:-}"
 AS_TEST_POLL_HOOK="${AS_TEST_POLL_HOOK:-}"
-readonly AS_TEST_STDIN_IS_TTY AS_TEST_POLL_HOOK
+readonly AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
 
 # ---- End of test seam -----------------------------------------------------
+
+# No tracing past this point, whatever turned it on: bash -x, an exported
+# SHELLOPTS that holds xtrace, or a BASH_ENV that sets -x. A trace would print
+# the sign-in salt and digests (#7), the account id #6 reads from a profile,
+# and the keychain value status reads, since each passes through a shell
+# variable or a traced command line. Unconditional: there is no debug
+# opt-in. The seam block above holds none of these, so tracing it is harmless.
+{ set +x; } 2>/dev/null
 
 # ---- Constants & paths ---------------------------------------------------
 
@@ -276,6 +294,29 @@ rotate_swap_log_if_needed() {
     "$AS_BIN_MV" -f "$tmp" "$SWAP_LOG"
     "$AS_BIN_CHMOD" 600 "$SWAP_LOG"
   fi
+}
+
+# ---- Store and history-log modes (S-06) ------------------------------------
+#
+# No global umask: it would also change the mode of the profile files the app
+# owns that the switcher rewrites. Instead the two things the switcher may
+# create in its store get their modes where they are created: the store
+# folder 700, and swap-history.log 600 (a umask inside a subshell, for that
+# one empty file). _swap_log_ensure runs before every row is appended, so the
+# first row never creates the log with the caller's umask.
+
+_swap_log_ensure() {
+  if [[ -d "$STORE" && ! -e "$SWAP_LOG" ]]; then
+    ( umask 077 && : >> "$SWAP_LOG" ) 2>/dev/null || :
+  fi
+  return 0
+}
+
+# _store_ensure: creates the store (mode 700) when it is missing; returns 1
+# when it can't.
+_store_ensure() {
+  if [[ ! -d "$STORE" ]]; then "$AS_BIN_MKDIR" -p -m 700 "$STORE" 2>/dev/null || return 1; fi
+  return 0
 }
 
 # ---- TOML reader (hand-rolled; supports flat and one-level table.key) ----
@@ -598,8 +639,8 @@ udd_for_tag() {
 # hold in the [identity] table of config.toml (`identity pin <tag>`), and
 # launch, swap and the read-only `identity` command compare the two.
 # Output names labels, plus at most the last 4 hex digits of an id, never a
-# whole id (`identity --show-ids` prints whole ids on stdout, for a
-# terminal). History rows carry a tag and a status word, never an id or a
+# whole id (`identity --show-ids` prints whole ids, and only when stdout is
+# a terminal). History rows carry a tag and a status word, never an id or a
 # label.
 
 readonly AS_UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -851,6 +892,7 @@ identity_gate() {
       ;;
   esac
   if [[ -d "$STORE" ]]; then
+    _swap_log_ensure
     printf '[%s] IDENTITY tag=%s status=%s\n' \
       "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$_IDS_STATUS" >> "$SWAP_LOG"
   fi
@@ -1172,6 +1214,7 @@ HANDOFF_EOF
   ok "Handoff captured: ${handoff_file}"
 
   # Log to swap-history.log for auditability
+  _swap_log_ensure
   printf '[%s] HANDOFF_CAPTURE source=%s target=%s note=%s\n' \
     "$now_iso" "$source_tag" "$target_tag" \
     "$([ -n "$operator_note" ] && echo 'yes' || echo 'no')" \
@@ -1614,6 +1657,22 @@ LOCK_STALE=1
 LOCK_AGE=""
 LOCK_PID=""
 
+# _strip_controls <text>: prints <text> without its C0 control characters,
+# DEL, and C1 control characters (U+0080 to U+009F, in their UTF-8 form), so
+# a line read from a file the switcher doesn't write can't move the cursor,
+# recolour or retitle the terminal when it is printed (S-07). Builtins only,
+# matched byte by byte in the C locale (a subshell, so the locale change
+# stays inside it).
+_strip_controls() (
+  LC_ALL=C
+  c0=$'[\001-\037\177]'
+  c1=$'\302[\200-\237]'
+  s="$1"
+  s="${s//$c0/}"
+  s="${s//$c1/}"
+  printf '%s' "$s"
+)
+
 # _plist_version <Info.plist>: prints its CFBundleShortVersionString and
 # returns 0, or prints nothing and returns 1 (absent, unreadable, no such
 # key, or a value that is not version-shaped).
@@ -1706,6 +1765,8 @@ _updater_flag() {
 # misordered.
 _updater_log_scan() {
   local since="${1:-}" out="" k v
+  # The last line is printed as read, so its control characters are removed
+  # first (S-07, _strip_controls).
   UPD_LOG_LAST=""
   UPD_LOG_SEED=""
   UPD_LOG_DONE=0
@@ -1728,7 +1789,7 @@ _updater_log_scan() {
     END { gsub(/\t/, " ", last); printf "L\t%s\nS\t%s\nN\t%d\n", last, seed, n }' "$UPDATER_LOG" 2>/dev/null)" || return 1
   while IFS=$'\t' read -r k v; do
     case "$k" in
-      L) UPD_LOG_LAST="$v" ;;
+      L) UPD_LOG_LAST="$(_strip_controls "$v")" ;;
       S) UPD_LOG_SEED="$v" ;;
       N) if [[ "$v" =~ ^[0-9]+$ ]]; then UPD_LOG_DONE="$v"; fi ;;
     esac
@@ -2078,6 +2139,7 @@ open_tag_instance() {
 
   printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
 
+  _swap_log_ensure
   printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
     >> "$SWAP_LOG"
@@ -2330,7 +2392,12 @@ readonly PREFS_CLASSES='{
 }'
 
 # Shared jq definitions. ABS marks a key a profile does not hold; allowlisted
-# values are always scalars, so the marker cannot collide with a value.
+# values are always scalars, so the marker cannot collide with a value. mask
+# hides identifiers by shape: uuids, session ids, emails, hex runs and paths,
+# and (S-04) any token of 8 or more letters and digits that mixes both
+# (prefixed base62 ids, ULIDs, the id in a local_ value) and any run of 6 or
+# more digits. show routes numbers through mask too. Ordinary key names,
+# booleans, short words and version strings such as 4.29.0 pass unchanged.
 readonly PREFS_DEFS='
 def ABS: {"absent": true};
 def isabs: type == "object" and .absent == true;
@@ -2343,11 +2410,14 @@ def parentok($p): (try getpath($p[:-1]) catch null) | type == "object";
 def val($p): if haspath($p) then getpath($p) else ABS end;
 def allsame: (map(.cur | tojson) | unique | length) == 1;
 def UUID: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+def MIXED: "(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{8,}(?![A-Za-z0-9])";
 def mask: gsub(UUID; "<id>") | gsub("session_[A-Za-z0-9_-]+"; "<session-id>")
-  | gsub("[^ \"<>]+@[^ \"<>]+"; "<email>") | gsub("[0-9a-fA-F-]{12,}"; "<id>") | gsub("/[^ \"<>]*"; "<path>");
+  | gsub("[^ \"<>]+@[^ \"<>]+"; "<email>") | gsub("[0-9a-fA-F-]{12,}"; "<id>") | gsub("/[^ \"<>]*"; "<path>")
+  | gsub(MIXED; "<id>") | gsub("[0-9]{6,}"; "<id>");
 def show:
   if isabs then "absent"
-  elif type == "boolean" or type == "number" or type == "null" then tojson
+  elif type == "number" then (tojson | mask)
+  elif type == "boolean" or type == "null" then tojson
   elif type == "array" or type == "object" then "\(length) \(if length == 1 then "entry" else "entries" end)"
   elif (length <= 40) and test("^[A-Za-z0-9 ._:+-]*$") and (mask == .) then tojson
   else "<masked>" end;
@@ -2827,7 +2897,7 @@ _prefs_write() {
 # _prefs_state_write <json>: writes the sync state through a temporary file
 # in the store, mode 600, then a rename.
 _prefs_state_write() {
-  if [[ ! -d "$STORE" ]]; then "$AS_BIN_MKDIR" -p "$STORE" || return 1; fi
+  _store_ensure || return 1
   PR_TMP="$("$AS_BIN_MKTEMP" "${STORE}/.prefs-sync.json.XXXXXX")" || { PR_TMP=""; return 1; }
   "$AS_BIN_CHMOD" 600 "$PR_TMP" || { _prefs_rm_tmp; return 1; }
   printf '%s\n' "$1" | "$AS_BIN_JQ" . > "$PR_TMP" || { _prefs_rm_tmp; return 1; }
@@ -2856,7 +2926,7 @@ _prefs_commit() {
 # _prefs_lock <doing>: takes the settings-sync lock, or prints the refusal
 # (the same rule and message shape as the update lock) and returns 1.
 _prefs_lock() {
-  if [[ ! -d "$STORE" ]]; then "$AS_BIN_MKDIR" -p "$STORE" 2>/dev/null || :; fi
+  _store_ensure || :
   if _lock_held "$PREFS_LOCK"; then
     printf '\033[31mERROR:\033[0m %s\n' "$(_lock_refusal "$PREFS_LOCK" "$1")" >&2
     return 1
@@ -2913,6 +2983,7 @@ _prefs_tally() {
     "$applied" "$([[ "$cmd" == "dry-run" ]] && printf 'would apply' || printf 'applied')" \
     "$label" "${shown:+ (${shown})}" "$kept" "$skipped" "$review" "$hint" >&2
   if [[ "$cmd" != "dry-run" ]]; then
+    _swap_log_ensure
     printf '[%s] PREFS_SYNC cmd=%s target=%s applied=%s keys=%s kept=%s review=%s skipped=%s from=%s\n' \
       "$(_prefs_now)" "$cmd" "$target" "$applied" "${ids:-none}" "$kept" "$review" "$skipped" "${src:-none}" >> "$SWAP_LOG"
   fi
@@ -3311,6 +3382,7 @@ _prefs_pin() {
   _prefs_state_write "$(printf '%s' "$PR_STATE_JSON" | "$AS_BIN_JQ" -c --argjson pins "$pins" \
     '{schema: 1, keys: (.keys // {}), pins: $pins, undo: (.undo // {})}')" \
     || _prefs_refuse "The sync state $(_tilde_path "$PREFS_STATE") could not be written; the pins are unchanged."
+  _swap_log_ensure
   printf '[%s] PREFS_PIN cmd=%s target=%s keys=%s pins=%s\n' "$(_prefs_now)" "$verb" "$tag" \
     "$([[ "$id" == "*" ]] && printf 'all' || printf '%s' "$id")" "$n" >> "$SWAP_LOG"
   if [[ "$verb" == "pin" && "$id" == "*" ]]; then
@@ -3326,6 +3398,27 @@ _prefs_pin() {
 }
 
 # ---- prefs undo ----------------------------------------------------------------
+
+# _prefs_whole_file_cs <current file> <prior copy>: lists the capability (C)
+# and security (S) families whose value differs between the two, through
+# prefs diff's report (PREFS_REPORT_JQ, masked values), and says they will
+# revert. Always returns 0.
+_prefs_whole_file_cs() {
+  local meta cs
+  meta="$("$AS_BIN_JQ" -cn --argjson classes "$PREFS_CLASSES" --argjson allow "$PREFS_ALLOW" \
+    '{classes: $classes, allow: $allow, tags: ["current", "prior-copy"], extra: [], all: false}')" || meta=""
+  if [[ -n "$meta" ]] && cs="$("$AS_BIN_JQ" -r -n --argjson m "$meta" "${PREFS_DEFS} ${PREFS_REPORT_JQ} | .cs[]" \
+      "$1" "$2" < /dev/null 2>/dev/null)"; then
+    if [[ -n "$cs" ]]; then
+      printf "Capability (C) and security (S) settings that differ from the prior copy; they will revert to the prior copy's values:\n%s\n" "$cs"
+    else
+      printf 'No capability (C) or security (S) setting differs from the prior copy.\n'
+    fi
+  else
+    printf "The current settings file can't be read, so the switcher can't list which capability (C) or security (S) settings will change; every setting reverts to the prior copy's value.\n"
+  fi
+  return 0
+}
 
 _prefs_undo() {
   local tag="" whole=false a rec f prev res ops ids rem="" n wrc none='{}'
@@ -3348,6 +3441,10 @@ _prefs_undo() {
     [[ -f "$prev" ]] || _prefs_refuse "'${tag}' has no prior copy to restore (one is made before each sync writes the profile). Nothing was changed."
     "$AS_BIN_JQ" -e 'type == "object"' "$prev" > /dev/null 2>&1 || _prefs_refuse "The prior copy in '${tag}' is not valid JSON; nothing was changed."
     _signin_tty || _prefs_refuse "prefs undo --whole-file needs a terminal to confirm. Nothing was changed."
+    # S-03: the whole file goes back, capability (C) and security (S)
+    # settings included, so say which of them differ and will revert, in
+    # prefs diff's masked rendering, before the confirmation.
+    _prefs_whole_file_cs "$f" "$prev"
     printf "This replaces the whole settings file of '%s' with the copy from before the last sync. Changes the app made to it since then will be lost.\n" "$tag"
     _signin_ask "Restore the prior copy of '${tag}'?" || { printf 'Not restoring; nothing was changed.\n'; exit 2; }
     wrc=0
@@ -3420,6 +3517,7 @@ _prefs_undo() {
     | ($u - $r) as $s
     | "\($u | length)|\($s | length)|\($s | join(","))|\($r | length)"')"
   IFS='|' read -r n n_rst rst n_rem <<< "$counts"
+  _swap_log_ensure
   printf '[%s] PREFS_UNDO cmd=undo target=%s mode=%s undone=%s keys=%s restored=%s restored_keys=%s removed=%s removed_keys=%s\n' \
     "$(_prefs_now)" "$tag" "$([[ "$whole" == "true" ]] && printf 'whole-file' || printf 'keys')" "$n" "${ids:-none}" \
     "$n_rst" "${rst:-none}" "$n_rem" "${rem:-none}" >> "$SWAP_LOG"
@@ -3741,6 +3839,7 @@ EOF
   ok "Swapped to '${target_tag}'. Bridged Code billing will follow ${target_tag}'s account auth."
 
   printf '%s\n' "$target_tag" > "$STATUSLINE_MARKER"
+  _swap_log_ensure
   printf '[%s] APP_SWAP target=%s udd=%s first_launch=%s mirror=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
     "$([ "$skip_mirror" == "false" ] && echo "yes" || echo "no")" \
@@ -3992,6 +4091,7 @@ cmd_clone_prefs() {
     ok "Mirrored: ${m}"
   done
 
+  _swap_log_ensure
   printf '[%s] CLONE_PREFS source=%s target=%s mirrored=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$source_tag" "$target_tag" \
     "$(IFS=,; echo "${mirrored[*]+"${mirrored[*]}"}")" \
@@ -4024,6 +4124,7 @@ cmd_quit() {
       # #9: the quit finds what to close through detection.
       app_binary_present || die "$(app_binary_refusal "quit")"
       quit_all_claude
+      _swap_log_ensure
       printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG"
       ;;
     *)
@@ -4113,6 +4214,7 @@ _update_on_signal() {
 
 _update_history() {
   if [[ -d "$STORE" ]]; then
+    _swap_log_ensure
     printf '[%s] UPDATE result=%s before=%s after=%s reopened=%s\n' \
       "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" "$4" >> "$SWAP_LOG" || :
   fi
@@ -4300,6 +4402,7 @@ cmd_update() {
     # shellcheck disable=SC2086
     ( quit_all_claude listed $listed ) || quit_rc=$?
     if [[ -d "$STORE" ]]; then
+      _swap_log_ensure
       printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
     fi
   fi
@@ -4565,6 +4668,7 @@ EOF
 
   ok "Registered account: tag=${tag} email=${email} label='${label}'"
 
+  _swap_log_ensure
   printf '[%s] ADD_ACCOUNT tag=%s email=%s label=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$email" "$label" \
     >> "$SWAP_LOG"
@@ -4585,7 +4689,8 @@ EOF
 # match, MISMATCH or unknown. Read-only: it opens config.toml and each
 # profile's config.json for reading and writes nothing, not even the
 # history log (main answers it before log rotation). --show-ids adds the
-# pinned and recorded ids, on stdout only.
+# pinned and recorded ids, on stdout only, and only when stdout is a
+# terminal; otherwise it refuses (exit 2) and prints nothing.
 # Exit 0 = no MISMATCH (unknown rows do not fail), 1 = at least one MISMATCH,
 # 2 = it cannot run: no config.toml, no tag in [accounts], a tag that is not
 # in [accounts], or bad arguments. Empty arguments are skipped.
@@ -4607,6 +4712,11 @@ cmd_identity() {
     esac
   done
 
+  # S-02: whole ids go to a terminal only, never to a pipe, a file or a
+  # transcript. Checked first, so this refusal can't be mistaken for another.
+  if [[ "$show_ids" == "true" ]] && ! _stdout_tty; then
+    _die2 "identity --show-ids prints whole account ids, so it runs only with its output on a terminal (not a pipe, a file or a transcript). Nothing was printed; without --show-ids, identity shows labels and the last 4 hex digits."
+  fi
   app_binary_warn
   [[ -f "$CONFIG_FILE" ]] || _die2 "No config.toml at ${CONFIG_FILE}, so there is nothing to check. Register a tag with: account-switcher add-account <tag> <email>"
   tags="$(accounts_tags)" || tags=""
@@ -4741,6 +4851,7 @@ cmd_identity_pin() {
   "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
   "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
 
+  _swap_log_ensure
   printf '[%s] IDENTITY_PIN tag=%s\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$key" >> "$SWAP_LOG"
   ok "Pinned '${tag}' to \"${label}\" (id …${cur:32:4}) in ${CONFIG_FILE}."
 }
@@ -4832,6 +4943,17 @@ _signin_tty() {
     return
   fi
   [[ -t 0 ]]
+}
+
+# Returns 0 when stdout counts as a terminal (S-02, identity --show-ids).
+# AS_TEST_STDOUT_IS_TTY is empty outside test mode (the seam block unsets
+# it), so production reads -t 1.
+_stdout_tty() {
+  if [[ "${AS_TEST_MODE:-0}" == "1" && -n "$AS_TEST_STDOUT_IS_TTY" ]]; then
+    [[ "$AS_TEST_STDOUT_IS_TTY" == "1" ]]
+    return
+  fi
+  [[ -t 1 ]]
 }
 
 # _signin_ask <question>: prints it and reads one line; returns 0 only for a
@@ -5029,6 +5151,7 @@ _signin_quit_row() {
   if [[ "$SIGNIN_QUIT_ROW" == "1" ]]; then return 0; fi
   SIGNIN_QUIT_ROW=1
   if [[ -d "$STORE" ]]; then
+    _swap_log_ensure
     printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
   fi
 }
@@ -5398,6 +5521,7 @@ _signin_finish() {
   # 5. History rows, in one block: tags, words and counts only.
   if [[ -d "$STORE" ]]; then
     ts="$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)"
+    _swap_log_ensure
     {
       printf '[%s] SIGNIN tag=%s mode=%s result=%s detail=%s others_changed=%s others_unverified=%s\n' \
         "$ts" "$SG_TAG" "$SG_MODE" "$result" "$detail" "$changed" "$unverified"
@@ -5916,7 +6040,9 @@ SUBCOMMANDS (Mac desktop app management):
                          account its profile records, and match, MISMATCH
                          or unknown. Exit 0 = no MISMATCH, 1 = a MISMATCH,
                          2 = cannot run. Prints labels, never ids;
-                         --show-ids prints the ids too, on stdout. Reads
+                         --show-ids prints the ids too, on stdout, and is
+                         terminal-only: with stdout not a terminal it
+                         refuses (exit 2) and prints nothing. Reads
                          only the profile's config.json (no cookies, Local
                          Storage, keychain items or tokens).
 

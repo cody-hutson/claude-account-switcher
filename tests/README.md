@@ -129,12 +129,15 @@ Scenario controls, all exported and reset by `new_case`:
 | `AS_FIXTURE_KEYCHAIN_JSON` | `security` | the item it prints (fake values only) |
 | `AS_FAKE_KEYCHAIN=absent` | `security` | the item is missing (exit 44) |
 
-Two more names are read by `account-switcher.sh` itself, for `signin` and
-`update`, and only in test mode (production unsets them with the seam
-names): `AS_TEST_STDIN_IS_TTY=1` makes stdin count as a terminal, and
-`AS_TEST_POLL_HOOK` names an executable under `AS_TEST_ROOT` (the interlock
-checks) that `signin` and `update` run once per poll, before the poll's
-reads, with the poll number. `t-07-signin.sh` uses the hook to change the
+A few more names are read by `account-switcher.sh` itself, and only in test
+mode (production unsets them with the seam names, then fixes them empty and
+readonly; `t-00-seam.sh` plants each in production and shows it is ignored):
+`AS_TEST_STDIN_IS_TTY=1` makes stdin count as a terminal (`signin`,
+`update`, `prefs`); `AS_TEST_STDOUT_IS_TTY=1` makes stdout count as one, for
+`identity --show-ids`, which is terminal-only (the interlock refuses any
+value but `0` or `1`); and `AS_TEST_POLL_HOOK` names an executable under
+`AS_TEST_ROOT` (the interlock checks) that `signin` and `update` run once per
+poll, before the poll's reads, with the poll number. `t-07-signin.sh` uses the hook to change the
 scenario between polls, so a case whose timer is `read -t` (a terminal) can
 stage changes mid-wait as well as one whose timer is the `sleep` fake;
 `t-10-update.sh` uses it to play the updater's helper during the install

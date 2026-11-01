@@ -658,6 +658,90 @@ case_undo_removes_added() {
   result "undo of a key the last sync added: prefs undo removes it (the file equals the pre-sync file, jq -S), says so by key id in the message and the PREFS_UNDO row, marks it needs review with its absence as the candidate (not as the app's removal), so the next swap doesn't re-add it and adopt can set it later; a key the app changed since is left alone" $?
 }
 
+case_whole_file_lists_cs() {
+  local ok=0 prior before_prompt
+  seeded
+  setg tag-a keep-awake false
+  run_p prefs sync tag-b
+  [[ "$rc" == "0" && -f "$(pfile tag-b).sync-prev" ]] || { ok=1; printf '    sync rc=%s\n' "$rc"; }
+  # The app then turns a security setting off and a capability on in tag-b.
+  $JQ '.preferences.bypassPermissionsModeEnabled = false | .preferences.coworkWebSearchEnabled = true' "$(pfile tag-b)" \
+    > "${AS_TEST_ROOT}/.x" && /bin/cat "${AS_TEST_ROOT}/.x" > "$(pfile tag-b)"
+  prior="$(/bin/cat "$(pfile tag-b).sync-prev")"
+  tty_on
+  run_in $'y\n' prefs undo tag-b --whole-file
+  before_prompt="${out%%Restore the prior copy*}"
+  [[ "$rc" == "0" && "$(/bin/cat "$(pfile tag-b)")" == "$prior" ]] || { ok=1; printf '    whole-file rc=%s\n' "$rc"; }
+  [[ "$before_prompt" == *"Capability (C) and security (S) settings that differ from the prior copy; they will revert to the prior copy's values:"* ]] || { ok=1; printf '    no C/S heading before the confirmation\n'; }
+  [[ "$before_prompt" == *"  bypassPermissionsModeEnabled (S): current=false, prior-copy=true"* ]] || { ok=1; printf '    the S line\n'; }
+  [[ "$before_prompt" == *"  coworkWebSearchEnabled (C): current=true, prior-copy=false"* ]] || { ok=1; printf '    the C line\n'; }
+  [[ "$before_prompt" != *"chromeExtensionEnabled"* && "$before_prompt" != *"localAgentModeTrustedFolders"* ]] || { ok=1; printf '    a C or S setting that agrees was listed\n'; }
+  # Now the file is the prior copy: nothing differs, and n declines.
+  run_in $'n\n' prefs undo tag-b --whole-file
+  [[ "$rc" == "2" && "$out" == *"No capability (C) or security (S) setting differs from the prior copy."* ]] || { ok=1; printf '    no-difference run rc=%s\n' "$rc"; }
+  assert_eq "$ok" "0" "whole-file C/S listing" && assert_no_ids
+  result "prefs undo --whole-file lists, before its confirmation, the capability (C) and security (S) settings that differ from the prior copy (masked as prefs diff shows them) and says they will revert; with none differing it says so" $?
+}
+
+case_mask_shapes() {
+  local ok=0 d raw
+  scene
+  # Planted in tag-a: U family names shaped like ids, and S values shaped
+  # like ids or long numbers; for contrast, an ordinary U name, a small
+  # number and (in primary) a version string.
+  $JQ '.preferences.epitaxyPrefs["org_2Xk9QpL7mNb3Vr"] = true
+    | .preferences.epitaxyPrefs["01ARZ3NDEKTSV4RRFFQ69G5FAV"] = 1
+    | .preferences.epitaxyPrefs["notice-1234567"] = true
+    | .preferences.epitaxyPrefs["macos-v26-hint"] = true
+    | .preferences.ccdScheduledTasksEnabled = "org-2Xk9QpL7mNb3Vr"
+    | .preferences.ccRemoteControlDefaultEnabled = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    | .preferences.coworkScheduledTasksEnabled = "local-q7Wz2Rk9Lm"
+    | .preferences.coworkHipaaRestricted = 12345678
+    | .preferences.orgWorkAcrossAppsDisabled = 3' "$(pfile tag-a)" > "${AS_TEST_ROOT}/.x" \
+    && /bin/cat "${AS_TEST_ROOT}/.x" > "$(pfile tag-a)"
+  $JQ '.preferences.epitaxyPrefs["cc-landing-draft-permission-mode"] = "4.29.0"' "$(pfile primary)" > "${AS_TEST_ROOT}/.x" \
+    && /bin/cat "${AS_TEST_ROOT}/.x" > "$(pfile primary)"
+  run_p prefs diff
+  d="$out"
+  [[ "$d" == *"  ccdScheduledTasksEnabled (S): primary=absent, tag-a=<masked>, tag-b=absent"* ]] || { ok=1; printf '    prefixed base62 value\n'; }
+  [[ "$d" == *"  ccRemoteControlDefaultEnabled (S): primary=absent, tag-a=<masked>, tag-b=absent"* ]] || { ok=1; printf '    ULID value\n'; }
+  [[ "$d" == *"  coworkScheduledTasksEnabled (S): primary=absent, tag-a=<masked>, tag-b=absent"* ]] || { ok=1; printf '    local-style value\n'; }
+  [[ "$d" == *"  coworkHipaaRestricted (S): primary=absent, tag-a=<id>, tag-b=absent"* ]] || { ok=1; printf '    long number\n'; }
+  [[ "$d" == *"  orgWorkAcrossAppsDisabled (S): primary=absent, tag-a=3, tag-b=absent"* ]] || { ok=1; printf '    a small number was masked\n'; }
+  [[ "$d" == *'cc-landing-draft-permission-mode (S): primary="4.29.0", tag-a="acceptEdits", tag-b="acceptEdits"'* ]] || { ok=1; printf '    a version string or a short word was masked\n'; }
+  [[ "$d" == *"bypassPermissionsModeEnabled (S): primary=false, tag-a=false, tag-b=true"* ]] || { ok=1; printf '    booleans\n'; }
+  [[ "$d" == *"  org_<id> (in tag-a)"* && "$d" == *"  <id> (in tag-a)"* && "$d" == *"  notice-<id> (in tag-a)"* ]] || { ok=1; printf '    U names shaped like ids\n'; }
+  [[ "$d" == *"  macos-v26-hint (in tag-a)"* && "$d" == *"earlyWindowShowLatched (in primary, tag-a, tag-b)"* ]] || { ok=1; printf '    an ordinary U name was masked\n'; }
+  for raw in 2Xk9QpL7mNb3Vr 01ARZ3NDEKTSV4RRFFQ69G5FAV q7Wz2Rk9Lm 12345678 1234567; do
+    [[ "$d" != *"$raw"* ]] || { ok=1; printf '    the output holds %s\n' "$raw"; }
+  done
+  assert_eq "$ok" "0" "masking by shape" && assert_no_ids
+  result "prefs diff masks identifiers by shape: prefixed base62, ULID, local-style and long-digit values and U names become <masked> or <id>; ordinary key names, booleans, short strings, small numbers and 4.29.0 do not" $?
+}
+
+case_store_modes() {
+  local ok=0 um m
+  new_case
+  /bin/mkdir -p "$(pdir primary)" || harness_error "cannot create primary's folder"
+  : > "${AS_TEST_ROOT}/transcript.txt"
+  [[ ! -e "$AS_STORE" ]] || harness_error "the store exists before the run"
+  # A permissive umask, so modes left to it would read 755 and 644.
+  um="$(umask)"
+  umask 022
+  run_p prefs sync
+  umask "$um"
+  [[ "$rc" != "2" ]] || { ok=1; printf '    sync rc=%s\n' "$rc"; }
+  m="$(/usr/bin/stat -f '%Lp' "$AS_STORE" 2> /dev/null)"
+  [[ "$m" == "700" ]] || { ok=1; printf '    store mode %s\n' "$m"; }
+  m="$(/usr/bin/stat -f '%Lp' "${AS_STORE}/swap-history.log" 2> /dev/null)"
+  [[ "$m" == "600" ]] || { ok=1; printf '    history log mode %s\n' "$m"; }
+  [[ "$(rows_of PREFS_SYNC)" == *"PREFS_SYNC cmd=sync"* ]] || { ok=1; printf '    no PREFS_SYNC row in the new log\n'; }
+  m="$(/usr/bin/stat -f '%Lp' "${AS_STORE}/prefs-sync.json" 2> /dev/null)"
+  [[ "$m" == "600" ]] || { ok=1; printf '    sync state mode %s\n' "$m"; }
+  assert_eq "$ok" "0" "modes" && assert_no_ids
+  result "a fresh scratch HOME under umask 022: the store the switcher creates is mode 700, and the history log it creates is mode 600 (the sync state, 600)" $?
+}
+
 case_half_written() {
   local ok=0
   seeded
@@ -850,6 +934,9 @@ case_read_only
 case_diff_output
 case_prior_copy_undo
 case_undo_removes_added
+case_whole_file_lists_cs
+case_mask_shapes
+case_store_modes
 case_half_written
 case_visible_logged
 case_documented

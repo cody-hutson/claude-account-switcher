@@ -25,19 +25,63 @@ refused() {  # $1 = text the refusal line must contain
 
 # ---- Production neutrality ------------------------------------------------
 
+# run_prod_driver: sources the script (every line but its call to main) in
+# production mode, with the case's planted environment, and prints what each
+# test-only name holds after the seam block, whether it is readonly, and
+# what _stdout_tty answers with stdout redirected to a file. Nothing in the
+# script runs but its top level, which defines and assigns only, so no real
+# command runs and no real state is read.
+run_prod_driver() {
+  local lib="${AS_TEST_ROOT}/switcher-lib.sh" l prev="" first=1
+  : > "$lib"
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    if [[ $first -eq 0 ]]; then printf '%s\n' "$prev" >> "$lib"; fi
+    prev="$l"
+    first=0
+  done < "$SWITCHER"
+  [[ "$prev" == "main "* ]] || harness_error "the script's last line is not the call to main"
+  (
+    cd "$AS_TEST_ROOT" || exit 2
+    _child_env
+    PATH="$SYSTEM_PATH"
+    unset AS_TEST_MODE
+    # shellcheck disable=SC2016
+    exec /bin/bash -c '
+      . "$1" || exit 70
+      ro=yes
+      ( AS_TEST_STDOUT_IS_TTY=1 ) 2> /dev/null && ro=no
+      ( AS_TEST_STDIN_IS_TTY=1 ) 2> /dev/null && ro=no
+      if _stdout_tty; then tty=yes; else tty=no; fi
+      printf "stdin=[%s] stdout=[%s] hook=[%s] readonly=%s stdout_tty=%s\n" \
+        "$AS_TEST_STDIN_IS_TTY" "$AS_TEST_STDOUT_IS_TTY" "$AS_TEST_POLL_HOOK" "$ro" "$tty"' t00-driver "$lib"
+  ) > "${AS_TEST_ROOT}/.run-out" 2> "${AS_TEST_ROOT}/.run-err" < /dev/null
+  rc=$?
+  _read_run "${AS_TEST_ROOT}/.run-out" "${AS_TEST_ROOT}/.run-err"
+}
+
 case_prod_planted_bin_ignored() {
   new_case
   # Every AS_BIN_* is exported and points at a fake; AS_BIN_CAT points
   # nowhere and AS_STORE somewhere else. Outside test mode all are ignored.
+  # So are the test-only names, planted here too.
   export AS_BIN_CAT=/nonexistent
   new_sibling_dir
   export AS_STORE="$SIBLING_DIR"
+  local hook="${AS_TEST_ROOT}/planted-hook.sh"
+  printf '#!/bin/bash\nexit 0\n' > "$hook"
+  /bin/chmod 755 "$hook"
+  export AS_TEST_STDIN_IS_TTY=1 AS_TEST_STDOUT_IS_TTY=1 AS_TEST_POLL_HOOK="$hook"
   run_switcher_prod help
-  assert_rc 0 &&
-    assert_contains "$out" "USAGE:" &&
-    assert_contains "$out" "STORE:        ${HOME}/.claude/account-switcher" &&
+  local help_rc="$rc" help_out="$out"
+  run_prod_driver
+  unset AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK
+  assert_eq "$help_rc" "0" "help exit" &&
+    assert_contains "$help_out" "USAGE:" &&
+    assert_contains "$help_out" "STORE:        ${HOME}/.claude/account-switcher" &&
+    assert_rc 0 &&
+    assert_eq "$out" "stdin=[] stdout=[] hook=[] readonly=yes stdout_tty=no" "the test-only names in production" &&
     assert_eq "$(< "${AS_TEST_ROOT}/calls.log")" "" "calls.log"
-  result "production: planted AS_BIN_CAT and AS_STORE are ignored; help runs the real commands" $?
+  result "production: planted AS_BIN_CAT, AS_STORE and test-only names (AS_TEST_STDIN_IS_TTY, AS_TEST_STDOUT_IS_TTY, AS_TEST_POLL_HOOK) are ignored: help runs the real commands, each test-only name is empty and readonly, and stdout to a file is not a terminal" $?
 }
 
 case_prod_version() {
@@ -211,6 +255,17 @@ case_keychain_default() {
   result "check 7: status with the default keychain service -> 78, security never called" $?
 }
 
+# ---- Interlock check 9: the stdout-is-a-terminal override ---------------------
+
+case_stdout_override_value() {
+  new_case
+  export AS_TEST_STDOUT_IS_TTY=yes
+  run_switcher version
+  unset AS_TEST_STDOUT_IS_TTY
+  refused "AS_TEST_STDOUT_IS_TTY is not 0 or 1 (got 'yes')"
+  result "check 9: AS_TEST_STDOUT_IS_TTY other than 0 or 1 -> 78" $?
+}
+
 # ---- Positive case ------------------------------------------------------------
 
 case_positive() {
@@ -305,6 +360,7 @@ case_one_line_fake
 case_root_outside
 case_root_dotdot
 case_keychain_default
+case_stdout_override_value
 case_positive
 case_kill_stray
 case_security_guard

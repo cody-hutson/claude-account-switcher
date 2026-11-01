@@ -221,7 +221,9 @@ for required in account-switcher.sh config.toml.template commands/account-switch
   fi
 done
 
-mkdir -p "${INSTALL_DIR}"
+# The switcher's store holds its history log and state: mode 700 when this
+# creates it (an existing folder keeps its mode).
+mkdir -p -m 700 "${INSTALL_DIR}"
 mkdir -p "${COMMANDS_DIR}"
 
 # Steps 1-3: managed files (overwrite — the repo is the source of truth)

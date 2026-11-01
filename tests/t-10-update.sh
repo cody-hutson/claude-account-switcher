@@ -793,6 +793,24 @@ case_install_running_refuses() {
   result "an install is running when the log's last timestamped line is 'Beginning installation' (untimestamped lines after it skipped) -> refused, exit 2; a live helper process alone is not the test" $?
 }
 
+case_log_line_controls() {
+  # The helper log's last line carries a title-setting OSC sequence, a colour
+  # sequence and a C1 CSI (UTF-8 C2 9B): update prints the line with every C0
+  # and C1 control removed.
+  scenario "$OLD_V" "$NEW_V" false 501:primary
+  printf '2026-10-31 11:30:00.100 ShipIt[117:218] Beginning installation \033]0;spoofed\007\033[31mred\033[0m \302\233x\n' >> "$(log_path)"
+  run_up "" update --yes
+  local shown="${err#*last line: }"
+  shown="${shown%%). Nothing was closed*}"
+  assert_rc 2 &&
+    assert_eq "$shown" "2026-10-31 11:30:00.100 ShipIt[117:218] Beginning installation ]0;spoofed[31mred[0m x" "the log line as printed" &&
+    assert_not_contains "$shown" $'\033' &&
+    assert_not_contains "$shown" $'\007' &&
+    assert_not_contains "$shown" $'\302\233' &&
+    assert_never_called osascript
+  result "update prints the updater log's last line with C0 and C1 control characters removed (an OSC title, a colour sequence and a C1 CSI)" $?
+}
+
 case_bad_arguments() {
   local ok=0
   scenario "$OLD_V" "$NEW_V" false 501:primary
@@ -997,6 +1015,7 @@ case_tag_not_reopened
 case_pids_changed_refuses
 case_unlisted_during_quit
 case_install_running_refuses
+case_log_line_controls
 case_bad_arguments
 case_lock_refuses
 case_stale_lock
