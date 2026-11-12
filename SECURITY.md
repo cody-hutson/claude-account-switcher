@@ -49,7 +49,7 @@ You will receive an acknowledgement, an initial assessment, and a remediation pl
 | Secret scanning (gitleaks, full history) | See `.github/workflows/security.yml` |
 | Native GitHub Secret Scanning + Push Protection | Enabled |
 | Private Vulnerability Reporting (PVR) | Enabled — the preferred reporting channel above |
-| Branch protection on `main` | Enabled — 4 required status checks (Bash SAST + Workflow SAST + Secret scanning + Personal-data gate); force-push and deletions blocked; stale-review dismissal; required conversation resolution |
+| Branch protection on `main` | Enabled — 5 required status checks (Bash SAST + Workflow SAST + Secret scanning + Personal-data gate + T1 simulated suite); force-push and deletions blocked; stale-review dismissal; required conversation resolution |
 | Commit signing | Maintainer practice; not enforced via branch protection (single-maintainer model) |
 
 ## Automated Security PRs

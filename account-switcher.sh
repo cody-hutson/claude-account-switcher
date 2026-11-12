@@ -221,7 +221,7 @@ readonly AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK AS_TEST_PR
 # Bump on every change to this script. `install.sh --check` reads this line
 # from both the repo copy and the installed copy (without running either), so
 # keep it a single `readonly VERSION="..."` assignment.
-readonly VERSION="11.0.0"
+readonly VERSION="11.1.0-dev"
 
 readonly STORE="${AS_STORE}"
 readonly CLAUDE_JSON="${AS_CLAUDE_JSON}"
