@@ -19,6 +19,26 @@ version = 1
 # `account-switcher add-account <tag> <email> [label]` after first launch + login.
 # primary = { label = "Primary", profile_email = "you@example.com" }
 
+[identity]
+# tag = account id recorded by `account-switcher identity pin <tag>`; a tag
+# with no line here reads `unknown`. Don't type ids by hand: check the tag's
+# window shows the right account, then run `identity pin <tag>`. The header
+# above must stay exactly [identity], with nothing after it on the line.
+
+[update]
+# Every tag runs the same Claude app, and its updater installs a downloaded
+# update only once every instance is closed. `account-switcher list` shows the
+# installed and the staged version and how long the update has waited.
+#
+# warn_after_hours: launch and swap print a one-line warning naming
+#   `account-switcher update` once a staged update has waited longer than
+#   this many hours (1-8760).
+warn_after_hours = 24
+#
+# install_timeout_s: how long `account-switcher update` waits for the install
+#   to finish after closing every instance, in seconds (10-3600).
+install_timeout_s = 120
+
 [notifications]
 # Channels for swap-success awareness signals.
 channels = ["statusline", "log", "stderr"]

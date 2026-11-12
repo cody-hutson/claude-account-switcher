@@ -1,0 +1,4 @@
+  PID ARGS
+  501 __APP__/Contents/MacOS/Claude
+  511 __APP__/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=utility
+  601 /usr/sbin/cfprefsd agent
