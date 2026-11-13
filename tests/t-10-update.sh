@@ -1216,6 +1216,61 @@ case_wait_warning() {
   result "launch and swap print one line naming update once the staged update has waited past [update] warn_after_hours (default 24, 48 when set), and none below it" $?
 }
 
+# ---- #24: update and the record of the tags Claude closed --------------------------
+
+# open-tags.json, through the real jq.
+rec24() { /usr/bin/jq -r "$1" "${AS_STORE}/open-tags.json" 2> /dev/null; }
+
+case_24_update_cycle() {
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  run_switcher list
+  local adopted
+  adopted="$(rec24 '[.open[].tag] | join(",")')"
+  helper_hook install
+  run_up "" update --yes
+  local up_rc="$rc"
+  run_switcher list
+  assert_eq "$adopted" "tag-a" "adopted before the update" &&
+    assert_eq "$up_rc" "0" "update" &&
+    assert_contains "$(history_text)" "] QUIT_ALL tags=primary,tag-a by=update" &&
+    assert_not_contains "$(history_text)" "] CLOSED " &&
+    assert_eq "$(rec24 '[.open[].tag] | sort | join(",")')" "primary,tag-a" "tracked after the reopen" &&
+    assert_eq "$(rec24 '.closed | length')" "0" "closed entries" &&
+    assert_not_contains "$out" "Tags Claude closed without the switcher"
+  result "#24: an update cycle records no closure (its quit takes the tags out first), writes QUIT_ALL by=update, and the reopened tags are tracked again" $?
+}
+
+case_24_list_during_update() {
+  # INT-4: a list that runs while update holds its lock, after update's quit
+  # (the process table holds only the helper), records nothing closed:
+  # update's quit took its tags out of the record before signalling.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  run_switcher list
+  helper_hook install
+  local inner="$AS_TEST_POLL_HOOK" hook="${AS_TEST_ROOT}/hook24.sh"
+  /bin/cat > "$hook" <<HOOK
+#!/bin/bash
+set -u
+if [[ "\$1" == "1" ]]; then
+  if [[ -d "${AS_STORE}/.update.lock" ]]; then printf 'yes\n' > "${AS_TEST_ROOT}/lock24.txt"; fi
+  /bin/bash "${SWITCHER}" list > "${AS_TEST_ROOT}/list24.txt" 2>&1 < /dev/null
+fi
+exec "${inner}" "\$@"
+HOOK
+  /bin/chmod 755 "$hook" || harness_error "cannot chmod the hook"
+  AS_TEST_POLL_HOOK="$hook"
+  export AS_TEST_POLL_HOOK
+  run_up "" update --yes
+  local mid=""
+  [[ -f "${AS_TEST_ROOT}/list24.txt" ]] && mid="$(< "${AS_TEST_ROOT}/list24.txt")"
+  assert_rc 0 &&
+    assert_eq "$(< "${AS_TEST_ROOT}/lock24.txt")" "yes" "the lock was held during the list" &&
+    assert_contains "$mid" "(no Claude desktop app instances running)" &&
+    assert_not_contains "$mid" "Tags Claude closed without the switcher" &&
+    assert_not_contains "$(history_text)" "] CLOSED "
+  result "#24 INT-4: a list while update holds its lock, after its quit, records nothing closed (the quit took its tags out first)" $?
+}
+
 # ---- The unknown-tag guard ---------------------------------------------------------
 
 case_unknown_tag_guard() {
@@ -1308,6 +1363,8 @@ case_lock_refuses
 case_stale_lock
 case_install_check
 case_wait_warning
+case_24_update_cycle
+case_24_list_during_update
 case_unknown_tag_guard
 case_help
 case_seam_guarded

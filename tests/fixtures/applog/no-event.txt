@@ -1,0 +1,5 @@
+__T_BEFORE__ [info] [stealth-update] Triggering stealth update after idle timeout
+__T_NOISE__ [info] [main] Window focused
+    continued: an unstamped line
+__T_EVENT__ [info] Killing 2 PTY process tree(s) on quit
+__T_EVENT__ [info] [main] Window closed

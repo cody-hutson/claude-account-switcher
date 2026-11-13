@@ -1299,6 +1299,7 @@ quit_all_claude() {
   # process, causing the wait loop and SIGTERM/SIGKILL guards to clause
   # through and return "success" while the process remained alive.
   local initial_pids="" mode="all" listed=" " q
+  QUIT_TAGS=""
   if [[ "${1:-}" == "listed" ]]; then
     mode="listed"
     shift
@@ -1315,6 +1316,12 @@ quit_all_claude() {
     return 0
   fi
   if [[ "$mode" == "listed" ]]; then _quit_listed_check "$listed" || return 3; fi
+
+  # #24: the tags about to close leave the record before anything is
+  # signalled, so the app is never reported as having closed them.
+  # The PIDs are numbers, so word splitting is the point.
+  # shellcheck disable=SC2086
+  _open_tags_quitting $initial_pids
 
   info "Sending graceful quit to running Claude instances..."
   "$AS_BIN_OSASCRIPT" -e 'tell application "Claude" to quit' 2>/dev/null || true
@@ -1349,6 +1356,8 @@ quit_all_claude() {
   else
     fresh_pids=$(get_claude_pids)
   fi
+  # shellcheck disable=SC2086
+  if [[ -n "$fresh_pids" ]]; then _open_tags_quitting $fresh_pids; fi
   if [[ -n "$alive_initial" ]] || [[ -n "$fresh_pids" ]]; then
     warn "Some Claude processes did not exit gracefully; sending SIGTERM"
     local p
@@ -1372,6 +1381,8 @@ quit_all_claude() {
   else
     fresh_pids=$(get_claude_pids)
   fi
+  # shellcheck disable=SC2086
+  if [[ -n "$fresh_pids" ]]; then _open_tags_quitting $fresh_pids; fi
   if [[ -n "$alive_initial" ]] || [[ -n "$fresh_pids" ]]; then
     warn "Claude processes resisting SIGTERM; sending SIGKILL via PID list"
     local p
@@ -1582,6 +1593,8 @@ _launch_report() {
   info "Waiting up to ${NEW_INSTANCE_WAIT_S} s for the new '${tag}' instance..."
   pid="$(wait_for_new_instance "$tag" "$pre" "$NEW_INSTANCE_WAIT_S")"
   if [[ -n "$pid" ]]; then
+    # #24: its new PID was seen, so the tag is running (a closure clears).
+    _open_tags_back "$tag"
     rung="$(bring_to_front "$pid")"
     if [[ "$rung" != "none" ]]; then
       front="yes"
@@ -1969,6 +1982,508 @@ update_wait_warning() {
   return 0
 }
 
+# ---- Tags Claude closed on its own (#24) ----------------------------------
+#
+# While an app update is staged, Claude closes an idle instance on its own to
+# install it, and with several tags open the first ones to close never come
+# back: the update installs only once every instance is closed, and the
+# updater then reopens only primary. The switcher has no background job. It
+# notices the next time a command that reads the process table runs (an
+# observation): list, launch, swap, update, reopen and signin. Every quit the
+# switcher makes goes through quit_all_claude, which takes the tags it is
+# about to close out of the record before anything is signalled, so the
+# switcher's own quits are never reported as the app's.
+#
+# The record, open-tags.json (mode 600), is the only input to detection:
+#   {"schema": 1,
+#    "open":   [{"tag": "<tag>", "seen_utc": "<ISO UTC>"}],
+#    "closed": [{"tag": "<tag>", "seen_utc": "<ISO UTC>", "found_utc": "<ISO UTC>",
+#                "cause": "updater" | "unknown",
+#                "event": "idle-update" | "pending-restart" | "none"}],
+#    "primary_seen_utc": "<ISO UTC>" | null,
+#    "event_mark_utc": "<ISO UTC>" | null}
+# It holds tags, UTC stamps and words from closed sets, and no id, email or
+# path. A file that is absent, unreadable or malformed reads as empty: that
+# loses tracking, but never reports a closure that didn't happen.
+#   open    the tags the switcher opened, or adopted: a running instance
+#           started with --user-data-dir, which only the switcher passes.
+#           primary is never adopted, because the Dock and the updater's
+#           helper start it too. Each carries the last time it was seen.
+#   closed  tags found gone without the switcher closing them. An entry
+#           stays until its tag is seen running again (an observation, or a
+#           wait that saw its new PID), so list keeps naming it and reopen
+#           keeps offering it.
+#   primary_seen_utc  the last time the switcher saw primary running,
+#           whoever started it; cleared when the switcher's own quit closes
+#           it. Only the cause rule reads it.
+#   event_mark_utc    the latest app-log event an observation has already
+#           counted, so the 2 s slack never counts one event twice.
+#
+# One clock per run: every stamp a run writes is the time it first read the
+# clock (_open_tags_now), and every command that stamps a tag observes first.
+# So a tag a command opens carries the same seen time as everything that
+# command saw running, and the cause rule's comparisons of seen times hold.
+# Stamps a few seconds apart within one command would let an instance seen
+# just before another's open lend its close to the other's time span.
+#
+# The cause rule. The app writes one shared log (main.log and its numbered
+# copies), whose update-close lines name no profile, so a closure is tied to
+# its cause by counting. For the tags found closed at one observation (at F),
+# each last seen at S_i:
+#   u_i  the update closes in the app's log stamped in [S_i - 2 s, F] and
+#        after event_mark_utc: the idle-timeout close ("idle-update") and
+#        the restart after a long-pending update ("pending-restart");
+#   k_i  the tags found closed with S_j >= S_i, plus 1 for primary when it
+#        was seen at or after S_i (primary_seen_utc as stored before this
+#        observation), is not itself one of them, and is either gone at F or
+#        running again after a completed install since S_i: its own close
+#        then used an event too.
+# The cause is "updater" (closed by the app's updater) only when the log was
+# readable and u_i >= k_i >= 1; otherwise "unknown" (closed, cause unknown).
+# Fewer events than closures means the log can't say which window an event
+# closed, so every one of those tags reads unknown. The rule errs towards
+# unknown: a primary quit by hand in the same span turns a real updater
+# close into unknown, and reopen then leaves that tag for launch. A trigger
+# line that never ended in a close still counts (the log's format is
+# undocumented; when its wording changes, every cause reads unknown).
+# Residuals: two runs in the same second can each record the same closure
+# (there is no lock, on purpose: a stale lock would switch tracking off);
+# a list that runs while update holds its lock can read the record before
+# update's quit removes its tags and write after it.
+
+readonly OPEN_TAGS="${STORE}/open-tags.json"
+readonly APPLOG_SLACK_S=2
+readonly OT_TAG_RE='^[a-z0-9][a-z0-9-]{0,31}$'
+readonly OT_STAMP_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+
+# The record in memory: space-separated tokens with |-separated fields
+# (tags, UTC stamps and closed-set words hold neither character).
+#   OT_OPEN    <tag>|<seen>
+#   OT_CLOSED  <tag>|<seen>|<found>|<cause>|<event>
+OT_OPEN=""
+OT_CLOSED=""
+OT_PSEEN=""
+OT_MARK=""
+OT_LOADED=0
+# Set by open_tags_observe: the tags newly found closed (<tag>:<cause>), and
+# how many instances run ("" when the process table could not be read).
+OT_NEW=""
+OT_RUNNING_N=""
+OT_NOW_EP=""
+OT_NOW_UTC=""
+# Set by quit_all_claude: the tags it closed, a comma list for QUIT_ALL rows.
+QUIT_TAGS=""
+APPLOG_EVENTS=""
+
+# _open_tags_now: reads the clock once per run (see "One clock per run"),
+# setting OT_NOW_EP and OT_NOW_UTC. Returns 1 when the clock can't be read.
+_open_tags_now() {
+  local ep="" u=""
+  if [[ -n "$OT_NOW_EP" ]]; then return 0; fi
+  ep="$("$AS_BIN_DATE" +%s 2>/dev/null)" || ep=""
+  [[ "$ep" =~ ^[0-9]+$ ]] || return 1
+  u="$("$AS_BIN_DATE" -u -r "$ep" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || u=""
+  [[ "$u" =~ $AS_UTC_RE ]] || return 1
+  OT_NOW_EP="$ep"
+  OT_NOW_UTC="$u"
+  return 0
+}
+
+# _ot_local <epoch>: the local time "YYYY-MM-DD HH:MM:SS", as the app's log
+# stamps its lines.
+_ot_local() {
+  "$AS_BIN_DATE" -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null
+}
+
+# _ot_in <tokens> <tag>: returns 0 when a token in <tokens> is <tag>'s.
+_ot_in() {
+  local tok
+  for tok in $1; do
+    if [[ "${tok%%|*}" == "$2" ]]; then return 0; fi
+  done
+  return 1
+}
+
+# _ot_without <tokens> <tag>: prints <tokens> without <tag>'s.
+_ot_without() {
+  local tok out=""
+  for tok in $1; do
+    if [[ "${tok%%|*}" != "$2" ]]; then out="${out} ${tok}"; fi
+  done
+  printf '%s' "$out"
+}
+
+# _open_tags_read: loads the record (see above). Each value is checked
+# against its own shape; anything else is dropped. Always returns 0.
+_open_tags_read() {
+  local out="" kind tag a b c d
+  OT_OPEN="" OT_CLOSED="" OT_PSEEN="" OT_MARK=""
+  OT_LOADED=1
+  [[ -f "$OPEN_TAGS" && -r "$OPEN_TAGS" ]] || return 0
+  out="$("$AS_BIN_JQ" -r 'if type == "object" and .schema == 1 then
+      ((.open | if type == "array" then .[] else empty end) | select(type == "object")
+        | ["O", (.tag | tostring), (.seen_utc | tostring)] | join("|")),
+      ((.closed | if type == "array" then .[] else empty end) | select(type == "object")
+        | ["C", (.tag | tostring), (.seen_utc | tostring), (.found_utc | tostring),
+           (.cause | tostring), (.event | tostring)] | join("|")),
+      ("P|" + (.primary_seen_utc // "" | tostring)),
+      ("M|" + (.event_mark_utc // "" | tostring))
+    else empty end' "$OPEN_TAGS" 2>/dev/null)" || out=""
+  while IFS='|' read -r kind tag a b c d; do
+    case "$kind" in
+      O)
+        if [[ "$tag" =~ $OT_TAG_RE && "$a" =~ $AS_UTC_RE ]] && ! _ot_in "$OT_OPEN" "$tag"; then
+          OT_OPEN="${OT_OPEN} ${tag}|${a}"
+        fi
+        ;;
+      C)
+        case "${c}/${d}" in
+          updater/idle-update|updater/pending-restart|unknown/idle-update|unknown/pending-restart|unknown/none) ;;
+          *) continue ;;
+        esac
+        if [[ "$tag" =~ $OT_TAG_RE && "$a" =~ $AS_UTC_RE && "$b" =~ $AS_UTC_RE ]] && ! _ot_in "$OT_CLOSED" "$tag"; then
+          OT_CLOSED="${OT_CLOSED} ${tag}|${a}|${b}|${c}|${d}"
+        fi
+        ;;
+      P) if [[ "$tag" =~ $AS_UTC_RE ]]; then OT_PSEEN="$tag"; fi ;;
+      M) if [[ "$tag" =~ $AS_UTC_RE ]]; then OT_MARK="$tag"; fi ;;
+    esac
+  done <<< "$out"
+  return 0
+}
+
+# _open_tags_write: writes the record through a temp file beside it (mode
+# 600 from its creation, so the rename is within one folder), mv and chmod
+# 600. Only when the store exists; a write that fails leaves the old record
+# and returns 0.
+_open_tags_write() {
+  local tmp="${OPEN_TAGS}.tmp.$$"
+  [[ -d "$STORE" ]] || return 0
+  # $o, $c, $p and $m are jq's variables.
+  # shellcheck disable=SC2016
+  if ( umask 077 && "$AS_BIN_JQ" -n --arg o "$OT_OPEN" --arg c "$OT_CLOSED" --arg p "$OT_PSEEN" --arg m "$OT_MARK" \
+        '{schema: 1,
+          open: [$o | split(" ")[] | select(length > 0) | split("|") | {tag: .[0], seen_utc: .[1]}],
+          closed: [$c | split(" ")[] | select(length > 0) | split("|")
+                   | {tag: .[0], seen_utc: .[1], found_utc: .[2], cause: .[3], event: .[4]}],
+          primary_seen_utc: (if $p == "" then null else $p end),
+          event_mark_utc: (if $m == "" then null else $m end)}' \
+        > "$tmp" ) 2>/dev/null \
+      && "$AS_BIN_MV" -f "$tmp" "$OPEN_TAGS" 2>/dev/null \
+      && "$AS_BIN_CHMOD" 600 "$OPEN_TAGS" 2>/dev/null; then
+    return 0
+  fi
+  "$AS_BIN_RM" -f "$tmp" 2>/dev/null || :
+  return 0
+}
+
+# _open_tags_set_open <tag> <keep|clear>: <tag>'s open entry is seen now.
+# clear also drops its closed entry and, for primary, sets primary_seen_utc.
+_open_tags_set_open() {
+  local tag="$1"
+  if [[ "$tag" == "default" ]]; then tag="primary"; fi
+  [[ "$tag" =~ $OT_TAG_RE ]] || return 0
+  [[ -d "$STORE" ]] || return 0
+  _open_tags_now || return 0
+  _open_tags_read
+  OT_OPEN="$(_ot_without "$OT_OPEN" "$tag") ${tag}|${OT_NOW_UTC}"
+  if [[ "$2" == "clear" ]]; then
+    OT_CLOSED="$(_ot_without "$OT_CLOSED" "$tag")"
+    if [[ "$tag" == "primary" ]]; then OT_PSEEN="$OT_NOW_UTC"; fi
+  fi
+  _open_tags_write
+  return 0
+}
+
+# _open_tags_add <tag>: the switcher's open of <tag> succeeded. Its closed
+# entry, if any, stays until an instance is seen (_open_tags_back): an open
+# that never produced one is not a tag that came back.
+_open_tags_add() { _open_tags_set_open "$1" keep; }
+
+# _open_tags_back <tag>: <tag> is running (a wait saw its new PID, or reopen
+# counted it): seen now, and its closed entry clears.
+_open_tags_back() { _open_tags_set_open "$1" clear; }
+
+# _ot_quit_tag <tag>: adds <tag> to QUIT_TAGS once.
+_ot_quit_tag() {
+  case ",${QUIT_TAGS}," in
+    *",$1,"*) ;;
+    *) QUIT_TAGS="${QUIT_TAGS:+${QUIT_TAGS},}$1" ;;
+  esac
+  return 0
+}
+
+# _open_tags_quitting <pid> ...: quit_all_claude calls this before it
+# signals anything. The tag of each PID leaves open, so this quit is never
+# reported as the app closing it, and joins QUIT_TAGS (unknown stands for an
+# instance whose tag can't be told). primary leaving clears primary_seen_utc.
+# When the process table can't be read, every open entry is dropped: missing
+# a later closure is better than reporting this quit as one. Always returns 0.
+_open_tags_quitting() {
+  local want=" $* " rows st=0 pid profile method gone="" all=0 t
+  rows="$(claude_instances)" || st=$?
+  if [[ $st -ne 0 ]]; then
+    _ot_quit_tag unknown
+    all=1
+  else
+    while IFS=$'\t' read -r pid profile method; do
+      [[ -n "$pid" ]] || continue
+      if [[ "$want" != *" ${pid} "* ]]; then continue; fi
+      _ot_quit_tag "$profile"
+      gone="${gone} ${profile}"
+    done <<< "$rows"
+  fi
+  [[ -d "$STORE" ]] || return 0
+  if [[ $all -eq 0 && -z "$gone" ]]; then return 0; fi
+  _open_tags_read
+  if [[ $all -eq 1 ]]; then
+    OT_OPEN=""
+  else
+    for t in $gone; do
+      if [[ "$t" == "unknown" ]]; then continue; fi
+      OT_OPEN="$(_ot_without "$OT_OPEN" "$t")"
+      if [[ "$t" == "primary" ]]; then OT_PSEEN=""; fi
+    done
+  fi
+  _open_tags_write
+  return 0
+}
+
+# _applog_update_quits <from> <to>: the app's update closes stamped in
+# [<from>, <to>] (local "YYYY-MM-DD HH:MM:SS", as the log stamps them). Sets
+# APPLOG_EVENTS to one "<type><TAB><stamp>" line per event, where <type> is
+# idle-update or pending-restart. Reads main.log and its numbered copies
+# (main1.log, main12.log, ...), never main-window.log, one awk per file;
+# the copies' time spans overlap, so files are filtered by time, not order.
+# The awk program prints only its own type words and the 19-character
+# stamp, never a line ($0), and the shell drops anything else: nothing else
+# the log holds (it also holds account and organization ids) can leave this
+# function (#24 AC5). Returns 1 when no file can be read.
+_applog_update_quits() {
+  local from="$1" to="$2" f any=0 out="" typ t
+  APPLOG_EVENTS=""
+  for f in "${AS_APP_LOG_DIR}/main.log" "${AS_APP_LOG_DIR}"/main[0-9].log "${AS_APP_LOG_DIR}"/main[0-9][0-9].log; do
+    [[ -f "$f" && -r "$f" ]] || continue
+    any=1
+    # $0 is awk's line, used only inside index().
+    # shellcheck disable=SC2016
+    out="$(AS_FROM="$from" AS_TO="$to" "$AS_BIN_AWK" '
+      BEGIN { from = ENVIRON["AS_FROM"]; to = ENVIRON["AS_TO"] }
+      /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
+        t = substr($0, 1, 19)
+        if (t < from || t > to) next
+        if (index($0, "[stealth-update] Triggering stealth update after idle timeout") > 0) print "idle-update\t" t
+        else if (index($0, "[updater] Auto-restarting app after update pending for") > 0) print "pending-restart\t" t
+      }' "$f" 2>/dev/null)" || out=""
+    while IFS=$'\t' read -r typ t; do
+      case "$typ" in idle-update|pending-restart) ;; *) continue ;; esac
+      [[ "$t" =~ $OT_STAMP_RE ]] || continue
+      APPLOG_EVENTS="${APPLOG_EVENTS}${typ}"$'\t'"${t}"$'\n'
+    done <<< "$out"
+  done
+  [[ $any -eq 1 ]] || return 1
+  return 0
+}
+
+# _open_tags_causes <newly closed tokens> <primary_seen before> <running>:
+# the cause rule (above) for the tags found closed at this observation.
+# Appends each to OT_CLOSED and OT_NEW, writes one CLOSED history row each,
+# and moves event_mark_utc past the events it counted.
+_open_tags_causes() {
+  local newc="$1" p_before="$2" running="$3" tok tag seen ep sj tk j
+  local mep="" pep="" readable=1 lo="" from_ep from to u k etype estamp last last_type
+  local cause event any_closed_primary=0 max_counted="" mark_utc=""
+  if [[ -n "$OT_MARK" ]]; then mep="$(_utc_epoch "$OT_MARK")" || mep=""; fi
+  if [[ -n "$p_before" ]]; then pep="$(_utc_epoch "$p_before")" || pep=""; fi
+  # Each tag's span starts at its seen time less the slack, and after the
+  # mark; the reader is asked once, from the earliest of those starts.
+  local spans=""
+  for tok in $newc; do
+    tag="${tok%%|*}"
+    seen="${tok#*|}"
+    if [[ "$tag" == "primary" ]]; then any_closed_primary=1; fi
+    ep="$(_utc_epoch "$seen")" || ep=""
+    if [[ -z "$ep" ]]; then spans="${spans} ${tag}|x|x"; continue; fi
+    from_ep=$((ep - APPLOG_SLACK_S))
+    if [[ -n "$mep" && $from_ep -le $mep ]]; then from_ep=$((mep + 1)); fi
+    spans="${spans} ${tag}|${ep}|${from_ep}"
+    if [[ -z "$lo" || $from_ep -lt $lo ]]; then lo="$from_ep"; fi
+  done
+  to="$(_ot_local "$OT_NOW_EP")" || to=""
+  from=""
+  if [[ -n "$lo" ]]; then from="$(_ot_local "$lo")" || from=""; fi
+  if [[ -z "$from" || -z "$to" ]] || ! _applog_update_quits "$from" "$to"; then readable=0; fi
+  for tok in $spans; do
+    IFS='|' read -r tag ep from_ep <<< "$tok"
+    cause="unknown"
+    event="none"
+    if [[ "$ep" != "x" && $readable -eq 1 ]]; then
+      from="$(_ot_local "$from_ep")" || from=""
+      u=0
+      last=""
+      last_type="none"
+      while IFS=$'\t' read -r etype estamp; do
+        [[ -n "$etype" ]] || continue
+        if [[ -n "$from" && ! "$estamp" < "$from" ]]; then
+          u=$((u + 1))
+          if [[ -z "$last" || "$estamp" > "$last" ]]; then last="$estamp"; last_type="$etype"; fi
+        fi
+      done <<< "$APPLOG_EVENTS"
+      event="$last_type"
+      if [[ -n "$last" ]] && [[ -z "$max_counted" || "$last" > "$max_counted" ]]; then max_counted="$last"; fi
+      # k: the closures that must have fallen in this span.
+      k=0
+      for j in $spans; do
+        sj="${j#*|}"
+        sj="${sj%%|*}"
+        if [[ "$sj" != "x" && $sj -ge $ep ]]; then k=$((k + 1)); fi
+      done
+      if [[ -n "$pep" && $pep -ge $ep && $any_closed_primary -eq 0 ]]; then
+        if [[ "$running" != *" primary "* ]]; then
+          k=$((k + 1))
+        elif ! _updater_log_scan "$(_ot_local "$ep")" || [[ $UPD_LOG_DONE -gt 0 ]]; then
+          # Running again after a completed install (or the helper's log
+          # can't be read, so that can't be ruled out): its close used an
+          # event too.
+          k=$((k + 1))
+        fi
+      fi
+      if [[ $k -ge 1 && $u -ge $k ]]; then cause="updater"; fi
+    fi
+    seen=""
+    for tk in $newc; do
+      if [[ "${tk%%|*}" == "$tag" ]]; then seen="${tk#*|}"; fi
+    done
+    OT_CLOSED="${OT_CLOSED} ${tag}|${seen}|${OT_NOW_UTC}|${cause}|${event}"
+    OT_NEW="${OT_NEW:+${OT_NEW} }${tag}:${cause}"
+    if [[ -d "$STORE" ]]; then
+      _swap_log_ensure
+      printf '[%s] CLOSED tag=%s seen=%s cause=%s event=%s\n' \
+        "$OT_NOW_UTC" "$tag" "$seen" "$cause" "$event" >> "$SWAP_LOG" || :
+    fi
+  done
+  if [[ -n "$max_counted" ]]; then
+    mark_utc="$(_update_local_to_utc "$max_counted")" || mark_utc=""
+    if [[ "$mark_utc" =~ $AS_UTC_RE ]]; then OT_MARK="$mark_utc"; fi
+  fi
+  return 0
+}
+
+# open_tags_observe: one observation (see above). Compares the record's open
+# tags with the running instances: a running tag is seen now; one that is
+# gone is newly closed, with its cause; a running instance started with
+# --user-data-dir (other than primary) that isn't tracked is adopted; a
+# closed tag that runs again clears. It records nothing closed when the read
+# is undetermined (the app binary is not where detection looks, the process
+# table can't be read, or an instance's tag is unknown), though it still
+# refreshes what it sees running. Sets OT_NEW and OT_RUNNING_N. Always
+# returns 0.
+open_tags_observe() {
+  local rows st=0
+  OT_NEW=""
+  OT_RUNNING_N=""
+  app_binary_present || return 0
+  rows="$(claude_instances)" || st=$?
+  [[ $st -eq 0 ]] || return 0
+  _open_tags_observe_rows "$rows"
+}
+
+# _open_tags_observe_rows <claude_instances rows>: the observation, from
+# rows the caller has already read (update observes from its own listing
+# read, so it reads the process table no more often than before).
+_open_tags_observe_rows() {
+  local rows="$1" pid profile method running=" " argv=" " undetermined=0 n=0
+  local tok tag seen newc="" changed=0 p_before new_open="" new_closed=""
+  OT_NEW=""
+  OT_RUNNING_N=""
+  while IFS=$'\t' read -r pid profile method; do
+    [[ -n "$pid" ]] || continue
+    n=$((n + 1))
+    if [[ "$profile" == "unknown" ]]; then undetermined=1; continue; fi
+    running="${running}${profile} "
+    if [[ "$method" == "argv" && "$profile" != "primary" ]]; then argv="${argv}${profile} "; fi
+  done <<< "$rows"
+  OT_RUNNING_N="$n"
+  [[ -d "$STORE" ]] || return 0
+  _open_tags_now || return 0
+  _open_tags_read
+  p_before="$OT_PSEEN"
+  for tok in $OT_OPEN; do
+    tag="${tok%%|*}"
+    seen="${tok#*|}"
+    if [[ "$running" == *" ${tag} "* ]]; then
+      new_open="${new_open} ${tag}|${OT_NOW_UTC}"
+      if [[ "$seen" != "$OT_NOW_UTC" ]]; then changed=1; fi
+    elif [[ $undetermined -eq 1 ]]; then
+      new_open="${new_open} ${tok}"
+    elif _ot_in "$OT_CLOSED" "$tag"; then
+      # An open since that closure never produced an instance (reopen or
+      # launch exited without one): the first closure and its cause stand,
+      # and no second row is written.
+      changed=1
+    else
+      newc="${newc} ${tok}"
+      changed=1
+    fi
+  done
+  for tag in $argv; do
+    if ! _ot_in "$new_open" "$tag"; then
+      new_open="${new_open} ${tag}|${OT_NOW_UTC}"
+      changed=1
+    fi
+  done
+  OT_OPEN="$new_open"
+  for tok in $OT_CLOSED; do
+    if [[ "$running" == *" ${tok%%|*} "* ]]; then changed=1; else new_closed="${new_closed} ${tok}"; fi
+  done
+  OT_CLOSED="$new_closed"
+  if [[ "$running" == *" primary "* && "$OT_PSEEN" != "$OT_NOW_UTC" ]]; then
+    OT_PSEEN="$OT_NOW_UTC"
+    changed=1
+  fi
+  if [[ -n "$newc" ]]; then _open_tags_causes "$newc" "$p_before" "$running"; fi
+  if [[ $changed -eq 1 ]]; then _open_tags_write; fi
+  return 0
+}
+
+# _open_tags_cause_text <updater|unknown>
+_open_tags_cause_text() {
+  case "$1" in
+    updater) printf "closed by the app's updater" ;;
+    *)       printf 'closed, cause unknown' ;;
+  esac
+}
+
+# open_tags_notice: launch, swap and update print one warning line naming
+# the tags this run's observation found closed.
+open_tags_notice() {
+  local tok list=""
+  [[ -n "$OT_NEW" ]] || return 0
+  for tok in $OT_NEW; do
+    list="${list:+${list}, }${tok%%:*} ($(_open_tags_cause_text "${tok#*:}"))"
+  done
+  warn "Since the switcher last saw them running, Claude closed: ${list}. account-switcher list shows them; account-switcher reopen brings back the ones the updater closed."
+  return 0
+}
+
+# _open_tags_section: list's section of every recorded closure, printed only
+# when there is one.
+_open_tags_section() {
+  local tok tag seen found cause event any_u=0 any_k=0
+  if [[ $OT_LOADED -eq 0 ]]; then _open_tags_read; fi
+  [[ -n "${OT_CLOSED// /}" ]] || return 0
+  printf 'Tags Claude closed without the switcher (since it last saw them running):\n'
+  for tok in $OT_CLOSED; do
+    IFS='|' read -r tag seen found cause event <<< "$tok"
+    printf '  %-12s %-30slast seen %s\n' "$tag" "$(_open_tags_cause_text "$cause")" "$seen"
+    if [[ "$cause" == "updater" ]]; then any_u=1; else any_k=1; fi
+  done
+  if [[ $any_u -eq 1 ]]; then printf "  Reopen the ones the app's updater closed: account-switcher reopen\n"; fi
+  if [[ $any_k -eq 1 ]]; then printf '  Reopen one closed for an unknown reason: account-switcher launch <tag>\n'; fi
+  printf '\n'
+  return 0
+}
+
 # The update lock is a directory, made with mkdir, which fails when the
 # directory exists, so two runs cannot both take it. It holds one file,
 # owner: "pid=<n> started_epoch=<n> started_utc=<ISO UTC>". update takes it
@@ -2158,6 +2673,9 @@ open_tag_instance() {
   printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
     >> "$SWAP_LOG"
+
+  # #24: the tag is tracked from its open.
+  _open_tags_add "$tag"
 }
 
 cmd_launch() {
@@ -2185,6 +2703,10 @@ cmd_launch() {
   # #6: check the account the profile records before opening anything. A
   # MISMATCH refuses here (--force overrides); unknown proceeds with a hint.
   identity_gate "$tag" "$force" launch
+
+  # #24: an observation, after the #6 check so a refusal writes nothing.
+  open_tags_observe
+  open_tags_notice
 
   # #10: one line when a staged app update has waited too long.
   update_wait_warning
@@ -2230,6 +2752,9 @@ cmd_launch() {
 
 cmd_list_instances() {
   app_binary_warn
+  # #24: an observation; the section after the instance rows lists what it
+  # found.
+  open_tags_observe
   printf '\n=== Running Claude desktop app instances ===\n\n'
 
   # One row per main process from claude_instances. via= says how the tag
@@ -2258,6 +2783,7 @@ cmd_list_instances() {
     fi
   fi
   printf '\n'
+  _open_tags_section
 
   # #10: every Claude-* folder whose tag is not in [accounts] is marked
   # unconfigured. list only reports it; it never deletes a folder.
@@ -3768,6 +4294,11 @@ EOF
   # running instances alone. unknown proceeds with a hint.
   identity_gate "$target_tag" "$force" swap
 
+  # #24: an observation, before the handoff and the quit, and after the #6
+  # check so a refusal writes nothing.
+  open_tags_observe
+  open_tags_notice
+
   # #10: one line when a staged app update has waited too long.
   update_wait_warning
 
@@ -3814,6 +4345,10 @@ EOF
 
   # ---- Step 1: Quit current Mac app instance(s) --------------------------
   quit_all_claude
+  if [[ -n "$QUIT_TAGS" ]]; then
+    _swap_log_ensure
+    printf '[%s] QUIT_ALL tags=%s by=swap\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$QUIT_TAGS" >> "$SWAP_LOG"
+  fi
 
   # ---- Step 2: The settings step (#11) -----------------------------------
   # After every instance has quit (which flushes each profile's settings
@@ -3882,6 +4417,7 @@ EOF
     "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
     "$([ "$skip_mirror" == "false" ] && echo "yes" || echo "no")" \
     >> "$SWAP_LOG"
+  _open_tags_add "$target_tag"
 
   if [[ "$first_launch" == "true" ]]; then
     info ""
@@ -4164,7 +4700,7 @@ cmd_quit() {
       app_binary_present || die "$(app_binary_refusal "quit")"
       quit_all_claude
       _swap_log_ensure
-      printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG"
+      printf '[%s] QUIT_ALL tags=%s by=quit\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "${QUIT_TAGS:-none}" >> "$SWAP_LOG"
       ;;
     *)
       # H-1: Reject malformed tags even though per-tag quit is not yet
@@ -4277,6 +4813,7 @@ _update_reopen() {
     if [[ "$t" == "primary" && "$lai" == "true" && "$installed" == "1" ]]; then
       if [[ -n "$helper" ]]; then
         printf '  primary · PID %s (opened by the updater; not opened again)\n' "$helper"
+        _open_tags_back primary
         UPD_REOPENED=$((UPD_REOPENED + 1))
       else
         printf "  primary: not seen within %s s. The updater was asked to reopen it, so update does not open it a second time; if it does not appear, run: account-switcher launch primary\n" "$NEW_INSTANCE_WAIT_S"
@@ -4288,6 +4825,7 @@ _update_reopen() {
     is_tag_running "$t" || rs=$?
     if [[ $rs -eq 0 ]]; then
       printf '  %s: already running; not opened again\n' "$t"
+      _open_tags_back "$t"
       UPD_REOPENED=$((UPD_REOPENED + 1))
       continue
     fi
@@ -4305,6 +4843,7 @@ _update_reopen() {
     npid="$(wait_for_new_instance "$t" "$pre" "$NEW_INSTANCE_WAIT_S")"
     if [[ -n "$npid" ]]; then
       printf '  %s · PID %s\n' "$t" "$npid"
+      _open_tags_back "$t"
       UPD_REOPENED=$((UPD_REOPENED + 1))
     else
       printf "  %s: opened, but no new instance appeared within %s s (account-switcher list)\n" "$t" "$NEW_INSTANCE_WAIT_S"
@@ -4377,6 +4916,10 @@ cmd_update() {
   if [[ $st -ne 0 ]]; then
     _update_refuse "The process table could not be read, so update can't name what it would close. Nothing was closed."
   fi
+  # #24: an observation from the same read, before anything is listed or
+  # closed.
+  _open_tags_observe_rows "$rows"
+  open_tags_notice
   while IFS=$'\t' read -r pid profile method; do
     [[ -n "$pid" ]] || continue
     if [[ "$profile" == "unknown" ]]; then unknown="${unknown} ${pid}"; continue; fi
@@ -4457,7 +5000,8 @@ cmd_update() {
     ( quit_all_claude listed $listed ) || quit_rc=$?
     if [[ -d "$STORE" ]]; then
       _swap_log_ensure
-      printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
+      local ut="${UPD_TAGS// /,}"
+      printf '[%s] QUIT_ALL tags=%s by=update\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "${ut:-none}" >> "$SWAP_LOG" || :
     fi
   fi
   if [[ $quit_rc -ne 0 ]]; then
@@ -4983,6 +5527,7 @@ SIGNIN_FINAL=0
 SIGNIN_PHASE="none"
 SIGNIN_POST_STARTED=0
 SIGNIN_QUIT_ROW=0
+SG_CONFIRMED_TAGS=""
 SNAP_SALT=""
 SNAP_D_ABSENT=""
 
@@ -5228,7 +5773,7 @@ _signin_quit_row() {
   SIGNIN_QUIT_ROW=1
   if [[ -d "$STORE" ]]; then
     _swap_log_ensure
-    printf '[%s] QUIT_ALL\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SWAP_LOG" || :
+    printf '[%s] QUIT_ALL tags=%s by=signin\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "${SG_CONFIRMED_TAGS:-none}" >> "$SWAP_LOG" || :
   fi
 }
 
@@ -5867,6 +6412,10 @@ cmd_signin() {
         if [[ "$profile" == "$tag" ]]; then mark="  (target: will be quit and reopened)"; fi
         printf '  %s · PID %s%s\n' "$profile" "$pid" "$mark"
         SG_CONFIRMED="${SG_CONFIRMED} ${pid}"
+        case ",${SG_CONFIRMED_TAGS}," in
+          *",${profile},"*) ;;
+          *) SG_CONFIRMED_TAGS="${SG_CONFIRMED_TAGS:+${SG_CONFIRMED_TAGS},}${profile}" ;;
+        esac
       done <<< "$SG_ROWS"
       printf -- "--quit-others quits every Claude instance listed above (work in progress in them may be lost), then opens '%s' alone.\n" "$tag"
       if [[ "$yes" != "true" ]]; then
@@ -5918,6 +6467,10 @@ cmd_signin() {
     SG_PRE_PRIMARY=" "
   fi
 
+  # #24: an observation before the open, so the tag signin opens carries
+  # the same seen time as every tag running now (one clock per run).
+  open_tags_observe
+
   # The target: use the running instance (never a second process on a
   # profile whose lock is held), or open it through launch's open path.
   local first_launch="false" pre rung
@@ -5934,6 +6487,7 @@ cmd_signin() {
       _signin_refuse "Could not open the '${tag}' instance; nothing was signed in."
     fi
     TARGET_PID="$(wait_for_new_instance "$tag" "$pre" "$NEW_INSTANCE_WAIT_S")"
+    if [[ -n "$TARGET_PID" ]]; then _open_tags_back "$tag"; fi
     if [[ -z "$TARGET_PID" ]]; then
       _signin_refuse "No new '${tag}' instance appeared within ${NEW_INSTANCE_WAIT_S} s of opening it, so signin can't watch it; nothing was signed in by signin. Check with: account-switcher list"
     fi

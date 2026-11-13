@@ -75,8 +75,8 @@ from the repo root).
 
 The check is read-only. It skips your runtime state and never opens it:
 `config.toml`, `swap-history.log`, `swap-history.log.1`, `.statusline-marker`,
-`prefs-sync.json`, `.prefs-sync.lock`, `update-state.json`, `.update.lock`
-and `.DS_Store`.
+`prefs-sync.json`, `.prefs-sync.lock`, `update-state.json`, `open-tags.json`,
+`.update.lock` and `.DS_Store`.
 
 To see which version is installed without the repo:
 

@@ -1,0 +1,5 @@
+__T_BEFORE__ [info] [main] Window focused
+__T_NOISE__ [info] [updater] Checking for updates
+__T_NOISE__.123 [info] [updater] Auto-restarting app after update pending for 25 hours
+__T_EVENT__ [info] [updater] Auto-restarting app after update pending for 25 hours
+__T_EVENT__ [info] Killing 1 PTY process tree(s) on quit
