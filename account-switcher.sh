@@ -1996,10 +1996,11 @@ update_wait_warning() {
 # back: the update installs only once every instance is closed, and the
 # updater then reopens only primary. The switcher has no background job. It
 # notices the next time a command that reads the process table runs (an
-# observation): list, launch, swap, update, reopen and signin. Every quit the
-# switcher makes goes through quit_all_claude, which takes the tags it is
-# about to close out of the record before anything is signalled, so the
-# switcher's own quits are never reported as the app's.
+# observation): list, launch, swap, reopen and signin, and update while an
+# update is staged (with nothing staged it stops before its listing). Every
+# quit the switcher makes goes through quit_all_claude, which takes the tags
+# it is about to close out of the record before anything is signalled, so
+# the switcher's own quits are never reported as the app's.
 #
 # The record, open-tags.json (mode 600), is the only input to detection:
 #   {"schema": 1,

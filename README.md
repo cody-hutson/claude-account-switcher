@@ -483,9 +483,11 @@ last one closes, the update installs, and the updater reopens only
 `primary`, and only when its install request asked it to.
 
 The switcher can't stop this. With no background job, it notices at your
-next `list`, `launch`, `swap`, `update`, `reopen` or `signin`. `list` names
-each tag the switcher opened that is now gone without the switcher closing
-it, with when it was last seen and the cause:
+next `list`, `launch`, `swap`, `reopen` or `signin`, and at `update` while
+an update is still staged (once the app has installed it, `update` has
+nothing to do and doesn't look). `list` names each tag the switcher opened
+that is now gone without the switcher closing it, with when it was last
+seen and the cause:
 
 ```
 Tags Claude closed without the switcher (since it last saw them running):
@@ -784,7 +786,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 - No plaintext tokens persist on disk under this script's authority. OAuth state lives in the macOS keychain (CLI surface) or Electron `safeStorage` per `--user-data-dir` (Mac-app surface).
 - `signin` compares every profile's identity before and after the sign-in without holding the value: `jq` writes it into a pipe that `shasum` reads, and only a salted SHA-256 digest comes back. The digests and the salt are never printed, logged, written to a file or passed to another program; history rows carry tags, status words and counts only.
 - The account check reads one non-secret value, `lastKnownAccountUuid`, from each profile's `config.json`. That file also holds the app's token caches, so `jq` reads it in place and only that one value (at most 36 characters, and only when it is shaped like an account id) reaches the script; no shell variable ever holds the file's contents, the file is never copied, and core dumps are turned off for the run. Nothing else in a profile is opened.
-- Update detection (`list`, `update`, `reopen`, and the `launch` / `swap` warning) reads only the updater's state file, the installed and staged `Info.plist` files, the updater's log and the process list. When a tag the switcher opened is found closed, it also reads the app's own log (`~/Library/Logs/Claude/main.log` and its numbered copies; never `main-window.log`). From that log it takes two event types, the idle-timeout update close and the restart after a long-pending update, and their times, and nothing else. That log also holds account and organization ids, and they never reach the switcher's output, its history or its files. It opens no cookies, Local Storage, keychain items or tokens, and nothing in any profile folder. The updater's cache is found by the app's bundle id, never by a pattern that could match another app's updater.
+- Update detection (`list`, `update`, `reopen`, and the `launch` / `swap` warning) reads only the updater's state file, the installed and staged `Info.plist` files, the updater's log and the process list. When a tag the switcher opened is found closed (by any command that checks for closed tags, `signin` included), the check also reads the app's own log (`~/Library/Logs/Claude/main.log` and its numbered copies; never `main-window.log`). From that log it takes two event types, the idle-timeout update close and the restart after a long-pending update, and their times, and nothing else. That log also holds account and organization ids, and they never reach the switcher's output, its history or its files. It opens no cookies, Local Storage, keychain items or tokens, and nothing in any profile folder. The updater's cache is found by the app's bundle id, never by a pattern that could match another app's updater.
 - The `SWAP_HANDOFF.md` capture applies redaction patterns to commit messages, branch names, and gh issue/PR titles before write: `eyJ[A-Za-z0-9_.-]{20,}` (JWT-like), `sk-ant-[A-Za-z0-9_-]{20,}` (Anthropic API key prefix), `[A-Za-z0-9_-]{60,}` (long token-like sequences) get replaced with `[REDACTED-TOKEN-LIKE]` before write.
 
 ## Safety
