@@ -603,6 +603,116 @@ case_one_clock() {
   result "one clock per run: after launch tag-a and launch tag-b (each open takes 1.5 s), both tags and primary carry one stamp, so a tag quit by hand in the chain reads unknown" $?
 }
 
+# row_shape <row>: returns 0 when a QUIT_ALL, CLOSED or REOPEN row is exactly
+# [UTC] KIND key=value with that kind's keys and value shapes, so nothing
+# else (no udd=, id or path) can ride on it; 2 for a row of another kind.
+row_shape() {
+  local u='^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\] '
+  local tags='(none|[a-z0-9][a-z0-9-]*(,[a-z0-9][a-z0-9-]*)*)'
+  local s='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+  local re
+  case "$1" in
+    *"] QUIT_ALL"*) re="${u}QUIT_ALL tags=${tags} by=(quit|swap|update|signin)$" ;;
+    *"] CLOSED "*)  re="${u}CLOSED tag=[a-z0-9][a-z0-9-]* seen=${s} cause=(updater|unknown) event=(idle-update|pending-restart|none)$" ;;
+    *"] REOPEN "*)  re="${u}REOPEN tags=${tags} reopened=[0-9]+/[0-9]+ missing=${tags}$" ;;
+    *) return 2 ;;
+  esac
+  [[ "$1" =~ $re ]]
+}
+
+case_swap_from_primary() {
+  # primary runs (the Dock's); swap tag-b quits it, and the switcher's own
+  # quit of primary logs no update close, so primary_seen clears. Then the
+  # updater closes tag-b (an idle close, the install, the helper reopens
+  # primary): tag-b reads updater, and reopen brings it back. Without the
+  # clear, primary would count as one more closure in tag-b's span, and
+  # tag-b would read unknown and never be reopened (#24's headline path).
+  scenario
+  ps_rows 501:primary
+  export AS_FAKE_QUIT=graceful AS_FAKE_OPEN_SPAWNS_PID=4502
+  run_switcher list
+  local listed_p
+  listed_p="$(rec_q '.primary_seen_utc | type')"
+  run_switcher swap tag-b --no-mirror --no-handoff
+  local swap_rc="$rc" swap_p seen_b
+  swap_p="$(rec_q '.primary_seen_utc | type')"
+  seen_b="$(rec_q '.open[] | select(.tag == "tag-b") | .seen_utc')"
+  local t
+  t="$(/bin/date +%s)"
+  ps_rows 4400:primary
+  idle_line "$t"
+  helper_install "$t"
+  updater_flag true
+  run_switcher list
+  local list_out="$out"
+  export AS_FAKE_OPEN_SPAWNS_PID=4503
+  run_switcher reopen
+  local reopen_rc="$rc" reopen_out="$out"
+  # Every QUIT_ALL, CLOSED and REOPEN row has exactly its shape; control: a
+  # planted udd= on a row of each kind fails it.
+  local l bad="" n_q=0 n_c=0 n_r=0 control=""
+  while IFS= read -r l; do
+    row_shape "$l"
+    case $? in
+      0) case "$l" in *"] QUIT_ALL"*) n_q=$((n_q + 1)) ;; *"] CLOSED "*) n_c=$((n_c + 1)) ;; *) n_r=$((n_r + 1)) ;; esac ;;
+      1) bad="${bad} bad-row" ;;
+    esac
+  done <<< "$(history_text)"
+  for l in "[2026-11-12T00:00:00Z] QUIT_ALL tags=primary by=swap udd=/x" \
+           "[2026-11-12T00:00:00Z] CLOSED tag=tag-b seen=2026-11-12T00:00:00Z cause=updater event=none udd=/x" \
+           "[2026-11-12T00:00:00Z] REOPEN tags=tag-b reopened=1/1 missing=none udd=/x"; do
+    row_shape "$l" && control="${control} passed"
+  done
+  out="${list_out}"$'\n'"${reopen_out}"
+  assert_eq "$listed_p" "string" "primary_seen after the first list" &&
+    assert_eq "$swap_rc" "0" "swap" &&
+    assert_eq "$swap_p" "null" "primary_seen after the swap quit primary" &&
+    assert_eq "$([[ "$seen_b" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && printf ok)" "ok" "tag-b tracked from the swap" &&
+    assert_contains "$(history_text)" "] QUIT_ALL tags=primary by=swap" &&
+    assert_contains "$list_out" "$(printf '  %-12s %-30slast seen %s' tag-b "closed by the app's updater" "$seen_b")" &&
+    assert_contains "$(history_text)" "CLOSED tag=tag-b seen=${seen_b} cause=updater event=idle-update" &&
+    assert_eq "$reopen_rc" "0" "reopen" &&
+    assert_contains "$reopen_out" "  tag-b · PID 4503" &&
+    assert_contains "$reopen_out" "reopen reopened=1/1 missing=none unknown=none exit=0" &&
+    assert_eq "$(n_open_flagless)" "0" "opens without --user-data-dir" &&
+    assert_eq "$bad" "" "rows off their shape" &&
+    assert_eq "${n_q}/${n_c}/${n_r}" "1/1/1" "QUIT_ALL/CLOSED/REOPEN rows" &&
+    assert_eq "$control" "" "control: a planted udd= fails each shape"
+  result "swap tag-b from a running primary clears primary_seen (its own quit logs no update close), so the updater's close of tag-b reads updater and reopen brings it back; every QUIT_ALL, CLOSED and REOPEN row has its exact shape (control: a planted udd= fails each)" $?
+}
+
+case_signin_observes() {
+  # signin observes before its open: tag-a and primary, last seen 10 minutes
+  # ago, carry signin's stamp, as tag-b does. Then tag-b is quit by hand,
+  # and the updater closes tag-a and primary; the install; the helper
+  # reopens primary. Both tags read unknown. Without the observation, tag-b
+  # alone would be seen at signin's stamp, the two closes would cover it,
+  # and the hand-quit tag-b would read closed by the updater.
+  scenario
+  ps_rows 501:primary 502:tag-a
+  seed "$SEEN_EP" - "tag-a:${SEEN_EP}"
+  export AS_FAKE_OPEN_SPAWNS_PID=4503
+  run_switcher signin tag-b --timeout 30 --settle 0
+  local si_rc="$rc" stamps
+  stamps="$(rec_q '[.open[] | .seen_utc] + [.primary_seen_utc] | unique | length')"
+  local t
+  t="$(/bin/date +%s)"
+  ps_rows 4400:primary
+  idle_line "$t"
+  idle_line "$t" main1.log
+  helper_install "$t"
+  run_switcher list
+  local h
+  h="$(history_text)"
+  out="signin_rc=${si_rc} stamps=${stamps}"$'\n'"${out}"
+  assert_eq "$si_rc" "3" "signin (no account appears: timeout)" &&
+    assert_eq "$stamps" "1" "one stamp for tag-a, tag-b and primary after signin" &&
+    assert_contains "$h" "CLOSED tag=tag-a" &&
+    assert_contains "$h" "CLOSED tag=tag-b" &&
+    assert_not_contains "$h" "cause=updater"
+  result "signin observes before its open: tag-a and primary take its stamp with tag-b, so a tag-b quit by hand in the chain reads unknown, never updater" $?
+}
+
 # ---- A tag seen again (Stage 5 A-1) ---------------------------------------------------
 
 case_launch_clears() {
@@ -812,6 +922,8 @@ case_count_cost
 case_mark
 case_mark_moves
 case_one_clock
+case_swap_from_primary
+case_signin_observes
 case_launch_clears
 case_open_never_took
 case_reopen_helper_primary

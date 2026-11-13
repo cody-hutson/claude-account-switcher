@@ -1289,6 +1289,51 @@ HOOK
   result "#24 INT-4: a list while update holds its lock, after its quit, records nothing closed (the quit took its tags out first)" $?
 }
 
+# app_idle_line <epoch> <file>: one idle-timeout update close in the app's
+# own log (local time, as the app stamps it).
+app_idle_line() {
+  /bin/mkdir -p "$AS_APP_LOG_DIR" || harness_error "cannot create the app log folder"
+  printf '%s [info] [stealth-update] Triggering stealth update after idle timeout\n' \
+    "$(/bin/date -r "$1" '+%Y-%m-%d %H:%M:%S')" >> "${AS_APP_LOG_DIR}/$2"
+}
+
+case_24_helper_primary_seen() {
+  # update with tag-a and tag-b open and primary not; the flag true. update
+  # observes before its quit, so the helper's primary, seen in update's
+  # reopen, is the only time this run sees primary: primary_seen takes the
+  # run's stamp there. Then tag-a is quit by hand, and the updater closes
+  # tag-b and primary; the install; the helper reopens primary. Both tags
+  # read unknown, because primary's own update close is counted. Left
+  # empty, primary_seen would let the two closes cover the two tags, and
+  # the hand-quit tag-a would read closed by the updater.
+  scenario "$OLD_V" "$NEW_V" true 502:tag-a 503:tag-b
+  helper_hook install 2 1
+  run_up "" update --yes
+  local up_rc="$rc" up_out="$out" pseen seen_a seen_b
+  pseen="$(rec24 '.primary_seen_utc // "null"')"
+  seen_a="$(rec24 '.open[] | select(.tag == "tag-a") | .seen_utc')"
+  seen_b="$(rec24 '.open[] | select(.tag == "tag-b") | .seen_utc')"
+  local t
+  t="$(/bin/date +%s)"
+  ps_table "${RELAUNCH_PID}:primary"
+  app_idle_line "$t" main.log
+  app_idle_line "$t" main1.log
+  printf '%s.500 ShipIt[115:216] Beginning installation\n%s.900 ShipIt[115:216] Installation completed successfully\n' \
+    "$(/bin/date -r "$t" '+%Y-%m-%d %H:%M:%S')" "$(/bin/date -r "$t" '+%Y-%m-%d %H:%M:%S')" >> "$(log_path)"
+  run_switcher list
+  local h
+  h="$(history_text)"
+  out="${up_out}"$'\n'"${out}"
+  assert_eq "$up_rc" "0" "update" &&
+    assert_contains "$up_out" "  primary · PID ${RELAUNCH_PID} was opened by the updater (primary was not open before); it is left running." &&
+    assert_eq "$seen_b" "$seen_a" "the reopened tags' stamps" &&
+    assert_eq "$pseen" "$seen_a" "primary_seen after the reopen" &&
+    assert_contains "$h" "] CLOSED tag=tag-a " &&
+    assert_contains "$h" "] CLOSED tag=tag-b " &&
+    assert_not_contains "$h" "cause=updater"
+  result "#24: update's reopen sees the helper's primary, so primary_seen takes the run's stamp; a later hand quit of tag-a with tag-b and primary closed by the updater reads unknown for both, never updater" $?
+}
+
 # ---- The unknown-tag guard ---------------------------------------------------------
 
 case_unknown_tag_guard() {
@@ -1383,6 +1428,7 @@ case_install_check
 case_wait_warning
 case_24_update_cycle
 case_24_list_during_update
+case_24_helper_primary_seen
 case_unknown_tag_guard
 case_help
 case_seam_guarded
