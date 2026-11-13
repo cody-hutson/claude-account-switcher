@@ -1190,30 +1190,48 @@ record_state() {  # <first_seen_utc>
 ago_utc() { /bin/date -u -r $(( $(/bin/date +%s) - $1 )) +%Y-%m-%dT%H:%M:%SZ; }
 
 case_wait_warning() {
-  local ok=0 n
+  # #24 (D-6, D-Warn-scope (A)): from the moment an update is staged,
+  # launch and swap print one line saying the app may close idle windows on
+  # its own; [update] warn_after_hours is no longer read. list adds the same
+  # warning while any instance is open.
+  local ok=0 n line idle
+  idle="The app may close idle windows on its own to install it, from about 10 minutes after it finds the update: that ends their Code sessions and Terminal tabs, and tags other than primary don't come back. To install it on your terms: account-switcher update"
+  scenario "$OLD_V" "$NEW_V" false
+  record_state "$(ago_utc 120)"
+  run_up "" launch tag-a
+  line="Claude ${NEW_V} is waiting to install (staged 2m ago). ${idle}"
+  n="$(count_matching "$err" "is waiting to install")"
+  [[ "$rc" == "0" && "$n" == "1" && "$err" == *"$line"* ]] || { ok=1; printf '    launch 2 m: rc=%s n=%s\n' "$rc" "$n"; }
+  run_up "" swap tag-b --no-mirror --no-handoff
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" ]] || { ok=1; printf '    swap 2 m: rc=%s\n' "$rc"; }
+  # Past 24 hours: still exactly one line, and no 24-hour wording.
   scenario "$OLD_V" "$NEW_V" false
   record_state "$(ago_utc 108000)"
   run_up "" launch tag-a
-  n="$(count_matching "$err" "to install (over 24 h)")"
-  [[ "$rc" == "0" && "$n" == "1" && "$err" == *"Claude ${NEW_V} has waited 1d 6h to install (over 24 h); it installs only when every Claude instance is closed. To install it now: account-switcher update"* ]] || { ok=1; printf '    launch 30 h: rc=%s n=%s\n' "$rc" "$n"; }
-  run_up "" swap tag-b --no-mirror --no-handoff
-  [[ "$rc" == "0" && "$(count_matching "$err" "to install (over 24 h)")" == "1" ]] || { ok=1; printf '    swap 30 h: rc=%s\n' "$rc"; }
-  # Under the threshold: no line.
-  scenario "$OLD_V" "$NEW_V" false
-  record_state "$(ago_utc 7200)"
-  run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" != *"to install (over"* ]] || ok=1
-  # A higher threshold in config.toml.
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" && "$err" == *"(staged 1d 6h ago). ${idle}"* && "$err" != *"(over 24 h)"* ]] \
+    || { ok=1; printf '    launch 30 h: rc=%s\n' "$rc"; }
+  # warn_after_hours in config.toml changes nothing: the key is not read.
   scenario "$OLD_V" "$NEW_V" false
   write_config "warn_after_hours = 48"
-  record_state "$(ago_utc 108000)"
+  record_state "$(ago_utc 120)"
   run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" != *"to install (over"* ]] || ok=1
-  record_state "$(ago_utc 180000)"
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" ]] || { ok=1; printf '    launch at 48: rc=%s\n' "$rc"; }
+  # Nothing staged: no line.
+  scenario "$OLD_V" none false
   run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" == *"has waited 2d 2h to install (over 48 h)"* ]] || { ok=1; printf '    launch 50 h at 48: rc=%s\n' "$rc"; }
+  [[ "$rc" == "0" && "$err" != *"is waiting to install"* && "$err" != *"may close idle windows"* ]] || { ok=1; printf '    launch, nothing staged: rc=%s\n' "$rc"; }
+  # list: the warning line after waiting:, with one instance open, and none
+  # with no instance open.
+  scenario "$OLD_V" "$NEW_V" false 502:tag-a
+  record_state "$(ago_utc 120)"
+  run_switcher list
+  [[ "$rc" == "0" && "$(count_matching "$out" "  warning:   the app may close idle windows on its own")" == "1" ]] || { ok=1; printf '    list, one open: rc=%s\n' "$rc"; }
+  scenario "$OLD_V" "$NEW_V" false
+  record_state "$(ago_utc 120)"
+  run_switcher list
+  [[ "$rc" == "0" && "$out" != *"  warning:"* ]] || { ok=1; printf '    list, none open: rc=%s\n' "$rc"; }
   assert_eq "$ok" "0" "warning cases"
-  result "launch and swap print one line naming update once the staged update has waited past [update] warn_after_hours (default 24, 48 when set), and none below it" $?
+  result "#24: from the moment an update is staged, launch and swap print one line that the app may close idle windows on its own (also past 24 h; warn_after_hours is not read), list adds it while an instance is open, and nothing staged prints none" $?
 }
 
 # ---- #24: update and the record of the tags Claude closed --------------------------

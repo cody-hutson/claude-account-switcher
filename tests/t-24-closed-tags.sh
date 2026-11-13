@@ -637,6 +637,159 @@ case_open_never_took() {
   result "an open that produced no instance: the first closure and its cause stand, no second row" $?
 }
 
+# ---- reopen (#24 AC3) ---------------------------------------------------------------
+
+# updater_flag <true|false>: the helper's state file (JSON) with
+# launchAfterInstallation set.
+updater_flag() {
+  /bin/mkdir -p "$AS_UPDATER_CACHE" || harness_error "cannot create the updater cache"
+  printf '{"launchAfterInstallation": %s, "useUpdateBundleName": true}\n' "$1" > "${AS_UPDATER_CACHE}/ShipItState.plist"
+}
+
+# The open calls without --user-data-dir (primary), and with a tag's.
+n_open_flagless() {
+  local l n=0
+  while IFS= read -r l; do [[ "$l" == $'open\t-n\t-a\tClaude' ]] && n=$((n + 1)); done < <(calls_of open)
+  printf '%d' "$n"
+}
+n_open_tag() {
+  local l n=0
+  while IFS= read -r l; do [[ "$l" == $'open\t-n\t-a\tClaude\t--args\t--user-data-dir='"$(pdir "$1")" ]] && n=$((n + 1)); done < <(calls_of open)
+  printf '%d' "$n"
+}
+
+case_reopen_helper_primary() {
+  # The helper reopened primary after an install it was asked to reopen the
+  # app from; primary and tag-a are recorded as closed by the updater.
+  scenario
+  ps_rows 4400:primary
+  seed - -
+  seed_closed primary "$SEEN_EP" updater idle-update
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  updater_flag true
+  helper_install "$((NOW_EP - 20))"
+  export AS_FAKE_OPEN_SPAWNS_PID=4501
+  run_switcher reopen
+  assert_rc 0 &&
+    assert_eq "$(n_open_tag tag-a)" "1" "opens of tag-a" &&
+    assert_eq "$(n_open_flagless)" "0" "opens without --user-data-dir" &&
+    assert_contains "$out" "  tag-a · PID 4501" &&
+    assert_contains "$out" "reopen reopened=1/1 missing=none unknown=none exit=0" &&
+    assert_eq "$(rec_q '.closed | length')" "0" "closed entries left" &&
+    assert_contains "$(history_text)" "] REOPEN tags=tag-a reopened=1/1 missing=none"
+  result "reopen: the helper's primary is running, so only tag-a opens (never an open without --user-data-dir); the records clear, one REOPEN row, exit 0" $?
+}
+
+case_reopen_never_appears() {
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  run_switcher reopen
+  local first_rc="$rc" first_out="$out"
+  run_switcher list
+  local list_out="$out"
+  run_switcher reopen
+  out="${first_out}"$'\n'"${list_out}"$'\n'"${out}"
+  assert_eq "$first_rc" "3" "the first reopen" &&
+    assert_contains "$first_out" "reopen reopened=0/1 missing=tag-a unknown=none exit=3" &&
+    assert_not_contains "$(history_text)" "] CLOSED " &&
+    assert_contains "$list_out" "$(row_for tag-a updater)" &&
+    assert_rc 3 &&
+    assert_eq "$(n_open_tag tag-a)" "2" "opens of tag-a over both reopens"
+  result "reopen: a tag that never appears -> exit 3, named, still recorded; list writes no second CLOSED row and still shows it; the next reopen offers it again" $?
+}
+
+case_reopen_refusals() {
+  local lock_ok=1 install_ok=1
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  /bin/mkdir -p "${AS_STORE}/.update.lock" || harness_error "cannot create the lock"
+  printf 'pid=4242 started_epoch=%s started_utc=%s\n' "$NOW_EP" "$(utc_of "$NOW_EP")" > "${AS_STORE}/.update.lock/owner"
+  run_switcher reopen
+  if [[ "$rc" == "2" && "$err" == *"An update is running"*"Not reopening"* && -z "$(calls_of open)" ]]; then lock_ok=0; fi
+  local lock_err="$err"
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  /bin/mkdir -p "$AS_UPDATER_CACHE" || harness_error "cannot create the updater cache"
+  printf '%s.500 ShipIt[1:2] Beginning installation\n' "$(local_of "$NOW_EP")" > "${AS_UPDATER_CACHE}/ShipIt_stderr.log"
+  run_switcher reopen
+  if [[ "$rc" == "2" && "$err" == *"The updater is installing right now; nothing was opened."* && -z "$(calls_of open)" ]]; then install_ok=0; fi
+  out="${lock_err}"$'\n'"${err}"
+  assert_eq "$lock_ok" "0" "under the update lock" &&
+    assert_eq "$install_ok" "0" "while an install runs" &&
+    assert_not_contains "$(history_text)" "REOPEN"
+  result "reopen refuses (exit 2, nothing opened, no row) while update holds its lock and while the updater's log shows an install running" $?
+}
+
+case_reopen_waits_for_helper() {
+  local waited=1 control=1
+  # 30 s after a completed install, the flag true, primary not running yet:
+  # reopen waits for the helper's primary and never opens it.
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed primary "$SEEN_EP" updater idle-update
+  updater_flag true
+  helper_install "$((NOW_EP - 30))"
+  set_ps_next_fixture ps-primary-only.txt
+  run_switcher reopen
+  if [[ "$rc" == "0" && "$(n_open_flagless)" == "0" && "$out" == *"  primary · PID 501 (opened by the updater; not opened again)"* \
+        && "$out" == *"reopen reopened=1/1 missing=none unknown=none exit=0"* ]]; then waited=0; fi
+  local first="$out"
+  # Control: the flag false, the same table switch: reopen opens primary.
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed primary "$SEEN_EP" updater idle-update
+  updater_flag false
+  helper_install "$((NOW_EP - 30))"
+  export AS_FAKE_OPEN_SPAWNS_PID=4502
+  run_switcher reopen
+  if [[ "$(n_open_flagless)" == "1" ]]; then control=0; fi
+  out="${first}"$'\n'"${out}"
+  assert_eq "$waited" "0" "waits for the helper's primary, never opens it" &&
+    assert_eq "$control" "0" "control: with the flag false it opens primary"
+  result "reopen right after an install the updater reopens: it waits for the helper's primary (seen on a later poll) and never opens it (control: with the flag false it opens primary)" $?
+}
+
+case_reopen_unknown_only() {
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" unknown none
+  run_switcher reopen
+  assert_rc 0 &&
+    assert_contains "$out" "Nothing to reopen: no tag is recorded as closed by the app's updater." &&
+    assert_contains "$out" "Not reopened (closed, cause unknown; it may have been closed on purpose):" &&
+    assert_contains "$out" "  account-switcher launch tag-a" &&
+    assert_contains "$out" "reopen reopened=0/0 missing=none unknown=tag-a exit=0" &&
+    assert_never_called open &&
+    assert_not_contains "$(history_text)" "REOPEN"
+  result "reopen with only 'cause unknown' tags: nothing opens, each is named with a launch command, exit 0" $?
+}
+
+case_reopen_unconfigured() {
+  # A tag recorded as closed by the updater that is neither in [accounts]
+  # nor on disk any more would open as a new, empty profile.
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-z "$SEEN_EP" updater idle-update
+  run_switcher reopen
+  assert_rc 3 &&
+    assert_contains "$out" "  account-switcher launch tag-z --new" &&
+    assert_contains "$out" "reopen reopened=0/1 missing=tag-z unknown=none exit=3" &&
+    assert_never_called open
+  result "reopen never opens a tag that is neither in [accounts] nor on disk: named with launch --new, exit 3" $?
+}
+
+case_reopen_arguments() {
+  scenario ps-no-claude.txt
+  run_switcher reopen tag-a
+  assert_rc 2 &&
+    assert_contains "$err" "Usage: account-switcher reopen" &&
+    assert_never_called ps
+  result "reopen takes no arguments: exit 2 with the usage line, before reading the process table" $?
+}
+
 case_cause_idle
 case_cause_forced
 case_cause_no_event
@@ -661,4 +814,11 @@ case_mark_moves
 case_one_clock
 case_launch_clears
 case_open_never_took
+case_reopen_helper_primary
+case_reopen_never_appears
+case_reopen_refusals
+case_reopen_waits_for_helper
+case_reopen_unknown_only
+case_reopen_unconfigured
+case_reopen_arguments
 finish

@@ -5,7 +5,7 @@
 # Electron --user-data-dir flag. An earlier CLI-mutation approach was
 # removed after a security review; only the Mac-app launcher surface ships.
 #
-# Subcommands: swap | launch | signin | identity | clone-prefs | prefs | quit | update | list | status | config | add-account | version | help
+# Subcommands: swap | launch | signin | identity | clone-prefs | prefs | quit | update | reopen | list | status | config | add-account | version | help
 #
 # Primitives: bash + jq + open + osascript + lsappinfo. No Python, no node.
 # No tokens are persisted on disk by this script. OAuth state lives in the
@@ -1656,7 +1656,6 @@ readonly UPDATE_LOCK_STALE_S=600
 readonly LOCK_STALE_S=$UPDATE_LOCK_STALE_S
 readonly PREFS_STATE="${STORE}/prefs-sync.json"
 readonly PREFS_LOCK="${STORE}/.prefs-sync.lock"
-readonly UPDATE_WARN_HOURS_DEFAULT=24
 readonly UPDATE_TIMEOUT_DEFAULT=120
 readonly AS_VERSION_RE='^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$'
 readonly AS_UTC_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
@@ -1968,17 +1967,25 @@ _update_config_int() {
   printf '%s' "$2"
 }
 
+# _update_idle_close_text: the warning's sentence (#24), one source for
+# launch, swap and list, so their wording can't drift apart. The callers
+# supply its first word ("The", or list's "the").
+_update_idle_close_text() {
+  printf "app may close idle windows on its own to install it, from about 10 minutes after it finds the update: that ends their Code sessions and Terminal tabs, and tags other than primary don't come back. To install it on your terms: account-switcher update"
+}
+
 # update_wait_warning: launch and swap call this before they open anything.
-# When the staged update has waited longer than [update] warn_after_hours
-# (default 24), one warning line naming the update command. Never refuses.
+# From the moment an app update is staged, one warning line: the app may
+# close idle windows on its own to install it (#24). launch and swap each
+# leave an instance open, so they warn whenever an update is staged; the
+# [update] warn_after_hours threshold of v11.0.0 is no longer read. Never
+# refuses.
 update_wait_warning() {
-  local hours
+  local staged=""
   update_observe
-  [[ "$UPD_STAGED" != "unknown" && "$UPD_STAGED" != "none" && -n "$UPD_WAIT_S" ]] || return 0
-  hours="$(_update_config_int warn_after_hours "$UPDATE_WARN_HOURS_DEFAULT" 1 8760)"
-  if [[ $UPD_WAIT_S -gt $((hours * 3600)) ]]; then
-    warn "Claude ${UPD_STAGED} has waited $(_fmt_duration "$UPD_WAIT_S") to install (over ${hours} h); it installs only when every Claude instance is closed. To install it now: account-switcher update"
-  fi
+  [[ "$UPD_STAGED" != "unknown" && "$UPD_STAGED" != "none" ]] || return 0
+  if [[ -n "$UPD_WAIT_S" ]]; then staged=" (staged $(_fmt_duration "$UPD_WAIT_S") ago)"; fi
+  warn "Claude ${UPD_STAGED} is waiting to install${staged}. The $(_update_idle_close_text)"
   return 0
 }
 
@@ -2191,6 +2198,17 @@ _open_tags_set_open() {
     OT_CLOSED="$(_ot_without "$OT_CLOSED" "$tag")"
     if [[ "$tag" == "primary" ]]; then OT_PSEEN="$OT_NOW_UTC"; fi
   fi
+  _open_tags_write
+  return 0
+}
+
+# _open_tags_primary_seen: primary is running (the updater's helper opened
+# it), though the switcher doesn't track it: primary_seen_utc is now.
+_open_tags_primary_seen() {
+  [[ -d "$STORE" ]] || return 0
+  _open_tags_now || return 0
+  _open_tags_read
+  OT_PSEEN="$OT_NOW_UTC"
   _open_tags_write
   return 0
 }
@@ -2708,7 +2726,7 @@ cmd_launch() {
   open_tags_observe
   open_tags_notice
 
-  # #10: one line when a staged app update has waited too long.
+  # #10, #24: one line while an app update is staged.
   update_wait_warning
 
   # #9: launch never uses detection to avoid a second process (it always
@@ -2831,6 +2849,11 @@ cmd_list_instances() {
         printf '  waiting:   %s (since %s)\n' "$(_fmt_duration "$UPD_WAIT_S")" "$UPD_FIRST_SEEN"
       else
         printf '  waiting:   unknown\n'
+      fi
+      # #24: while any instance is open (or the process table could not be
+      # read, so none can be ruled out).
+      if [[ "$OT_RUNNING_N" != "0" ]]; then
+        printf '  warning:   the %s\n' "$(_update_idle_close_text)"
       fi
       ;;
   esac
@@ -4299,7 +4322,7 @@ EOF
   open_tags_observe
   open_tags_notice
 
-  # #10: one line when a staged app update has waited too long.
+  # #10, #24: one line while an app update is staged.
   update_wait_warning
 
   # M-15: Register cleanup trap before any side-effects.
@@ -4796,13 +4819,16 @@ _update_history() {
   fi
 }
 
-# _update_reopen <lai: true|false> <installed: 1|0>: reopens every tag in
-# UPD_TAGS and sets UPD_REOPENED and UPD_MISSING. With lai true after an
-# install, primary is the helper's to reopen: update waits for it and never
-# opens it. A tag that is already running is not opened again; a tag whose
-# state can't be told is not opened either (named, for launch by hand).
+# _update_reopen <lai: true|false> <installed: 1|0> [<command: update|reopen>]:
+# reopens every tag in UPD_TAGS and sets UPD_REOPENED and UPD_MISSING. With
+# lai true after an install, primary is the helper's to reopen: it waits for
+# it and never opens it. A tag that is already running is not opened again;
+# a tag whose state can't be told is not opened either (named, for launch by
+# hand). <command> names the caller in its messages (default update, whose
+# output is unchanged). Each tag it counts as reopened is seen again in the
+# record of closed tags (#24).
 _update_reopen() {
-  local lai="$1" installed="$2" t rs pre npid helper=""
+  local lai="$1" installed="$2" cmd="${3:-update}" t rs pre npid helper=""
   UPD_REOPENED=0
   UPD_MISSING=""
   if [[ "$lai" == "true" && "$installed" == "1" ]]; then
@@ -4816,7 +4842,7 @@ _update_reopen() {
         _open_tags_back primary
         UPD_REOPENED=$((UPD_REOPENED + 1))
       else
-        printf "  primary: not seen within %s s. The updater was asked to reopen it, so update does not open it a second time; if it does not appear, run: account-switcher launch primary\n" "$NEW_INSTANCE_WAIT_S"
+        printf "  primary: not seen within %s s. The updater was asked to reopen it, so %s does not open it a second time; if it does not appear, run: account-switcher launch primary\n" "$NEW_INSTANCE_WAIT_S" "$cmd"
         UPD_MISSING="${UPD_MISSING} primary"
       fi
       continue
@@ -4851,7 +4877,12 @@ _update_reopen() {
     fi
   done
   if [[ -n "$helper" && " ${UPD_TAGS} " != *" primary "* ]]; then
-    printf '  primary · PID %s was opened by the updater (primary was not open before); it is left running.\n' "$helper"
+    if [[ "$cmd" == "update" ]]; then
+      printf '  primary · PID %s was opened by the updater (primary was not open before); it is left running.\n' "$helper"
+    else
+      printf '  primary · PID %s was opened by the updater; it is left running.\n' "$helper"
+    fi
+    _open_tags_primary_seen
   fi
   return 0
 }
@@ -5120,6 +5151,129 @@ cmd_update() {
   #     exit the EXIT trap does the same.
   _update_lock_release
   update_observe
+  exit "$code"
+}
+
+# ---- reopen (#24) -----------------------------------------------------------
+#
+# reopen brings back every tag recorded as closed by the app's updater (see
+# "Tags Claude closed on its own"), each on its own profile, through update's
+# reopen (_update_reopen). It never opens a tag that is already running, and
+# within a minute of a completed install whose request asked the updater to
+# reopen the app (the flag is read now, and anything but false reads as
+# true), primary is the helper's to reopen: reopen waits for it and never
+# opens a second one. Like update's reopen, it skips the #6 account check:
+# these tags ran on the same profile until the app closed them.
+#
+# It never reopens in bulk a tag closed for an unknown reason, which may
+# have been closed on purpose: each is named with a launch command. Nor one
+# that is neither in [accounts] nor on disk, which would open as a new,
+# empty profile: named with launch --new.
+#
+# Exit codes:
+#   0  every tag the updater closed is running again, or nothing to reopen
+#   2  refused before anything was opened: the app not where detection
+#      looks, update running, an install running, or an argument given
+#   3  a tag did not reopen (named, and still recorded, so reopen offers it
+#      again)
+#   130  interrupted; each tag's record clears as it is counted, so the next
+#      reopen opens only the rest
+# History row: REOPEN tags=<tags> reopened=<n>/<m> missing=<tags>|none.
+
+readonly REOPEN_RECENT_S=60
+
+# _ot_csv <words>: a comma list, or none.
+_ot_csv() {
+  local w out=""
+  for w in $1; do out="${out:+${out},}${w}"; done
+  printf '%s' "${out:-none}"
+}
+
+cmd_reopen() {
+  local arg tok tag seen found cause event t m=0 filtered="" unknown_tags="" code=0
+  local lai="true" recent=0 since="" missing="" missing_csv
+  for arg; do
+    if [[ -n "$arg" ]]; then
+      printf 'Usage: account-switcher reopen\n' >&2
+      _update_refuse "reopen takes no arguments (got: ${arg})."
+    fi
+  done
+  UPD_TAGS=""
+  UPD_REOPENED=0
+  UPD_MISSING=""
+
+  # 1. The app must be where detection looks, before the process table is
+  #    read or anything is written.
+  app_binary_present || _update_refuse "$(app_binary_refusal "opened")"
+  rotate_swap_log_if_needed
+
+  # 2. A running update reopens what it closed.
+  if _update_lock_held; then _update_refuse "$(_update_lock_refusal reopening)"; fi
+
+  # 3. An observation, so a tag closed since the last one is offered too.
+  open_tags_observe
+
+  # 4. Never while the app's bundle may be being replaced.
+  if _updater_log_scan "" && _updater_installing; then
+    _update_refuse "The updater is installing right now; nothing was opened. Run account-switcher reopen again once account-switcher list shows the new version."
+  fi
+
+  # 5. The tags the updater closed, oldest found first; the others are named.
+  if [[ $OT_LOADED -eq 0 ]]; then _open_tags_read; fi
+  for tok in $OT_CLOSED; do
+    IFS='|' read -r tag seen found cause event <<< "$tok"
+    if [[ "$cause" != "updater" ]]; then
+      unknown_tags="${unknown_tags} ${tag}"
+      continue
+    fi
+    m=$((m + 1))
+    if [[ "$tag" == "primary" ]] || tag_is_in_accounts "$tag" || [[ -d "$(udd_for_tag "$tag")" ]]; then
+      UPD_TAGS="${UPD_TAGS:+${UPD_TAGS} }${tag}"
+    else
+      filtered="${filtered} ${tag}"
+    fi
+  done
+
+  if [[ $m -eq 0 ]]; then
+    printf "Nothing to reopen: no tag is recorded as closed by the app's updater.\n"
+  else
+    # 6. Right after an install, primary may be the helper's to reopen.
+    _updater_flag
+    if [[ "$UPD_FLAG" == "false" ]]; then lai="false"; fi
+    if _open_tags_now; then since="$(_ot_local "$((OT_NOW_EP - REOPEN_RECENT_S))")" || since=""; fi
+    if [[ -z "$since" ]]; then
+      recent=1
+    elif _updater_log_scan "$since" && [[ $UPD_LOG_DONE -gt 0 ]]; then
+      recent=1
+    fi
+
+    # 7. The reopen.
+    if [[ -n "$UPD_TAGS" ]]; then _update_reopen "$lai" "$recent" reopen; fi
+    if [[ -n "$filtered" ]]; then
+      printf 'Not reopened (not in [accounts] and no profile folder, so it would open as a new, empty profile):\n'
+      for t in $filtered; do printf '  account-switcher launch %s --new\n' "$t"; done
+    fi
+    missing="${UPD_MISSING}${filtered}"
+    if [[ -n "${missing// /}" ]]; then code=3; fi
+  fi
+
+  # 8. The tags closed for an unknown reason.
+  if [[ -n "$unknown_tags" ]]; then
+    printf 'Not reopened (closed, cause unknown; it may have been closed on purpose):\n'
+    for t in $unknown_tags; do printf '  account-switcher launch %s\n' "$t"; done
+  fi
+
+  # 9. The history row.
+  missing_csv="$(_ot_csv "$missing")"
+  if [[ $m -gt 0 && -d "$STORE" ]]; then
+    _swap_log_ensure
+    printf '[%s] REOPEN tags=%s reopened=%s/%s missing=%s\n' "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "$(_ot_csv "${UPD_TAGS}${filtered}")" "$UPD_REOPENED" "$m" "$missing_csv" >> "$SWAP_LOG" || :
+  fi
+
+  # 10. The closing line.
+  printf 'reopen reopened=%s/%s missing=%s unknown=%s exit=%s\n' \
+    "$UPD_REOPENED" "$m" "$missing_csv" "$(_ot_csv "$unknown_tags")" "$code"
   exit "$code"
 }
 
@@ -6630,9 +6784,10 @@ SUBCOMMANDS (Mac desktop app management):
                          [accounts] and has no profile folder yet (a typo
                          would create a new, empty profile), naming the
                          configured tags and the closest match; --new
-                         allows it. They also refuse while update runs, and
-                         warn (one line) when a staged app update has waited
-                         longer than [update] warn_after_hours (default 24).
+                         allows it. They also refuse while update runs, and,
+                         while an app update is staged, warn (one line) that
+                         the app may close idle windows on its own to
+                         install it.
                          Then waits up to ${NEW_INSTANCE_WAIT_S} s for the new instance, brings
                          its window to the front by PID, and ends with:
                            tag=<tag> pid=<pid> front=yes|no
@@ -6798,17 +6953,37 @@ SUBCOMMANDS (Mac desktop app management):
                          interrupted (it says what it closed and how to
                          reopen each tag).
 
+  reopen                 Reopen every tag recorded as closed by the app's
+                         updater (list names them), each on its own profile.
+                         It never opens a tag that is already running, nor
+                         primary a second time right after an install the
+                         updater reopens it from. Tags closed for an unknown
+                         reason (perhaps on purpose) are named with a launch
+                         command instead, never reopened. Ends with:
+                           reopen reopened=<n>/<m> missing=<tags|none>
+                           unknown=<tags|none> exit=<code>
+                         Exit 0 reopened (or nothing to reopen); 2 refused
+                         (update or an install running, Claude not where
+                         detection looks, or an argument given); 3 a tag
+                         did not reopen (named; reopen offers it again).
+
   list (or instances)    Show running Claude desktop app instances, each with
                          its tag and how the tag was found (via=argv: its
                          --user-data-dir; via=flagless: the only instance
                          without one, primary; via=lsof: the profile folder
                          it holds open), or tag=unknown via=none when it
-                         cannot be determined; then on-disk profile folders
-                         with sizes, each Claude-* folder not in [accounts]
+                         cannot be determined; then the tags the switcher
+                         opened that Claude closed without it, each with its
+                         cause (closed by the app's updater, or closed,
+                         cause unknown) and when it was last seen; then
+                         on-disk profile folders with sizes, each Claude-*
+                         folder not in [accounts]
                          marked unconfigured (never deleted); then the
                          installed app version, the staged one (or none),
                          and how long it has waited (unknown, never none,
-                         when the updater's files can't be read).
+                         when the updater's files can't be read), with a
+                         warning while an update is staged and an instance
+                         is open.
 
   status                 Show CLI identity (~/.claude.json + keychain
                          subscription type) + statusline marker.
@@ -6933,6 +7108,18 @@ main() {
       done
       shift
       cmd_update "$@"
+      return 0
+      ;;
+    reopen)
+      # reopen (#24) has update's exit codes (2 refused, 3 a tag did not
+      # reopen), so it also checks its arguments here and refuses a bad one
+      # with 2 rather than through the shared check's die.
+      local _r
+      for _r; do
+        if ! ( validate_argv_safe "$_r" ); then exit 2; fi
+      done
+      shift
+      cmd_reopen "$@"
       return 0
       ;;
     prefs)
