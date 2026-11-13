@@ -55,7 +55,8 @@ readonly MANAGED
 # pins, undo records), and .prefs-sync.lock the directory a settings sync
 # holds while it writes; update-state.json is the switcher's record of the
 # app update it saw, and .update.lock the directory `update` holds while it
-# runs; .DS_Store is Finder metadata.
+# runs; open-tags.json is the switcher's record of the tags it opened and
+# the ones it found closed (#24); .DS_Store is Finder metadata.
 OPERATOR_STATE=(
   config.toml
   swap-history.log
@@ -64,6 +65,7 @@ OPERATOR_STATE=(
   prefs-sync.json
   .prefs-sync.lock
   update-state.json
+  open-tags.json
   .update.lock
   .DS_Store
 )

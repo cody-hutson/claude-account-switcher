@@ -444,7 +444,7 @@ case_app_missing_refuses() {
   for spec in "1|swap|tag-a|--no-handoff" "1|quit|--all" "1|clone-prefs|primary|tag-a" \
               "2|signin|tag-a|--yes" "2|update|--yes" "2|prefs|sync" "2|prefs|sync|tag-a" \
               "2|prefs|adopt|keep-awake|--from|tag-a" "2|prefs|review" "2|prefs|pin|tag-a|keep-awake" \
-              "2|prefs|unpin|tag-a|keep-awake" "2|prefs|undo|tag-a"; do
+              "2|prefs|unpin|tag-a|keep-awake" "2|prefs|undo|tag-a" "2|reopen"; do
     IFS='|' read -r -a parts <<< "$spec"
     want="${parts[0]}"
     args=("${parts[@]:1}")
@@ -460,7 +460,7 @@ case_app_missing_refuses() {
   unset AS_TEST_STDIN_IS_TTY
   assert_eq "${bad# }" "" "commands that did not refuse as expected" &&
     assert_tree_unchanged "$HOME" "$before"
-  result "the app's main binary is not where detection looks -> swap, quit, clone-prefs (exit 1), signin, update and every writing prefs verb (exit 2) refuse naming the path, before reading the process table, signalling, opening or writing anything (HOME unchanged)" $?
+  result "the app's main binary is not where detection looks -> swap, quit, clone-prefs (exit 1), signin, update, reopen and every writing prefs verb (exit 2) refuse naming the path, before reading the process table, signalling, opening or writing anything (HOME unchanged)" $?
 }
 
 case_app_missing_warns() {

@@ -1190,30 +1190,148 @@ record_state() {  # <first_seen_utc>
 ago_utc() { /bin/date -u -r $(( $(/bin/date +%s) - $1 )) +%Y-%m-%dT%H:%M:%SZ; }
 
 case_wait_warning() {
-  local ok=0 n
+  # #24 (D-6, D-Warn-scope (A)): from the moment an update is staged,
+  # launch and swap print one line saying the app may close idle windows on
+  # its own; [update] warn_after_hours is no longer read. list adds the same
+  # warning while any instance is open.
+  local ok=0 n line idle
+  idle="The app may close idle windows on its own to install it, from about 10 minutes after it finds the update: that ends their Code sessions and Terminal tabs, and tags other than primary don't come back. To install it on your terms: account-switcher update"
+  scenario "$OLD_V" "$NEW_V" false
+  record_state "$(ago_utc 120)"
+  run_up "" launch tag-a
+  line="Claude ${NEW_V} is waiting to install (staged 2m ago). ${idle}"
+  n="$(count_matching "$err" "is waiting to install")"
+  [[ "$rc" == "0" && "$n" == "1" && "$err" == *"$line"* ]] || { ok=1; printf '    launch 2 m: rc=%s n=%s\n' "$rc" "$n"; }
+  run_up "" swap tag-b --no-mirror --no-handoff
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" ]] || { ok=1; printf '    swap 2 m: rc=%s\n' "$rc"; }
+  # Past 24 hours: still exactly one line, and no 24-hour wording.
   scenario "$OLD_V" "$NEW_V" false
   record_state "$(ago_utc 108000)"
   run_up "" launch tag-a
-  n="$(count_matching "$err" "to install (over 24 h)")"
-  [[ "$rc" == "0" && "$n" == "1" && "$err" == *"Claude ${NEW_V} has waited 1d 6h to install (over 24 h); it installs only when every Claude instance is closed. To install it now: account-switcher update"* ]] || { ok=1; printf '    launch 30 h: rc=%s n=%s\n' "$rc" "$n"; }
-  run_up "" swap tag-b --no-mirror --no-handoff
-  [[ "$rc" == "0" && "$(count_matching "$err" "to install (over 24 h)")" == "1" ]] || { ok=1; printf '    swap 30 h: rc=%s\n' "$rc"; }
-  # Under the threshold: no line.
-  scenario "$OLD_V" "$NEW_V" false
-  record_state "$(ago_utc 7200)"
-  run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" != *"to install (over"* ]] || ok=1
-  # A higher threshold in config.toml.
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" && "$err" == *"(staged 1d 6h ago). ${idle}"* && "$err" != *"(over 24 h)"* ]] \
+    || { ok=1; printf '    launch 30 h: rc=%s\n' "$rc"; }
+  # warn_after_hours in config.toml changes nothing: the key is not read.
   scenario "$OLD_V" "$NEW_V" false
   write_config "warn_after_hours = 48"
-  record_state "$(ago_utc 108000)"
+  record_state "$(ago_utc 120)"
   run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" != *"to install (over"* ]] || ok=1
-  record_state "$(ago_utc 180000)"
+  [[ "$rc" == "0" && "$(count_matching "$err" "is waiting to install")" == "1" ]] || { ok=1; printf '    launch at 48: rc=%s\n' "$rc"; }
+  # Nothing staged: no line.
+  scenario "$OLD_V" none false
   run_up "" launch tag-a
-  [[ "$rc" == "0" && "$err" == *"has waited 2d 2h to install (over 48 h)"* ]] || { ok=1; printf '    launch 50 h at 48: rc=%s\n' "$rc"; }
+  [[ "$rc" == "0" && "$err" != *"is waiting to install"* && "$err" != *"may close idle windows"* ]] || { ok=1; printf '    launch, nothing staged: rc=%s\n' "$rc"; }
+  # list: the warning line after waiting:, with one instance open, and none
+  # with no instance open.
+  scenario "$OLD_V" "$NEW_V" false 502:tag-a
+  record_state "$(ago_utc 120)"
+  run_switcher list
+  [[ "$rc" == "0" && "$(count_matching "$out" "  warning:   the app may close idle windows on its own")" == "1" ]] || { ok=1; printf '    list, one open: rc=%s\n' "$rc"; }
+  scenario "$OLD_V" "$NEW_V" false
+  record_state "$(ago_utc 120)"
+  run_switcher list
+  [[ "$rc" == "0" && "$out" != *"  warning:"* ]] || { ok=1; printf '    list, none open: rc=%s\n' "$rc"; }
   assert_eq "$ok" "0" "warning cases"
-  result "launch and swap print one line naming update once the staged update has waited past [update] warn_after_hours (default 24, 48 when set), and none below it" $?
+  result "#24: from the moment an update is staged, launch and swap print one line that the app may close idle windows on its own (also past 24 h; warn_after_hours is not read), list adds it while an instance is open, and nothing staged prints none" $?
+}
+
+# ---- #24: update and the record of the tags Claude closed --------------------------
+
+# open-tags.json, through the real jq.
+rec24() { /usr/bin/jq -r "$1" "${AS_STORE}/open-tags.json" 2> /dev/null; }
+
+case_24_update_cycle() {
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  run_switcher list
+  local adopted
+  adopted="$(rec24 '[.open[].tag] | join(",")')"
+  helper_hook install
+  run_up "" update --yes
+  local up_rc="$rc"
+  run_switcher list
+  assert_eq "$adopted" "tag-a" "adopted before the update" &&
+    assert_eq "$up_rc" "0" "update" &&
+    assert_contains "$(history_text)" "] QUIT_ALL tags=primary,tag-a by=update" &&
+    assert_not_contains "$(history_text)" "] CLOSED " &&
+    assert_eq "$(rec24 '[.open[].tag] | sort | join(",")')" "primary,tag-a" "tracked after the reopen" &&
+    assert_eq "$(rec24 '.closed | length')" "0" "closed entries" &&
+    assert_not_contains "$out" "Tags Claude closed without the switcher"
+  result "#24: an update cycle records no closure (its quit takes the tags out first), writes QUIT_ALL by=update, and the reopened tags are tracked again" $?
+}
+
+case_24_list_during_update() {
+  # INT-4: a list that runs while update holds its lock, after update's quit
+  # (the process table holds only the helper), records nothing closed:
+  # update's quit took its tags out of the record before signalling.
+  scenario "$OLD_V" "$NEW_V" false 501:primary 502:tag-a
+  run_switcher list
+  helper_hook install
+  local inner="$AS_TEST_POLL_HOOK" hook="${AS_TEST_ROOT}/hook24.sh"
+  /bin/cat > "$hook" <<HOOK
+#!/bin/bash
+set -u
+if [[ "\$1" == "1" ]]; then
+  if [[ -d "${AS_STORE}/.update.lock" ]]; then printf 'yes\n' > "${AS_TEST_ROOT}/lock24.txt"; fi
+  /bin/bash "${SWITCHER}" list > "${AS_TEST_ROOT}/list24.txt" 2>&1 < /dev/null
+fi
+exec "${inner}" "\$@"
+HOOK
+  /bin/chmod 755 "$hook" || harness_error "cannot chmod the hook"
+  AS_TEST_POLL_HOOK="$hook"
+  export AS_TEST_POLL_HOOK
+  run_up "" update --yes
+  local mid=""
+  [[ -f "${AS_TEST_ROOT}/list24.txt" ]] && mid="$(< "${AS_TEST_ROOT}/list24.txt")"
+  assert_rc 0 &&
+    assert_eq "$(< "${AS_TEST_ROOT}/lock24.txt")" "yes" "the lock was held during the list" &&
+    assert_contains "$mid" "(no Claude desktop app instances running)" &&
+    assert_not_contains "$mid" "Tags Claude closed without the switcher" &&
+    assert_not_contains "$(history_text)" "] CLOSED "
+  result "#24 INT-4: a list while update holds its lock, after its quit, records nothing closed (the quit took its tags out first)" $?
+}
+
+# app_idle_line <epoch> <file>: one idle-timeout update close in the app's
+# own log (local time, as the app stamps it).
+app_idle_line() {
+  /bin/mkdir -p "$AS_APP_LOG_DIR" || harness_error "cannot create the app log folder"
+  printf '%s [info] [stealth-update] Triggering stealth update after idle timeout\n' \
+    "$(/bin/date -r "$1" '+%Y-%m-%d %H:%M:%S')" >> "${AS_APP_LOG_DIR}/$2"
+}
+
+case_24_helper_primary_seen() {
+  # update with tag-a and tag-b open and primary not; the flag true. update
+  # observes before its quit, so the helper's primary, seen in update's
+  # reopen, is the only time this run sees primary: primary_seen takes the
+  # run's stamp there. Then tag-a is quit by hand, and the updater closes
+  # tag-b and primary; the install; the helper reopens primary. Both tags
+  # read unknown, because primary's own update close is counted. Left
+  # empty, primary_seen would let the two closes cover the two tags, and
+  # the hand-quit tag-a would read closed by the updater.
+  scenario "$OLD_V" "$NEW_V" true 502:tag-a 503:tag-b
+  helper_hook install 2 1
+  run_up "" update --yes
+  local up_rc="$rc" up_out="$out" pseen seen_a seen_b
+  pseen="$(rec24 '.primary_seen_utc // "null"')"
+  seen_a="$(rec24 '.open[] | select(.tag == "tag-a") | .seen_utc')"
+  seen_b="$(rec24 '.open[] | select(.tag == "tag-b") | .seen_utc')"
+  local t
+  t="$(/bin/date +%s)"
+  ps_table "${RELAUNCH_PID}:primary"
+  app_idle_line "$t" main.log
+  app_idle_line "$t" main1.log
+  printf '%s.500 ShipIt[115:216] Beginning installation\n%s.900 ShipIt[115:216] Installation completed successfully\n' \
+    "$(/bin/date -r "$t" '+%Y-%m-%d %H:%M:%S')" "$(/bin/date -r "$t" '+%Y-%m-%d %H:%M:%S')" >> "$(log_path)"
+  run_switcher list
+  local h
+  h="$(history_text)"
+  out="${up_out}"$'\n'"${out}"
+  assert_eq "$up_rc" "0" "update" &&
+    assert_contains "$up_out" "  primary · PID ${RELAUNCH_PID} was opened by the updater (primary was not open before); it is left running." &&
+    assert_eq "$seen_b" "$seen_a" "the reopened tags' stamps" &&
+    assert_eq "$pseen" "$seen_a" "primary_seen after the reopen" &&
+    assert_contains "$h" "] CLOSED tag=tag-a " &&
+    assert_contains "$h" "] CLOSED tag=tag-b " &&
+    assert_not_contains "$h" "cause=updater"
+  result "#24: update's reopen sees the helper's primary, so primary_seen takes the run's stamp; a later hand quit of tag-a with tag-b and primary closed by the updater reads unknown for both, never updater" $?
 }
 
 # ---- The unknown-tag guard ---------------------------------------------------------
@@ -1308,6 +1426,9 @@ case_lock_refuses
 case_stale_lock
 case_install_check
 case_wait_warning
+case_24_update_cycle
+case_24_list_during_update
+case_24_helper_primary_seen
 case_unknown_tag_guard
 case_help
 case_seam_guarded

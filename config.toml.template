@@ -30,10 +30,8 @@ version = 1
 # update only once every instance is closed. `account-switcher list` shows the
 # installed and the staged version and how long the update has waited.
 #
-# warn_after_hours: launch and swap print a one-line warning naming
-#   `account-switcher update` once a staged update has waited longer than
-#   this many hours (1-8760).
-warn_after_hours = 24
+# (warn_after_hours, read before v11.1.0, is no longer used: list, launch and
+# swap warn from the moment an update is staged.)
 #
 # install_timeout_s: how long `account-switcher update` waits for the install
 #   to finish after closing every instance, in seconds (10-3600).

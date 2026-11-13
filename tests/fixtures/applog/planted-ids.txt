@@ -1,0 +1,3 @@
+__T_NOISE__ [info] [auth] account __PLANT_UUID__ signed in as __PLANT_EMAIL__ from __PLANT_PATH__
+__T_EVENT__ [info] [stealth-update] Triggering stealth update after idle timeout account=__PLANT_UUID__ user=__PLANT_EMAIL__ dir=__PLANT_PATH__
+__T_EVENT__ [info] Killing 2 PTY process tree(s) on quit
