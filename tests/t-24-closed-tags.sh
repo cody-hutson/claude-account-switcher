@@ -504,6 +504,34 @@ case_count_cost() {
   result "count, the stated cost: primary quit by hand, tag-a closed by the updater, the install -> tag-a unknown (the safe direction)" $?
 }
 
+case_count_no_helper_log() {
+  local missing_ok=1 control_ok=1
+  # primary runs, seen with tag-a; one update close; the updater's own log
+  # can't be read, so a close and relaunch of primary in the span can't be
+  # ruled out: primary counts, and tag-a reads unknown (Stage 6 D6-7).
+  scenario
+  ps_rows 501:primary
+  seed "$SEEN_EP" - "tag-a:${SEEN_EP}"
+  idle_line "$EVENT_EP"
+  run_switcher list
+  if [[ "$(history_text)" == *"CLOSED tag=tag-a seen=${S_UTC} cause=unknown event=idle-update"* ]]; then missing_ok=0; fi
+  local first="$out"
+  # Control: the log is readable and shows no completed install since S:
+  # primary was running throughout, so tag-a reads updater.
+  scenario
+  ps_rows 501:primary
+  seed "$SEEN_EP" - "tag-a:${SEEN_EP}"
+  idle_line "$EVENT_EP"
+  /bin/mkdir -p "$AS_UPDATER_CACHE" || harness_error "cannot create the updater cache"
+  printf '%s.500 ShipIt[1:2] Detected this as an install request\n' "$(local_of "$EVENT_EP")" > "${AS_UPDATER_CACHE}/ShipIt_stderr.log"
+  run_switcher list
+  if [[ "$(history_text)" == *"CLOSED tag=tag-a seen=${S_UTC} cause=updater event=idle-update"* ]]; then control_ok=0; fi
+  out="${first}"$'\n'"${out}"
+  assert_eq "$missing_ok" "0" "the updater's log unreadable: tag-a unknown" &&
+    assert_eq "$control_ok" "0" "control: readable, no install since S: tag-a updater"
+  result "count: primary running and the updater's log unreadable -> primary counts (it may have closed and come back), tag-a unknown; control: the log readable with no install since -> updater" $?
+}
+
 # ---- One event, one observation (the mark) ---------------------------------------
 
 case_mark() {
@@ -535,6 +563,20 @@ case_mark_moves() {
   assert_rc 0 &&
     assert_eq "$(rec_q '.event_mark_utc')" "$(utc_of "$EVENT_EP")" "the mark after the observation"
   result "the mark moves to the latest update close an observation counted" $?
+}
+
+case_mark_moves_unknown() {
+  # One update close and two tags gone: both read unknown, and the close is
+  # still marked as counted, so the next observation can't count it again
+  # (Stage 6 D6-8: the mark moves whatever cause the observation recorded).
+  scenario ps-no-claude.txt
+  seed - - "tag-a:${SEEN_EP}" "tag-b:${SEEN_EP}"
+  idle_line "$EVENT_EP"
+  run_switcher list
+  assert_rc 0 &&
+    assert_not_contains "$(history_text)" "cause=updater" &&
+    assert_eq "$(rec_q '.event_mark_utc')" "$(utc_of "$EVENT_EP")" "the mark after an observation that recorded only unknown"
+  result "the mark moves past an update close an observation counted even when every closure it recorded reads unknown" $?
 }
 
 # ---- One clock per run ----------------------------------------------------------------
@@ -919,8 +961,10 @@ case_count_alone
 case_count_primary_tracked
 case_count_primary_untracked
 case_count_cost
+case_count_no_helper_log
 case_mark
 case_mark_moves
+case_mark_moves_unknown
 case_one_clock
 case_swap_from_primary
 case_signin_observes
