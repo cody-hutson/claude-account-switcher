@@ -3804,10 +3804,9 @@ EOF
     local running_tag_for_handoff
     running_tag_for_handoff=$(detect_running_tag)
     if [[ -z "$running_tag_for_handoff" ]]; then
-      # No instance running — fallback: assume operator is swapping from a
-      # cold-start; use "primary" as nominal source so handoff still records
-      # the swap event. Operator can override via --note if needed.
-      running_tag_for_handoff="primary"
+      # No instance running: the source is unknown, never assumed to be
+      # primary (#25).
+      running_tag_for_handoff="unknown"
     fi
     capture_handoff "$running_tag_for_handoff" "$target_tag" "$operator_note" 2>&1 | "$AS_BIN_SED" 's/^/    /'
     printf '\n'
