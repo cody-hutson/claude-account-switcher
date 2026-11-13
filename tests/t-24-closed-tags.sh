@@ -789,6 +789,56 @@ case_open_never_took() {
   result "an open that produced no instance: the first closure and its cause stand, no second row" $?
 }
 
+# An open fake that records the call and fails (exit 1), launching nothing
+# (the same fake as t-10-update.sh's).
+failing_open_fake() {
+  /bin/cat > "${AS_FAKES_DIR}/open" <<'FAKE'
+#!/bin/bash
+# as-fake: recording
+line="open"
+for arg; do line="${line}"$'\t'"${arg}"; done
+printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
+exit 1
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/open" || harness_error "cannot chmod the open fake"
+}
+
+case_open_fails() {
+  # INT-7: a failed open writes no record entry, no LAUNCH row and no
+  # marker, and tag-a's recorded closure stands. Control: the same launch
+  # with an open that works writes all three.
+  local fail_rc fail_calls fail_open fail_closed fail_marker fail_hist
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  printf 'tag-b\n' > "${AS_STORE}/.statusline-marker"
+  failing_open_fake
+  run_switcher launch tag-a
+  fail_rc="$rc"
+  fail_calls="$(count_matching "$(calls_of open)" "--user-data-dir=$(pdir tag-a)")"
+  fail_open="$(rec_q '[.open[].tag] | join(",")')"
+  fail_closed="$(rec_q '[.closed[].tag] | join(",")')"
+  fail_marker="$(< "${AS_STORE}/.statusline-marker")"
+  fail_hist="$(history_text)"
+  scenario ps-no-claude.txt
+  seed - -
+  seed_closed tag-a "$SEEN_EP" updater idle-update
+  printf 'tag-b\n' > "${AS_STORE}/.statusline-marker"
+  export AS_FAKE_OPEN_SPAWNS_PID=4501
+  run_switcher launch tag-a
+  assert_eq "$fail_rc" "1" "exit of the launch whose open failed" &&
+    assert_eq "$fail_calls" "1" "open calls for tag-a" &&
+    assert_eq "$fail_open" "" "the record's open tags after the failed open" &&
+    assert_eq "$fail_closed" "tag-a" "the recorded closure after the failed open" &&
+    assert_eq "$fail_marker" "tag-b" "the marker after the failed open" &&
+    assert_not_contains "$fail_hist" "LAUNCH tag=" &&
+    assert_rc 0 &&
+    assert_eq "$(rec_q '[.open[].tag] | join(",")')" "tag-a" "control: the record's open tags" &&
+    assert_eq "$(< "${AS_STORE}/.statusline-marker")" "tag-a" "control: the marker" &&
+    assert_contains "$(history_text)" "LAUNCH tag=tag-a "
+  result "INT-7: a launch whose open fails writes no record entry, no LAUNCH row and no marker, and the recorded closure stands (control: a working open writes all three)" $?
+}
+
 # ---- reopen (#24 AC3) ---------------------------------------------------------------
 
 # updater_flag <true|false>: the helper's state file (JSON) with
@@ -970,6 +1020,7 @@ case_swap_from_primary
 case_signin_observes
 case_launch_clears
 case_open_never_took
+case_open_fails
 case_reopen_helper_primary
 case_reopen_never_appears
 case_reopen_refusals
