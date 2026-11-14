@@ -5429,7 +5429,7 @@ EOF
   # Refuses any whitespace, requires a '@' followed by something with a '.'.
   # The message doesn't repeat the value (#23).
   if [[ "$email" == *' '* ]] || [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-    die "Invalid email format (expected user@host.tld). Nothing was written."
+    die "Invalid email format: it needs one @ followed by a domain with a dot, and no spaces. Nothing was written."
   fi
 
   # Default label = tag with first letter capitalized.
