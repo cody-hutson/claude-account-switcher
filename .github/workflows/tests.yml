@@ -20,7 +20,7 @@ jobs:
     name: T1 simulated suite (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # The job runs pull-request code; leave no job token in the
           # checkout's git config for it to read.
