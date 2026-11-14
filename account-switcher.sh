@@ -359,23 +359,26 @@ toml_get() {
 
 # ---- Tag resolution ------------------------------------------------------
 
-# Resolves a switcher tag for the given oauth email by scanning [accounts]
-# in config.toml for a matching profile_email. Returns the tag, or
-# "(unmatched)" when no entry matches. BSD-awk compatible.
+# Resolves a switcher tag for the given oauth email: the first entry in
+# [accounts] whose profile_email equals it, or "(unmatched)" when none does.
+# The email is compared here, in bash: awk only ever receives a tag
+# (accounts_tags, _account_email), so the email is never on a child
+# process's command line (#23). An empty email, and an entry with no
+# profile_email, never match.
 resolve_tag_from_email() {
-  local email="$1"
-  [[ -f "$CONFIG_FILE" ]] || { printf '(unmatched)\n'; return; }
-  "$AS_BIN_AWK" -v email="$email" '
-    /^\[accounts\]/ { in_a = 1; next }
-    /^\[/           { in_a = 0 }
-    in_a && /profile_email/ {
-      tag = $0; sub(/[[:space:]]*=.*$/, "", tag)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", tag)
-      e = $0; sub(/.*profile_email[[:space:]]*=[[:space:]]*"/, "", e); sub(/".*/, "", e)
-      if (e == email) { print tag; matched = 1; exit }
-    }
-    END { if (!matched) print "(unmatched)" }
-  ' "$CONFIG_FILE"
+  local email="${1:-}" tags t e
+  if [[ -n "$email" && -f "$CONFIG_FILE" ]]; then
+    tags="$(accounts_tags)" || tags=""
+    # Keys are [a-z0-9-] only (accounts_tags' pattern), so splitting is exact.
+    for t in $tags; do
+      e="$(_account_email "$t")"
+      if [[ -n "$e" && "$e" == "$email" ]]; then
+        printf '%s\n' "$t"
+        return 0
+      fi
+    done
+  fi
+  printf '(unmatched)\n'
 }
 
 # Returns 0 if the given tag has an entry in [accounts] of config.toml,
@@ -5416,11 +5419,17 @@ EOF
   # Insert new_entry within [accounts] section. Strategy: rewrite via awk,
   # appending new_entry just before the next section header (or EOF if
   # [accounts] is the last section). If [accounts] section is missing,
-  # add it at the end of the file.
+  # add it at the end of the file. The entry holds the email, so it reaches
+  # awk on stdin (builtin printf, read by getline), never on awk's command
+  # line (#23); getline also keeps a backslash in the label literal, where
+  # -v would have expanded it. A failed read writes nothing.
   local tmp
   tmp="$("$AS_BIN_MKTEMP")"
-  "$AS_BIN_AWK" -v new_entry="$new_entry" '
-    BEGIN { in_a = 0; inserted = 0; has_accounts = 0 }
+  if ! printf '%s\n' "$new_entry" | "$AS_BIN_AWK" '
+    BEGIN {
+      if ((getline new_entry < "-") != 1) { bad = 1; exit 3 }
+      in_a = 0; inserted = 0; has_accounts = 0
+    }
     /^\[accounts\]/ { in_a = 1; has_accounts = 1; print; next }
     /^\[/ && in_a {
       # Leaving [accounts] section; insert new_entry before this header.
@@ -5431,12 +5440,16 @@ EOF
     }
     { print }
     END {
+      if (bad) exit 3
       # If file ends inside [accounts] without exiting, append new_entry.
       if (in_a && !inserted) { print new_entry; inserted = 1 }
       # If [accounts] section never seen, add it at end.
       if (!has_accounts) { print ""; print "[accounts]"; print new_entry }
     }
-  ' "$CONFIG_FILE" > "$tmp"
+  ' "$CONFIG_FILE" > "$tmp"; then
+    "$AS_BIN_RM" -f "$tmp"
+    die "Could not write the new entry; $(_tilde_path "$CONFIG_FILE") is unchanged."
+  fi
 
   "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
   "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
@@ -5544,8 +5557,8 @@ cmd_identity() {
 # already pinned to another tag, which is the mix-up #6 exists to catch,
 # unless --force. Confirms with the label and the id's last 4 hex digits
 # (--yes skips; a declined or unanswered prompt writes nothing and exits 1).
-# Writes through a temp file, mv and chmod 600, passing the id to awk in the
-# environment rather than on its command line, and appends
+# Writes through a temp file, mv and chmod 600, passing the id to awk on
+# stdin rather than on its command line or in its environment, and appends
 # IDENTITY_PIN tag=<tag> (no id) to the history log.
 cmd_identity_pin() {
   local tag="" yes="false" force="false" arg key udd st label cur="" other="" old="" ans="" tmp
@@ -5597,9 +5610,15 @@ cmd_identity_pin() {
   fi
 
   tmp="$("$AS_BIN_MKTEMP")"
-  if ! AS_PIN_KEY="$key" AS_PIN_LINE="${key} = \"${cur}\"" "$AS_BIN_AWK" '
+  # The pin line holds the id, so it reaches awk on stdin (builtin printf,
+  # read by getline), never in awk's arguments or environment (#23); the
+  # key is a tag and stays in the environment.
+  if ! printf '%s\n' "${key} = \"${cur}\"" | AS_PIN_KEY="$key" "$AS_BIN_AWK" '
     function blanks() { while (nb > 0) { print ""; nb-- } }
-    BEGIN { k = ENVIRON["AS_PIN_KEY"]; line = ENVIRON["AS_PIN_LINE"]; in_t = 0; done = 0; seen = 0; nb = 0 }
+    BEGIN {
+      if ((getline line < "-") != 1) { bad = 1; exit 3 }
+      k = ENVIRON["AS_PIN_KEY"]; in_t = 0; done = 0; seen = 0; nb = 0
+    }
     /^\[/ {
       if (in_t && !done) { print line; done = 1 }
       blanks()
@@ -5616,6 +5635,7 @@ cmd_identity_pin() {
     in_t && /^[[:space:]]*$/ { nb++; next }
     { blanks(); print }
     END {
+      if (bad) exit 3
       if (in_t && !done) { print line; done = 1 }
       blanks()
       if (!seen) { print ""; print "[identity]"; print line }
