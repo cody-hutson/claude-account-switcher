@@ -123,7 +123,7 @@ leftover, that file came from an older install and is no longer used.
 ## Quick start
 
 ```bash
-# Show CLI identity (~/.claude.json + keychain subscription)
+# Show the CLI account by its label (or unknown) + keychain subscription
 account-switcher status
 
 # Register a tag → email mapping in [accounts] of the runtime config.toml,
@@ -379,6 +379,16 @@ is not a terminal (a pipe, a file, the slash command's transcript) it
 refuses with exit `2` and prints nothing. History rows read
 `IDENTITY tag=<tag> status=<word>` and `IDENTITY_PIN tag=<tag>`, never an id
 or a label.
+
+**The same rule elsewhere.** `status` names the CLI account by its
+`[accounts]` label, or `unknown`; `status --show-ids` adds its email and
+account id, under the same terminal-only rule. `add-account` prints the tag
+and the label, and its row reads `ADD_ACCOUNT tag=<tag> label="<label>"`.
+`LAUNCH` and `APP_SWAP` rows name the profile by its folder (`udd=Claude`,
+`udd=Claude-<tag>`), not its path. Rows already in the log keep their old
+fields. No email or account id is passed to another process on its command
+line: `awk` receives a tag, or reads the value on stdin. `SWAP_HANDOFF.md` is
+mode `600` from the moment it is written.
 
 **Limits.** The value is the app's *last known* account: it persists after
 you sign out, so a signed-out profile still reads as its last account.
@@ -771,7 +781,7 @@ non-ASCII characters are rejected (prevents shell injection in the
 | `prefs undo <tag> [--whole-file]` | Reverse the last sync to `<tag>`, key by key: a key it changed goes back, a key it added is removed. Exit `0`, `1` nothing to restore, `2` refused. |
 | `quit [--all]` | Quit every running Claude instance. A bare `quit` does the same as `quit --all`. To close one window, press Cmd+Q in it: `quit <tag>` is refused. Graceful → SIGTERM → SIGKILL escalation. |
 | `list` (or `instances`) | Show running instances + configured profile dirs. Each instance row gives its tag and how the tag was found: `via=argv` (its `--user-data-dir`), `via=flagless` (the only instance started without one, which is primary) or `via=lsof` (the one profile folder it holds open). When none of these settles it, the row reads `tag=unknown via=none` rather than guessing `primary`. Profile folders whose tag is not in `[accounts]` are marked `unconfigured` (never deleted). The tags the switcher opened that Claude closed without it follow the instances, each with its cause and when it was last seen. The last block shows the installed app version, the staged one (or `none`, or `unknown`) and how long it has waited, with a warning while an update is staged and an instance is open. |
-| `status` | Show CLI identity (`~/.claude.json` + keychain subscription). |
+| `status [--show-ids]` | Show the CLI account (`~/.claude.json`) by its `[accounts]` label, or `unknown`, plus the keychain subscription. `--show-ids` adds the email and account id, at a terminal only (otherwise exit `2`, nothing printed). |
 | `config show` | Display the active config.toml. |
 | `config get <key>` | Read a single config.toml key (supports flat keys and one-level `table.key` form). |
 | `add-account <tag> <email> [label]` | Register a tag → email mapping in `[accounts]` of the runtime config.toml. Run it before `signin <tag>`, which prints the label and email from it. |

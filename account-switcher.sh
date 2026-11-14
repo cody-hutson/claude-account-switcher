@@ -117,8 +117,8 @@ _as_test_mode_interlock() {
     [[ -f "${AS_TEST_POLL_HOOK:-}" && -x "${AS_TEST_POLL_HOOK:-}" ]] || _as_test_refuse "AS_TEST_POLL_HOOK is not an executable file (got '${AS_TEST_POLL_HOOK:-}')"
   fi
 
-  # 9. The stdout-is-a-terminal override `identity --show-ids` reads (#6),
-  #    when set, is 0 or 1.
+  # 9. The stdout-is-a-terminal override `identity --show-ids` (#6) and
+  #    `status --show-ids` (#23) read, when set, is 0 or 1.
   case "${AS_TEST_STDOUT_IS_TTY:-}" in
     ""|0|1) ;;
     *) _as_test_refuse "AS_TEST_STDOUT_IS_TTY is not 0 or 1 (got '${AS_TEST_STDOUT_IS_TTY:-}')" ;;
@@ -137,7 +137,7 @@ AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_D
 # Test-only names, honoured only in test mode like every seam name:
 # AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal (signin #7, update
 # #10, prefs #11); AS_TEST_STDOUT_IS_TTY=1 makes stdout count as one
-# (identity --show-ids, #6); AS_TEST_POLL_HOOK names a scratch script
+# (identity --show-ids, #6; status --show-ids, #23); AS_TEST_POLL_HOOK names a scratch script
 # signin and update run once per poll, so a case can change the scenario
 # between polls; and AS_TEST_PREFS_EXTRA_OP is one more [path, value] op the
 # settings write applies, so a case can reach its "differs outside the
@@ -654,8 +654,10 @@ udd_for_tag() {
 # launch, swap and the read-only `identity` command compare the two.
 # Output names labels, plus at most the last 4 hex digits of an id, never a
 # whole id (`identity --show-ids` prints whole ids, and only when stdout is
-# a terminal). History rows carry a tag and a status word, never an id or a
-# label.
+# a terminal). The identity rows (IDENTITY, IDENTITY_PIN, SIGNIN*) carry a
+# tag and a status word, never an id or a label. Every history row is free
+# of emails, ids and absolute paths (#23); ADD_ACCOUNT adds the quoted
+# label the operator chose.
 
 readonly AS_UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
@@ -5788,7 +5790,8 @@ _signin_tty() {
   [[ -t 0 ]]
 }
 
-# Returns 0 when stdout counts as a terminal (S-02, identity --show-ids).
+# Returns 0 when stdout counts as a terminal (S-02: identity --show-ids and
+# status --show-ids).
 # AS_TEST_STDOUT_IS_TTY is empty outside test mode (the seam block unsets
 # it), so production reads -t 1.
 _stdout_tty() {
@@ -7053,8 +7056,11 @@ SUBCOMMANDS (Mac desktop app management):
                          warning while an update is staged and an instance
                          is open.
 
-  status                 Show CLI identity (~/.claude.json + keychain
-                         subscription type) + statusline marker.
+  status [--show-ids]    Show the CLI account (~/.claude.json) by its
+                         [accounts] label, or unknown, plus the keychain
+                         subscription type and the statusline marker.
+                         --show-ids adds its email and account id, only
+                         when stdout is a terminal (otherwise exit 2).
 
   config show | get <k>  Display or read a specific config.toml key.
 
@@ -7064,6 +7070,8 @@ SUBCOMMANDS (Mac desktop app management):
                          login of the new tag's Mac app instance so
                          'status' can resolve CLI identity → switcher tag.
                          This is the explicit [accounts] registration path.
+                         Its output and history row name the tag and the
+                         label, never the email.
 
   version (or --version) Print this script's version. To check whether the
                          install matches the repository, run
