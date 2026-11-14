@@ -353,9 +353,9 @@ case_history_rows() {
   done <<< "$(history_text)"
   assert_rc 0 &&
     assert_eq "$kinds" "IDENTITY LAUNCH " "history rows" &&
-    assert_contains "$(history_text)" "LAUNCH tag=tag-b udd=$(profile_dir tag-b) first_launch=false" &&
+    assert_contains "$(history_text)" "LAUNCH tag=tag-b udd=Claude-tag-b first_launch=false" &&
     assert_eq "$bad" "0" "no PID or label in the log"
-  result "history: launch still writes its IDENTITY and LAUNCH rows only, LAUNCH unchanged; no PID or label logged" $?
+  result "history: launch still writes its IDENTITY and LAUNCH rows only, LAUNCH naming the profile folder (#23); no PID or label logged" $?
 }
 
 # ---- The primitives, called directly -------------------------------------------

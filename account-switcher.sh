@@ -2691,9 +2691,10 @@ open_tag_instance() {
 
   printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
 
+  # udd= names the profile folder, never its absolute path (#23).
   _swap_log_ensure
   printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "${udd##*/}" "$first_launch" \
     >> "$SWAP_LOG"
 
   # #24: the tag is tracked from its open.
@@ -4439,9 +4440,10 @@ EOF
   ok "Swapped to '${target_tag}'. Bridged Code billing will follow ${target_tag}'s account auth."
 
   printf '%s\n' "$target_tag" > "$STATUSLINE_MARKER"
+  # udd= names the profile folder, never its absolute path (#23).
   _swap_log_ensure
   printf '[%s] APP_SWAP target=%s udd=%s first_launch=%s mirror=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "${target_udd##*/}" "$first_launch" \
     "$([ "$skip_mirror" == "false" ] && echo "yes" || echo "no")" \
     >> "$SWAP_LOG"
   _open_tags_add "$target_tag"
