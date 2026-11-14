@@ -85,11 +85,15 @@ calls_text() {
 # ---- Scan --------------------------------------------------------------------
 
 # hits <text> <home|nohome>: one word per shape found in the text: email,
-# uuid, home (the case's HOME or profile root; only with "home").
+# uuid, home (the case's HOME or profile root; only with "home"). The email
+# and uuid tests read the text with the scratch base (the folder holding the
+# case root) taken out, so a base whose own path holds a uuid can't raise a
+# false hit.
 hits() {
-  local t="$1" h=""
-  [[ "$t" =~ $EMAIL_ERE ]] && h="${h}email "
-  [[ "$t" =~ $UUID_ERE ]] && h="${h}uuid "
+  local t="$1" s h="" base="${AS_TEST_ROOT%/*}"
+  s="${t//"$base"/<base>}"
+  [[ "$s" =~ $EMAIL_ERE ]] && h="${h}email "
+  [[ "$s" =~ $UUID_ERE ]] && h="${h}uuid "
   if [[ "$2" == "home" ]]; then
     case "$t" in
       *"$HOME"*|*"$AS_PROFILE_ROOT"*) h="${h}home " ;;
@@ -132,10 +136,28 @@ case_status_label() {
   assert_rc 0 &&
     assert_contains "$out" "  account:      Alpha" &&
     assert_contains "$out" "  switcher tag: tag-a" &&
+    assert_called awk "tag=tag-a" &&
     assert_not_contains "$out" "email:" &&
     assert_not_contains "$out" "account id:" &&
     assert_all_clean "$out$err"
   result "status: the CLI account's label (Alpha), no email or id; output, rows and calls.log clean (control arm finds each shape)" $?
+}
+
+# An [accounts] entry keyed `default` (add-account accepts that tag) still
+# resolves: status reads each key literally.
+case_status_default_key() {
+  scenario
+  {
+    printf 'version = 1\n\n[accounts]\n'
+    printf 'default = { label = "Home", profile_email = "%s" }\n' "$MAIL_A"
+    printf '\n[swap_handoff]\ngit_root = "%s"\n' "$TEST_GIT_ROOT"
+  } > "${AS_STORE}/config.toml"
+  run_switcher status
+  assert_rc 0 &&
+    assert_contains "$out" "  account:      Home" &&
+    assert_contains "$out" "  switcher tag: default" &&
+    assert_all_clean "$out$err"
+  result "status: an entry keyed default resolves to its own label (Home), as the lookup did before #23" $?
 }
 
 case_status_unknown() {
@@ -291,6 +313,29 @@ case_row_shapes() {
 
 # ---- The swap handoff (AC5) --------------------------------------------------
 
+# A case-local chmod: records, for each call on SWAP_HANDOFF.md, the mode
+# requested and the file's mode just before (none when it doesn't exist),
+# then runs the harness's own guarded chmod fake.
+mode_recording_chmod() {
+  /bin/mv "${AS_FAKES_DIR}/chmod" "${AS_FAKES_DIR}/chmod.real" || harness_error "cannot move the chmod fake"
+  /bin/cat > "${AS_FAKES_DIR}/chmod" <<'FAKE'
+#!/bin/bash
+# as-fake: guarded-passthrough
+last="${!#}"
+case "$last" in
+  */SWAP_HANDOFF.md)
+    m="$(/usr/bin/stat -f '%Lp' "$last" 2> /dev/null)" || m=""
+    printf '%s %s\n' "$1" "${m:-none}" >> "${AS_TEST_ROOT}/modes.log" ;;
+esac
+exec "${AS_FAKES_DIR}/chmod.real" "$@"
+FAKE
+  /bin/chmod 755 "${AS_FAKES_DIR}/chmod" || harness_error "cannot chmod the chmod fake"
+}
+
+modes_text() {
+  if [[ -f "${AS_TEST_ROOT}/modes.log" ]]; then printf '%s' "$(< "${AS_TEST_ROOT}/modes.log")"; fi
+}
+
 swap_with_handoff() {
   set_ps_fixture ps-one-tag.txt ps-no-claude.txt
   AS_FAKE_QUIT=graceful
@@ -299,21 +344,30 @@ swap_with_handoff() {
   run_switcher swap tag-b --no-mirror
 }
 
+# A permissive umask (022) for the run, so a file the switcher left to it
+# would read 644: the closing chmod must find the new file at 600 already.
 case_handoff_new_file() {
   local f mode
   scenario
+  mode_recording_chmod
   f="${AS_STORE}/SWAP_HANDOFF.md"
+  umask 022
   swap_with_handoff
   mode="$(/usr/bin/stat -f '%Lp' "$f" 2> /dev/null)"
   assert_rc 0 &&
     assert_eq "$mode" "600" "a new handoff's mode" &&
+    assert_eq "$(modes_text)" "600 600" "the mode before the closing chmod (created at 600)" &&
     assert_contains "$(history_text)" "HANDOFF_CAPTURE source=tag-a target=tag-b"
   result "handoff: a new SWAP_HANDOFF.md is created with mode 600" $?
 }
 
+# The existing file must be made 600 before the write: the first chmod finds
+# it at 644, and the closing one finds it at 600 already.
 case_handoff_existing_644() {
   local f mode body
   scenario
+  mode_recording_chmod
+  umask 022
   f="${AS_STORE}/SWAP_HANDOFF.md"
   printf 'OLD-HANDOFF-MARKER\n' > "$f"
   /bin/chmod 644 "$f"
@@ -324,7 +378,7 @@ case_handoff_existing_644() {
     assert_eq "$mode" "600" "the rewritten handoff's mode" &&
     assert_not_contains "$body" "OLD-HANDOFF-MARKER" &&
     assert_contains "$body" '- **Direction:** `tag-a` → `tag-b`' &&
-    assert_called chmod
+    assert_eq "$(modes_text)" "600 644"$'\n'"600 600" "the mode before each chmod (644, then already 600)"
   result "handoff: an existing 644 file is made 600 and rewritten" $?
 }
 
@@ -360,7 +414,9 @@ case_handoff_readonly_folder() {
 # A case-local awk fake: records its arguments (as the passthrough does) and
 # the name of every environment variable whose value holds a uuid, then runs
 # the real awk. Names, not values: the inherited environment may hold an
-# unrelated uuid, so the case compares against a baseline run.
+# unrelated uuid, so the case compares against a baseline run; and the
+# scratch base is taken out of each value first (the harness's
+# GIT_CEILING_DIRECTORIES names it).
 env_recording_awk() {
   /bin/cat > "${AS_FAKES_DIR}/awk" <<'FAKE'
 #!/bin/bash
@@ -369,8 +425,10 @@ line="awk"
 for arg; do arg="${arg//$'\t'/\\t}"; line="${line}"$'\t'"${arg//$'\n'/\\n}"; done
 printf '%s\n' "$line" >> "${AS_TEST_ROOT}/calls.log"
 re='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+base="${AS_TEST_ROOT%/*}"
 while IFS= read -r v; do
-  [[ "${v#*=}" =~ $re ]] && printf '%s\n' "${v%%=*}" >> "${AS_TEST_ROOT}/env.log"
+  val="${v#*=}"; val="${val//"$base"/}"
+  [[ "$val" =~ $re ]] && printf '%s\n' "${v%%=*}" >> "${AS_TEST_ROOT}/env.log"
 done < <(/usr/bin/env)
 exec /usr/bin/awk "$@"
 FAKE
@@ -406,6 +464,7 @@ case_identity_pin_channel() {
 }
 
 case_status_label
+case_status_default_key
 case_status_unknown
 case_status_show_ids_not_terminal
 case_status_show_ids_terminal

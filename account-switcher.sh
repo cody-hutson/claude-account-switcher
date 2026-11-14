@@ -361,9 +361,10 @@ toml_get() {
 
 # Resolves a switcher tag for the given oauth email: the first entry in
 # [accounts] whose profile_email equals it, or "(unmatched)" when none does.
-# The email is compared here, in bash: awk only ever receives a tag
-# (accounts_tags, _account_email), so the email is never on a child
-# process's command line (#23). An empty email, and an entry with no
+# The email is compared here, in bash: awk only ever receives a key
+# (accounts_tags, _account_email_key), so the email is never on a child
+# process's command line (#23). Each key is read literally, so an entry keyed
+# `default` still resolves. An empty email, and an entry with no
 # profile_email, never match.
 resolve_tag_from_email() {
   local email="${1:-}" tags t e
@@ -371,7 +372,7 @@ resolve_tag_from_email() {
     tags="$(accounts_tags)" || tags=""
     # Keys are [a-z0-9-] only (accounts_tags' pattern), so splitting is exact.
     for t in $tags; do
-      e="$(_account_email "$t")"
+      e="$(_account_email_key "$t")"
       if [[ -n "$e" && "$e" == "$email" ]]; then
         printf '%s\n' "$t"
         return 0
@@ -772,8 +773,14 @@ accounts_tags() {
 # account_label <tag>: prints the label of the tag's [accounts] entry, or the
 # tag itself when there is none.
 account_label() {
-  local key l=""
-  key="$(identity_key "${1:-}")"
+  _account_label_key "$(identity_key "${1:-}")"
+}
+
+# _account_label_key <key>: the same, for an [accounts] key taken literally,
+# with no default-to-primary mapping (status resolves the key its CLI email
+# matched, which can be a `default` entry add-account wrote).
+_account_label_key() {
+  local key="${1:-}" l=""
   if [[ -f "$CONFIG_FILE" ]]; then
     l="$("$AS_BIN_AWK" -v tag="$key" '
       /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
@@ -5326,7 +5333,7 @@ cmd_status() {
   if [[ "$resolved_tag" == "(unmatched)" ]]; then
     account_txt="unknown"
   else
-    account_txt="$(account_label "$resolved_tag")"
+    account_txt="$(_account_label_key "$resolved_tag")"
   fi
 
   printf 'CLI identity (from ~/.claude.json):\n'
@@ -5826,8 +5833,14 @@ _signin_drain() {
 # _account_email <tag>: the profile_email of the tag's [accounts] entry, or
 # nothing. It is printed on stdout only, never written to a log row.
 _account_email() {
-  local key e=""
-  key="$(identity_key "${1:-}")"
+  _account_email_key "$(identity_key "${1:-}")"
+}
+
+# _account_email_key <key>: the same, for an [accounts] key taken literally
+# (resolve_tag_from_email reads each key accounts_tags lists, `default`
+# included, as the lookup did before #23).
+_account_email_key() {
+  local key="${1:-}" e=""
   if [[ -f "$CONFIG_FILE" ]]; then
     e="$("$AS_BIN_AWK" -v tag="$key" '
       /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
