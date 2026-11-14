@@ -117,8 +117,8 @@ _as_test_mode_interlock() {
     [[ -f "${AS_TEST_POLL_HOOK:-}" && -x "${AS_TEST_POLL_HOOK:-}" ]] || _as_test_refuse "AS_TEST_POLL_HOOK is not an executable file (got '${AS_TEST_POLL_HOOK:-}')"
   fi
 
-  # 9. The stdout-is-a-terminal override `identity --show-ids` reads (#6),
-  #    when set, is 0 or 1.
+  # 9. The stdout-is-a-terminal override `identity --show-ids` (#6) and
+  #    `status --show-ids` (#23) read, when set, is 0 or 1.
   case "${AS_TEST_STDOUT_IS_TTY:-}" in
     ""|0|1) ;;
     *) _as_test_refuse "AS_TEST_STDOUT_IS_TTY is not 0 or 1 (got '${AS_TEST_STDOUT_IS_TTY:-}')" ;;
@@ -137,7 +137,7 @@ AS_SEAM_ROOTS="STORE CLAUDE_JSON PROFILE_ROOT APP_BUNDLE UPDATER_CACHE APP_LOG_D
 # Test-only names, honoured only in test mode like every seam name:
 # AS_TEST_STDIN_IS_TTY=1 makes stdin count as a terminal (signin #7, update
 # #10, prefs #11); AS_TEST_STDOUT_IS_TTY=1 makes stdout count as one
-# (identity --show-ids, #6); AS_TEST_POLL_HOOK names a scratch script
+# (identity --show-ids, #6; status --show-ids, #23); AS_TEST_POLL_HOOK names a scratch script
 # signin and update run once per poll, so a case can change the scenario
 # between polls; and AS_TEST_PREFS_EXTRA_OP is one more [path, value] op the
 # settings write applies, so a case can reach its "differs outside the
@@ -221,7 +221,7 @@ readonly AS_TEST_STDIN_IS_TTY AS_TEST_STDOUT_IS_TTY AS_TEST_POLL_HOOK AS_TEST_PR
 # Bump on every change to this script. `install.sh --check` reads this line
 # from both the repo copy and the installed copy (without running either), so
 # keep it a single `readonly VERSION="..."` assignment.
-readonly VERSION="11.1.0"
+readonly VERSION="11.2.0"
 
 readonly STORE="${AS_STORE}"
 readonly CLAUDE_JSON="${AS_CLAUDE_JSON}"
@@ -359,23 +359,27 @@ toml_get() {
 
 # ---- Tag resolution ------------------------------------------------------
 
-# Resolves a switcher tag for the given oauth email by scanning [accounts]
-# in config.toml for a matching profile_email. Returns the tag, or
-# "(unmatched)" when no entry matches. BSD-awk compatible.
+# Resolves a switcher tag for the given oauth email: the first entry in
+# [accounts] whose profile_email equals it, or "(unmatched)" when none does.
+# The email is compared here, in bash: awk only ever receives a key
+# (accounts_tags, _account_email_key), so the email is never on a child
+# process's command line (#23). Each key is read literally, so an entry keyed
+# `default` still resolves. An empty email, and an entry with no
+# profile_email, never match.
 resolve_tag_from_email() {
-  local email="$1"
-  [[ -f "$CONFIG_FILE" ]] || { printf '(unmatched)\n'; return; }
-  "$AS_BIN_AWK" -v email="$email" '
-    /^\[accounts\]/ { in_a = 1; next }
-    /^\[/           { in_a = 0 }
-    in_a && /profile_email/ {
-      tag = $0; sub(/[[:space:]]*=.*$/, "", tag)
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", tag)
-      e = $0; sub(/.*profile_email[[:space:]]*=[[:space:]]*"/, "", e); sub(/".*/, "", e)
-      if (e == email) { print tag; matched = 1; exit }
-    }
-    END { if (!matched) print "(unmatched)" }
-  ' "$CONFIG_FILE"
+  local email="${1:-}" tags t e
+  if [[ -n "$email" && -f "$CONFIG_FILE" ]]; then
+    tags="$(accounts_tags)" || tags=""
+    # Keys are [a-z0-9-] only (accounts_tags' pattern), so splitting is exact.
+    for t in $tags; do
+      e="$(_account_email_key "$t")"
+      if [[ -n "$e" && "$e" == "$email" ]]; then
+        printf '%s\n' "$t"
+        return 0
+      fi
+    done
+  fi
+  printf '(unmatched)\n'
 }
 
 # Returns 0 if the given tag has an entry in [accounts] of config.toml,
@@ -651,8 +655,10 @@ udd_for_tag() {
 # launch, swap and the read-only `identity` command compare the two.
 # Output names labels, plus at most the last 4 hex digits of an id, never a
 # whole id (`identity --show-ids` prints whole ids, and only when stdout is
-# a terminal). History rows carry a tag and a status word, never an id or a
-# label.
+# a terminal). The identity rows (IDENTITY, IDENTITY_PIN, SIGNIN*) carry a
+# tag and a status word, never an id or a label. Every history row is free
+# of emails, ids and absolute paths (#23); ADD_ACCOUNT adds the quoted
+# label the operator chose.
 
 readonly AS_UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 
@@ -767,8 +773,14 @@ accounts_tags() {
 # account_label <tag>: prints the label of the tag's [accounts] entry, or the
 # tag itself when there is none.
 account_label() {
-  local key l=""
-  key="$(identity_key "${1:-}")"
+  _account_label_key "$(identity_key "${1:-}")"
+}
+
+# _account_label_key <key>: the same, for an [accounts] key taken literally,
+# with no default-to-primary mapping (status resolves the key its CLI email
+# matched, which can be a `default` entry add-account wrote).
+_account_label_key() {
+  local key="${1:-}" l=""
   if [[ -f "$CONFIG_FILE" ]]; then
     l="$("$AS_BIN_AWK" -v tag="$key" '
       /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
@@ -1171,7 +1183,15 @@ else:
     note_line="- **Operator note:** ${note_truncated}"
   fi
 
-  "$AS_BIN_CAT" > "$handoff_file" <<HANDOFF_EOF
+  # #23: the handoff is readable only by the operator from the moment it is
+  # written. An existing file is made 600 before it is rewritten, and a new
+  # one is created under umask 077 (in a subshell, so the umask changes
+  # nothing else), so its content is never written at 644. A failed write
+  # still stops the swap before anything is quit, as before.
+  if [[ -e "$handoff_file" ]]; then
+    "$AS_BIN_CHMOD" 600 "$handoff_file"
+  fi
+  ( umask 077 && "$AS_BIN_CAT" > "$handoff_file" ) <<HANDOFF_EOF
 # Swap Handoff State
 
 > Auto-generated by account-switcher at the swap boundary. Captures
@@ -1221,7 +1241,7 @@ ${files_block}
 *handoff snapshot, copy this file to a timestamped backup before swapping.*
 HANDOFF_EOF
 
-  "$AS_BIN_CHMOD" 644 "$handoff_file"
+  "$AS_BIN_CHMOD" 600 "$handoff_file"
 
   ok "Handoff captured: ${handoff_file}"
 
@@ -2688,9 +2708,10 @@ open_tag_instance() {
 
   printf '%s\n' "$tag" > "$STATUSLINE_MARKER"
 
+  # udd= names the profile folder, never its absolute path (#23).
   _swap_log_ensure
   printf '[%s] LAUNCH tag=%s udd=%s first_launch=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "${udd##*/}" "$first_launch" \
     >> "$SWAP_LOG"
 
   # #24: the tag is tracked from its open.
@@ -4436,9 +4457,10 @@ EOF
   ok "Swapped to '${target_tag}'. Bridged Code billing will follow ${target_tag}'s account auth."
 
   printf '%s\n' "$target_tag" > "$STATUSLINE_MARKER"
+  # udd= names the profile folder, never its absolute path (#23).
   _swap_log_ensure
   printf '[%s] APP_SWAP target=%s udd=%s first_launch=%s mirror=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "$target_udd" "$first_launch" \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$target_tag" "${target_udd##*/}" "$first_launch" \
     "$([ "$skip_mirror" == "false" ] && echo "yes" || echo "no")" \
     >> "$SWAP_LOG"
   _open_tags_add "$target_tag"
@@ -5280,18 +5302,47 @@ cmd_reopen() {
 
 # ---- status --------------------------------------------------------------
 
+# status [--show-ids]
+# The CLI account (what bridged Code reads from when displaying the account
+# name) is named by the label of the [accounts] tag its email resolves to,
+# or `unknown` (#23). --show-ids adds the email and the whole account id, on
+# stdout only, and only when stdout is a terminal; otherwise it refuses
+# (exit 2) and prints nothing, as `identity --show-ids` does. Any other
+# argument is refused (exit 2) without being echoed.
 cmd_status() {
+  local show_ids="false" arg
+  for arg; do
+    case "$arg" in
+      "") ;;
+      --show-ids) show_ids="true" ;;
+      *) _die2 "Unknown argument for status. Usage: account-switcher status [--show-ids]" ;;
+    esac
+  done
+  # S-02: whole ids go to a terminal only. Checked first, so this refusal
+  # can't be mistaken for another.
+  if [[ "$show_ids" == "true" ]] && ! _stdout_tty; then
+    _die2 "status --show-ids prints the CLI account's email and whole account id, so it runs only with its output on a terminal (not a pipe, a file or a transcript). Nothing was printed; without --show-ids, status shows the account's label."
+  fi
+
   app_binary_warn
   printf '\n=== Claude Code Account Switcher (v%s) ===\n\n' "$VERSION"
 
-  # CLI identity (what bridged Code reads from when displaying the account name).
-  local active_email active_uuid
-  active_email=$("$AS_BIN_JQ" -r '.oauthAccount.emailAddress // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
-  active_uuid=$("$AS_BIN_JQ" -r '.oauthAccount.accountUuid // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
+  local active_email active_uuid resolved_tag account_txt
+  active_email=$("$AS_BIN_JQ" -r '.oauthAccount.emailAddress // empty' "${CLAUDE_JSON}" 2>/dev/null) || active_email=""
+  resolved_tag=$(resolve_tag_from_email "$active_email")
+  if [[ "$resolved_tag" == "(unmatched)" ]]; then
+    account_txt="unknown"
+  else
+    account_txt="$(_account_label_key "$resolved_tag")"
+  fi
 
   printf 'CLI identity (from ~/.claude.json):\n'
-  printf '  email:        %s\n' "$active_email"
-  printf '  accountUuid:  %s\n' "$active_uuid"
+  printf '  account:      %s\n' "$account_txt"
+  if [[ "$show_ids" == "true" ]]; then
+    active_uuid=$("$AS_BIN_JQ" -r '.oauthAccount.accountUuid // empty' "${CLAUDE_JSON}" 2>/dev/null) || active_uuid=""
+    printf '  email:        %s\n' "${active_email:-(none)}"
+    printf '  account id:   %s\n' "${active_uuid:-(none)}"
+  fi
 
   # Subscription type from keychain (single Claude Code-credentials entry,
   # shared across all CLI invocations regardless of which Mac app instance
@@ -5307,8 +5358,7 @@ cmd_status() {
     printf '  subscription: (keychain unreadable)\n'
   fi
 
-  local resolved_tag last_swap
-  resolved_tag=$(resolve_tag_from_email "$active_email")
+  local last_swap
   last_swap=$("$AS_BIN_CAT" "$STATUSLINE_MARKER" 2>/dev/null || echo "(unset)")
   printf '  switcher tag: %s\n' "$resolved_tag"
   printf '  last swap target: %s\n\n' "$last_swap"
@@ -5360,7 +5410,7 @@ cmd_add_account() {
 Usage: account-switcher add-account <tag> <email> [label]
 
 Registers a tag → email mapping in [accounts] of:
-  ${CONFIG_FILE}
+  $(_tilde_path "$CONFIG_FILE")
 
 After first-launch login of the new tag's Mac app instance, run this so
 that 'status' resolves CLI identity → switcher tag and any future tooling
@@ -5377,12 +5427,18 @@ EOF
     return 1
   fi
 
+  # Arguments given in the wrong order: refused before validate_tag, whose
+  # message would repeat the value (#23).
+  if [[ "$tag" == *@* ]]; then
+    die "add-account takes the tag first, then the email: the first argument looks like an email. Nothing was written."
+  fi
   validate_tag "$tag"
 
   # Lightweight email format check (catches obvious typos; not RFC-compliant).
   # Refuses any whitespace, requires a '@' followed by something with a '.'.
+  # The message doesn't repeat the value (#23).
   if [[ "$email" == *' '* ]] || [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-    die "Invalid email format: '${email}' (expected user@host.tld)"
+    die "Invalid email format: it needs one @ followed by a domain with a dot, and no spaces. Nothing was written."
   fi
 
   # Default label = tag with first letter capitalized.
@@ -5404,7 +5460,7 @@ EOF
   # Reject duplicate tag declaration. Manual edit is the path for updates
   # — silently overwriting could surprise operators or lose label history.
   if tag_is_in_accounts "$tag"; then
-    die "Tag '${tag}' is already declared in [accounts] in ${CONFIG_FILE}. Edit manually to update."
+    die "Tag '${tag}' is already declared in [accounts] in $(_tilde_path "$CONFIG_FILE"). Edit manually to update."
   fi
 
   # Build new entry line. Quotes around the values are TOML-required for
@@ -5416,11 +5472,17 @@ EOF
   # Insert new_entry within [accounts] section. Strategy: rewrite via awk,
   # appending new_entry just before the next section header (or EOF if
   # [accounts] is the last section). If [accounts] section is missing,
-  # add it at the end of the file.
+  # add it at the end of the file. The entry holds the email, so it reaches
+  # awk on stdin (builtin printf, read by getline), never on awk's command
+  # line (#23); getline also keeps a backslash in the label literal, where
+  # -v would have expanded it. A failed read writes nothing.
   local tmp
   tmp="$("$AS_BIN_MKTEMP")"
-  "$AS_BIN_AWK" -v new_entry="$new_entry" '
-    BEGIN { in_a = 0; inserted = 0; has_accounts = 0 }
+  if ! printf '%s\n' "$new_entry" | "$AS_BIN_AWK" '
+    BEGIN {
+      if ((getline new_entry < "-") != 1) { bad = 1; exit 3 }
+      in_a = 0; inserted = 0; has_accounts = 0
+    }
     /^\[accounts\]/ { in_a = 1; has_accounts = 1; print; next }
     /^\[/ && in_a {
       # Leaving [accounts] section; insert new_entry before this header.
@@ -5431,21 +5493,28 @@ EOF
     }
     { print }
     END {
+      if (bad) exit 3
       # If file ends inside [accounts] without exiting, append new_entry.
       if (in_a && !inserted) { print new_entry; inserted = 1 }
       # If [accounts] section never seen, add it at end.
       if (!has_accounts) { print ""; print "[accounts]"; print new_entry }
     }
-  ' "$CONFIG_FILE" > "$tmp"
+  ' "$CONFIG_FILE" > "$tmp"; then
+    "$AS_BIN_RM" -f "$tmp"
+    die "Could not write the new entry; $(_tilde_path "$CONFIG_FILE") is unchanged."
+  fi
 
   "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
   "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
 
-  ok "Registered account: tag=${tag} email=${email} label='${label}'"
+  # Output and the history row name the tag and the label, never the email
+  # (#23). The label goes last and quoted: it is free text, but it can't
+  # contain a double quote (refused above).
+  ok "Registered account: tag=${tag} label='${label}'"
 
   _swap_log_ensure
-  printf '[%s] ADD_ACCOUNT tag=%s email=%s label=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$email" "$label" \
+  printf '[%s] ADD_ACCOUNT tag=%s label="%s"\n' \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$label" \
     >> "$SWAP_LOG"
 }
 
@@ -5544,8 +5613,8 @@ cmd_identity() {
 # already pinned to another tag, which is the mix-up #6 exists to catch,
 # unless --force. Confirms with the label and the id's last 4 hex digits
 # (--yes skips; a declined or unanswered prompt writes nothing and exits 1).
-# Writes through a temp file, mv and chmod 600, passing the id to awk in the
-# environment rather than on its command line, and appends
+# Writes through a temp file, mv and chmod 600, passing the id to awk on
+# stdin rather than on its command line or in its environment, and appends
 # IDENTITY_PIN tag=<tag> (no id) to the history log.
 cmd_identity_pin() {
   local tag="" yes="false" force="false" arg key udd st label cur="" other="" old="" ans="" tmp
@@ -5597,9 +5666,15 @@ cmd_identity_pin() {
   fi
 
   tmp="$("$AS_BIN_MKTEMP")"
-  if ! AS_PIN_KEY="$key" AS_PIN_LINE="${key} = \"${cur}\"" "$AS_BIN_AWK" '
+  # The pin line holds the id, so it reaches awk on stdin (builtin printf,
+  # read by getline), never in awk's arguments or environment (#23); the
+  # key is a tag and stays in the environment.
+  if ! printf '%s\n' "${key} = \"${cur}\"" | AS_PIN_KEY="$key" "$AS_BIN_AWK" '
     function blanks() { while (nb > 0) { print ""; nb-- } }
-    BEGIN { k = ENVIRON["AS_PIN_KEY"]; line = ENVIRON["AS_PIN_LINE"]; in_t = 0; done = 0; seen = 0; nb = 0 }
+    BEGIN {
+      if ((getline line < "-") != 1) { bad = 1; exit 3 }
+      k = ENVIRON["AS_PIN_KEY"]; in_t = 0; done = 0; seen = 0; nb = 0
+    }
     /^\[/ {
       if (in_t && !done) { print line; done = 1 }
       blanks()
@@ -5616,6 +5691,7 @@ cmd_identity_pin() {
     in_t && /^[[:space:]]*$/ { nb++; next }
     { blanks(); print }
     END {
+      if (bad) exit 3
       if (in_t && !done) { print line; done = 1 }
       blanks()
       if (!seen) { print ""; print "[identity]"; print line }
@@ -5721,7 +5797,8 @@ _signin_tty() {
   [[ -t 0 ]]
 }
 
-# Returns 0 when stdout counts as a terminal (S-02, identity --show-ids).
+# Returns 0 when stdout counts as a terminal (S-02: identity --show-ids and
+# status --show-ids).
 # AS_TEST_STDOUT_IS_TTY is empty outside test mode (the seam block unsets
 # it), so production reads -t 1.
 _stdout_tty() {
@@ -5756,8 +5833,14 @@ _signin_drain() {
 # _account_email <tag>: the profile_email of the tag's [accounts] entry, or
 # nothing. It is printed on stdout only, never written to a log row.
 _account_email() {
-  local key e=""
-  key="$(identity_key "${1:-}")"
+  _account_email_key "$(identity_key "${1:-}")"
+}
+
+# _account_email_key <key>: the same, for an [accounts] key taken literally
+# (resolve_tag_from_email reads each key accounts_tags lists, `default`
+# included, as the lookup did before #23).
+_account_email_key() {
+  local key="${1:-}" e=""
   if [[ -f "$CONFIG_FILE" ]]; then
     e="$("$AS_BIN_AWK" -v tag="$key" '
       /^\[/ { in_a = ($0 ~ /^\[accounts\]/); next }
@@ -6986,8 +7069,11 @@ SUBCOMMANDS (Mac desktop app management):
                          warning while an update is staged and an instance
                          is open.
 
-  status                 Show CLI identity (~/.claude.json + keychain
-                         subscription type) + statusline marker.
+  status [--show-ids]    Show the CLI account (~/.claude.json) by its
+                         [accounts] label, or unknown, plus the keychain
+                         subscription type and the statusline marker.
+                         --show-ids adds its email and account id, only
+                         when stdout is a terminal (otherwise exit 2).
 
   config show | get <k>  Display or read a specific config.toml key.
 
@@ -6997,6 +7083,8 @@ SUBCOMMANDS (Mac desktop app management):
                          login of the new tag's Mac app instance so
                          'status' can resolve CLI identity → switcher tag.
                          This is the explicit [accounts] registration path.
+                         Its output and history row name the tag and the
+                         label, never the email.
 
   version (or --version) Print this script's version. To check whether the
                          install matches the repository, run
