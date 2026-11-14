@@ -5391,7 +5391,7 @@ cmd_add_account() {
 Usage: account-switcher add-account <tag> <email> [label]
 
 Registers a tag → email mapping in [accounts] of:
-  ${CONFIG_FILE}
+  $(_tilde_path "$CONFIG_FILE")
 
 After first-launch login of the new tag's Mac app instance, run this so
 that 'status' resolves CLI identity → switcher tag and any future tooling
@@ -5408,12 +5408,18 @@ EOF
     return 1
   fi
 
+  # Arguments given in the wrong order: refused before validate_tag, whose
+  # message would repeat the value (#23).
+  if [[ "$tag" == *@* ]]; then
+    die "add-account takes the tag first, then the email: the first argument looks like an email. Nothing was written."
+  fi
   validate_tag "$tag"
 
   # Lightweight email format check (catches obvious typos; not RFC-compliant).
   # Refuses any whitespace, requires a '@' followed by something with a '.'.
+  # The message doesn't repeat the value (#23).
   if [[ "$email" == *' '* ]] || [[ ! "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-    die "Invalid email format: '${email}' (expected user@host.tld)"
+    die "Invalid email format (expected user@host.tld). Nothing was written."
   fi
 
   # Default label = tag with first letter capitalized.
@@ -5435,7 +5441,7 @@ EOF
   # Reject duplicate tag declaration. Manual edit is the path for updates
   # — silently overwriting could surprise operators or lose label history.
   if tag_is_in_accounts "$tag"; then
-    die "Tag '${tag}' is already declared in [accounts] in ${CONFIG_FILE}. Edit manually to update."
+    die "Tag '${tag}' is already declared in [accounts] in $(_tilde_path "$CONFIG_FILE"). Edit manually to update."
   fi
 
   # Build new entry line. Quotes around the values are TOML-required for
@@ -5482,11 +5488,14 @@ EOF
   "$AS_BIN_MV" -f "$tmp" "$CONFIG_FILE"
   "$AS_BIN_CHMOD" 600 "$CONFIG_FILE"
 
-  ok "Registered account: tag=${tag} email=${email} label='${label}'"
+  # Output and the history row name the tag and the label, never the email
+  # (#23). The label goes last and quoted: it is free text, but it can't
+  # contain a double quote (refused above).
+  ok "Registered account: tag=${tag} label='${label}'"
 
   _swap_log_ensure
-  printf '[%s] ADD_ACCOUNT tag=%s email=%s label=%s\n' \
-    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$email" "$label" \
+  printf '[%s] ADD_ACCOUNT tag=%s label="%s"\n' \
+    "$("$AS_BIN_DATE" -u +%Y-%m-%dT%H:%M:%SZ)" "$tag" "$label" \
     >> "$SWAP_LOG"
 }
 
