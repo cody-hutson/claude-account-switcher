@@ -5283,18 +5283,47 @@ cmd_reopen() {
 
 # ---- status --------------------------------------------------------------
 
+# status [--show-ids]
+# The CLI account (what bridged Code reads from when displaying the account
+# name) is named by the label of the [accounts] tag its email resolves to,
+# or `unknown` (#23). --show-ids adds the email and the whole account id, on
+# stdout only, and only when stdout is a terminal; otherwise it refuses
+# (exit 2) and prints nothing, as `identity --show-ids` does. Any other
+# argument is refused (exit 2) without being echoed.
 cmd_status() {
+  local show_ids="false" arg
+  for arg; do
+    case "$arg" in
+      "") ;;
+      --show-ids) show_ids="true" ;;
+      *) _die2 "Unknown argument for status. Usage: account-switcher status [--show-ids]" ;;
+    esac
+  done
+  # S-02: whole ids go to a terminal only. Checked first, so this refusal
+  # can't be mistaken for another.
+  if [[ "$show_ids" == "true" ]] && ! _stdout_tty; then
+    _die2 "status --show-ids prints the CLI account's email and whole account id, so it runs only with its output on a terminal (not a pipe, a file or a transcript). Nothing was printed; without --show-ids, status shows the account's label."
+  fi
+
   app_binary_warn
   printf '\n=== Claude Code Account Switcher (v%s) ===\n\n' "$VERSION"
 
-  # CLI identity (what bridged Code reads from when displaying the account name).
-  local active_email active_uuid
-  active_email=$("$AS_BIN_JQ" -r '.oauthAccount.emailAddress // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
-  active_uuid=$("$AS_BIN_JQ" -r '.oauthAccount.accountUuid // "(none)"' "${CLAUDE_JSON}" 2>/dev/null || echo "(error)")
+  local active_email active_uuid resolved_tag account_txt
+  active_email=$("$AS_BIN_JQ" -r '.oauthAccount.emailAddress // empty' "${CLAUDE_JSON}" 2>/dev/null) || active_email=""
+  resolved_tag=$(resolve_tag_from_email "$active_email")
+  if [[ "$resolved_tag" == "(unmatched)" ]]; then
+    account_txt="unknown"
+  else
+    account_txt="$(account_label "$resolved_tag")"
+  fi
 
   printf 'CLI identity (from ~/.claude.json):\n'
-  printf '  email:        %s\n' "$active_email"
-  printf '  accountUuid:  %s\n' "$active_uuid"
+  printf '  account:      %s\n' "$account_txt"
+  if [[ "$show_ids" == "true" ]]; then
+    active_uuid=$("$AS_BIN_JQ" -r '.oauthAccount.accountUuid // empty' "${CLAUDE_JSON}" 2>/dev/null) || active_uuid=""
+    printf '  email:        %s\n' "${active_email:-(none)}"
+    printf '  account id:   %s\n' "${active_uuid:-(none)}"
+  fi
 
   # Subscription type from keychain (single Claude Code-credentials entry,
   # shared across all CLI invocations regardless of which Mac app instance
@@ -5310,8 +5339,7 @@ cmd_status() {
     printf '  subscription: (keychain unreadable)\n'
   fi
 
-  local resolved_tag last_swap
-  resolved_tag=$(resolve_tag_from_email "$active_email")
+  local last_swap
   last_swap=$("$AS_BIN_CAT" "$STATUSLINE_MARKER" 2>/dev/null || echo "(unset)")
   printf '  switcher tag: %s\n' "$resolved_tag"
   printf '  last swap target: %s\n\n' "$last_swap"
